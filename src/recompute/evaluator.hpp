@@ -3,10 +3,12 @@
 
 #include <cstddef>
 #include <map>
+#include <optional>
 #include <memory>
 #include <vector>
 
 #include "core/cancel.hpp"
+#include "core/params.hpp"
 #include "recompute/timeline.hpp"
 
 namespace iw::recompute {
@@ -18,6 +20,10 @@ struct FeatureStatus {
     bool reused = false;      ///< Served from the prefix cache (not recomputed).
     Error error;              ///< Valid when state == Failed.
     std::vector<Diagnostic> diagnostics;
+    /// Construction geometry published by this feature (B1 Plane / Axis / Point), when Ok.
+    std::optional<ConstructionGeometry> construction;
+    /// Non-geometric attributes published by the feature (FeatureResult::attributes), when Ok.
+    std::map<std::string, std::string> attributes;
 };
 
 /// Model state at the evaluated timeline position.
@@ -32,7 +38,7 @@ struct EvalResult {
 /// Timeline evaluator with prefix reuse (ARCHITECTURE section 4).
 ///
 /// Cache: for each position k the evaluator stores the state after feature k, keyed by a *stamp chain*:
-///   stamp_k = combine(stamp_{k-1}, featureId, paramHash, suppressed-flag).
+///   stamp_k = combine(stamp_{k-1}, featureId, paramHash, paramTableHash(used), suppressed-flag).
 /// evaluate() walks features in order and reuses the longest prefix whose chain is unchanged; editing
 /// feature N recomputes N..marker only. Marker moves and undo/redo are therefore cache hits.
 /// Features with disjoint read/write body sets MAY be computed in parallel later; the P0 contract is
@@ -49,8 +55,14 @@ public:
     Evaluator(const Evaluator&) = delete;
     Evaluator& operator=(const Evaluator&) = delete;
 
-    /// Evaluates features [0, timeline.rollbackMarker()). Errors: Cancelled (partial cache kept).
+    /// Evaluates features [0, timeline.rollbackMarker()) without a parameter table. Errors: Cancelled (partial cache
+    /// kept).
     Result<EvalResult> evaluate(const Timeline& timeline, CancelToken cancel = {});
+
+    /// Same, with the document parameter table visible to features (EvalContext::params). Each feature's stamp
+    /// includes params->hashOfUsed(feature.parameterReferences()), so a parameter edit recomputes exactly the
+    /// features that use it and everything after them.
+    Result<EvalResult> evaluate(const Timeline& timeline, const ParameterTable* params, CancelToken cancel = {});
 
     /// Drops all cached prefixes.
     void clearCache();

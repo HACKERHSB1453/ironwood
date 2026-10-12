@@ -89,6 +89,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     app.setApplicationName("Ironwood");
+    app.setOrganizationName("Ironwood");   // QSettings location for shortcuts, pinned commands, recent commands
     app.setApplicationVersion(IRONWOOD_VERSION);
 
     // The Viewport is a QRhiWidget: Qt creates and owns the QVulkanInstance of the top-level window itself

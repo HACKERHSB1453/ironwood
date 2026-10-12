@@ -2,10 +2,13 @@
 #include "kernel/exchange.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -46,9 +49,12 @@
 #include <Message_ProgressScope.hxx>
 #include <TDataStd_Name.hxx>
 #include <TDocStd_Document.hxx>
+#include <TopAbs_Orientation.hxx>
+#include <TopExp_Explorer.hxx>
 #include <TopLoc_Location.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
+#include <TopoDS_Face.hxx>
 #include <TopoDS_Shell.hxx>
 #include <XCAFApp_Application.hxx>
 #include <XCAFDoc_ColorTool.hxx>
@@ -465,6 +471,264 @@ Result<void> exportStl(const fs::path& path, const Shape& shape, const StlOption
         return std::unexpected(occtError(ErrorCode::KernelFailure, e, "exportStl"));
     } catch (const std::exception& e) {
         return makeError(ErrorCode::Internal, std::string("exportStl: ") + e.what());
+    }
+}
+
+// ---- 3MF export ------------------------------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char* kCoreNs = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
+constexpr const char* kMaterialNs = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02";
+constexpr const char* kModelPart = "3D/3dmodel.model";
+
+std::uint32_t crc32Of(const std::string& data) {
+    static const std::array<std::uint32_t, 256> table = [] {
+        std::array<std::uint32_t, 256> t{};
+        for (std::uint32_t i = 0; i < 256; ++i) {
+            std::uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1u) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            t[i] = c;
+        }
+        return t;
+    }();
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (const char ch : data) crc = table[(crc ^ static_cast<unsigned char>(ch)) & 0xFFu] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+void put16(std::string& out, std::uint32_t v) {
+    out.push_back(static_cast<char>(v & 0xFFu));
+    out.push_back(static_cast<char>((v >> 8) & 0xFFu));
+}
+void put32(std::string& out, std::uint32_t v) {
+    put16(out, v & 0xFFFFu);
+    put16(out, v >> 16);
+}
+
+struct ZipEntry {
+    std::string name;
+    std::string data;
+};
+
+/// Minimal ZIP writer (PKWARE APPNOTE 6.3): STORED entries, CRC-32 per entry, UTF-8 names, no zip64 (a 3MF
+/// package is far below 4 GiB). Local headers, then the central directory, then the end record.
+std::string buildZip(const std::vector<ZipEntry>& entries) {
+    constexpr std::uint32_t kDosTime = 0;
+    constexpr std::uint32_t kDosDate = (0u << 9) | (1u << 5) | 1u; // 1980-01-01
+    constexpr std::uint32_t kVersion = 20;                        // 2.0: needed for STORED
+    constexpr std::uint32_t kFlagsUtf8 = 0x0800u;
+    std::string out;
+    std::string central;
+    for (const ZipEntry& e : entries) {
+        const auto offset = static_cast<std::uint32_t>(out.size());
+        const std::uint32_t crc = crc32Of(e.data);
+        const auto size = static_cast<std::uint32_t>(e.data.size());
+        const auto nameLen = static_cast<std::uint32_t>(e.name.size());
+
+        put32(out, 0x04034b50u);
+        put16(out, kVersion);
+        put16(out, kFlagsUtf8);
+        put16(out, 0); // method: stored
+        put16(out, kDosTime);
+        put16(out, kDosDate);
+        put32(out, crc);
+        put32(out, size);
+        put32(out, size);
+        put16(out, nameLen);
+        put16(out, 0); // extra length
+        out += e.name;
+        out += e.data;
+
+        put32(central, 0x02014b50u);
+        put16(central, kVersion); // made by
+        put16(central, kVersion); // needed
+        put16(central, kFlagsUtf8);
+        put16(central, 0);
+        put16(central, kDosTime);
+        put16(central, kDosDate);
+        put32(central, crc);
+        put32(central, size);
+        put32(central, size);
+        put16(central, nameLen);
+        put16(central, 0); // extra
+        put16(central, 0); // comment
+        put16(central, 0); // disk
+        put16(central, 0); // internal attributes
+        put32(central, 0); // external attributes
+        put32(central, offset);
+        central += e.name;
+    }
+    const auto cdOffset = static_cast<std::uint32_t>(out.size());
+    const auto count = static_cast<std::uint32_t>(entries.size());
+    out += central;
+    put32(out, 0x06054b50u);
+    put16(out, 0);
+    put16(out, 0);
+    put16(out, count);
+    put16(out, count);
+    put32(out, static_cast<std::uint32_t>(central.size()));
+    put32(out, cdOffset);
+    put16(out, 0); // comment length
+    return out;
+}
+
+std::string xmlEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (const char c : s) {
+        switch (c) {
+        case '&': out += "&amp;"; break;
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '"': out += "&quot;"; break;
+        case '\'': out += "&apos;"; break;
+        default: out.push_back(c);
+        }
+    }
+    return out;
+}
+
+std::string hexColor(const std::optional<Color>& color) {
+    const Color c = color.value_or(Color{0.8f, 0.8f, 0.8f, 1.0f});
+    auto channel = [](float v) {
+        return static_cast<unsigned>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
+    };
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "#%02X%02X%02XFF", channel(c.r), channel(c.g), channel(c.b));
+    return buf;
+}
+
+/// Triangulated body in export coordinates (mm). Vertices are per face (not welded), like tess::tessellate.
+struct BodyMesh {
+    std::vector<double> xyz; ///< 3 values per vertex
+    std::vector<std::array<std::uint32_t, 3>> triangles;
+};
+
+Result<BodyMesh> meshForExport(const Shape& shape, const StlOptions& options, const CancelToken& cancel) {
+    // Meshing writes triangulations into the TShape; mesh a private copy so the immutable Shape stays untouched.
+    BRepBuilderAPI_Copy copy(occtShape(shape), /*copyGeom=*/Standard_False, /*copyMesh=*/Standard_False);
+    const TopoDS_Shape work = copy.Shape();
+    BRepMesh_IncrementalMesh mesh(work, options.linearDeflection, Standard_False, options.angularDeflection,
+                                  /*isInParallel=*/Standard_True);
+    BodyMesh out;
+    for (TopExp_Explorer ex(work, TopAbs_FACE); ex.More(); ex.Next()) {
+        if (cancel.cancelled()) return makeError(ErrorCode::Cancelled, "export3mf cancelled");
+        const TopoDS_Face face = TopoDS::Face(ex.Current());
+        TopLoc_Location loc;
+        Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+        if (tri.IsNull()) return makeError(ErrorCode::KernelFailure, "export3mf: a face failed to mesh");
+
+        // Same winding rule as tess::tessellate: a REVERSED face or a mirroring location flips the triangles.
+        const gp_Trsf trsf = loc.Transformation();
+        const bool flip = (face.Orientation() == TopAbs_REVERSED) != trsf.IsNegative();
+        const auto base = static_cast<std::uint32_t>(out.xyz.size() / 3);
+        for (Standard_Integer k = 1; k <= tri->NbNodes(); ++k) {
+            const gp_Pnt p = tri->Node(k).Transformed(trsf);
+            out.xyz.push_back(p.X());
+            out.xyz.push_back(p.Y());
+            out.xyz.push_back(p.Z());
+        }
+        for (Standard_Integer t = 1; t <= tri->NbTriangles(); ++t) {
+            Standard_Integer a = 0, b = 0, c = 0;
+            tri->Triangle(t).Get(a, b, c);
+            if (flip) std::swap(b, c);
+            out.triangles.push_back({base + static_cast<std::uint32_t>(a - 1), base + static_cast<std::uint32_t>(b - 1),
+                                     base + static_cast<std::uint32_t>(c - 1)});
+        }
+    }
+    if (out.triangles.empty()) return makeError(ErrorCode::KernelFailure, "export3mf: body has no triangles");
+    return out;
+}
+
+/// 3D/3dmodel.model. Resource ids: 1 = basematerials group (one base per body, pindex = body index),
+/// 2..N+1 = objects, build items reference the objects with identity transforms.
+std::string buildModelXml(const std::vector<MeshBody>& bodies, const std::vector<BodyMesh>& meshes) {
+    std::string x = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+    x += std::string("<model unit=\"millimeter\" xml:lang=\"en-US\" xmlns=\"") + kCoreNs + "\" xmlns:m=\"" +
+         kMaterialNs + "\">\n";
+    x += " <resources>\n  <m:basematerials id=\"1\">\n";
+    for (std::size_t i = 0; i < bodies.size(); ++i) {
+        const std::string name = bodies[i].name.empty() ? "Body " + std::to_string(i + 1) : bodies[i].name;
+        x += "   <m:base name=\"" + xmlEscape(name) + "\" displaycolor=\"" + hexColor(bodies[i].color) + "\"/>\n";
+    }
+    x += "  </m:basematerials>\n";
+
+    char num[3][64];
+    for (std::size_t i = 0; i < bodies.size(); ++i) {
+        const std::string name = bodies[i].name.empty() ? "Body " + std::to_string(i + 1) : bodies[i].name;
+        const BodyMesh& m = meshes[i];
+        x += "  <object id=\"" + std::to_string(i + 2) + "\" name=\"" + xmlEscape(name) +
+             "\" type=\"model\" pid=\"1\" pindex=\"" + std::to_string(i) + "\">\n   <mesh>\n    <vertices>\n";
+        for (std::size_t v = 0; v + 2 < m.xyz.size(); v += 3) {
+            std::snprintf(num[0], sizeof num[0], "%.9g", m.xyz[v]);
+            std::snprintf(num[1], sizeof num[1], "%.9g", m.xyz[v + 1]);
+            std::snprintf(num[2], sizeof num[2], "%.9g", m.xyz[v + 2]);
+            x += std::string("     <vertex x=\"") + num[0] + "\" y=\"" + num[1] + "\" z=\"" + num[2] + "\"/>\n";
+        }
+        x += "    </vertices>\n    <triangles>\n";
+        for (const auto& t : m.triangles)
+            x += "     <triangle v1=\"" + std::to_string(t[0]) + "\" v2=\"" + std::to_string(t[1]) + "\" v3=\"" +
+                 std::to_string(t[2]) + "\"/>\n";
+        x += "    </triangles>\n   </mesh>\n  </object>\n";
+    }
+    x += " </resources>\n <build>\n";
+    for (std::size_t i = 0; i < bodies.size(); ++i)
+        x += "  <item objectid=\"" + std::to_string(i + 2) + "\"/>\n";
+    x += " </build>\n</model>\n";
+    return x;
+}
+
+constexpr const char* kContentTypesXml =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+    "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+    "<Default Extension=\"model\" ContentType=\"application/vnd.ms-package.3dmanufacturing-3dmodel+xml\"/>"
+    "</Types>\n";
+
+constexpr const char* kRelsXml =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+    "<Relationship Target=\"/3D/3dmodel.model\" Id=\"rel0\" "
+    "Type=\"http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel\"/>"
+    "</Relationships>\n";
+
+} // namespace
+
+Result<void> export3mf(const fs::path& path, const std::vector<MeshBody>& bodies, const StlOptions& options,
+                       CancelToken cancel) {
+    std::lock_guard lock(exchangeMutex());
+    if (path.empty()) return makeError(ErrorCode::InvalidArgument, "export3mf: empty path");
+    if (bodies.empty()) return makeError(ErrorCode::InvalidArgument, "export3mf: no bodies");
+    for (const MeshBody& b : bodies)
+        if (b.shape.isNull())
+            return makeError(ErrorCode::InvalidArgument, "export3mf: null shape in body '" + b.name + "'");
+    if (!(options.linearDeflection > 0) || !(options.angularDeflection > 0))
+        return makeError(ErrorCode::InvalidArgument, "export3mf: deflections must be > 0");
+    if (cancel.cancelled()) return makeError(ErrorCode::Cancelled, "export3mf cancelled");
+    try {
+        std::vector<BodyMesh> meshes;
+        meshes.reserve(bodies.size());
+        for (const MeshBody& b : bodies) {
+            Result<BodyMesh> m = meshForExport(b.shape, options, cancel);
+            if (!m) return std::unexpected(m.error());
+            meshes.push_back(std::move(*m));
+        }
+        const std::string bytes = buildZip({
+            {"[Content_Types].xml", kContentTypesXml},
+            {"_rels/.rels", kRelsXml},
+            {kModelPart, buildModelXml(bodies, meshes)},
+        });
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) return makeError(ErrorCode::IoError, "export3mf: cannot write '" + path.string() + "'");
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        out.close();
+        if (!out) return makeError(ErrorCode::IoError, "export3mf: failed writing '" + path.string() + "'");
+        return {};
+    } catch (const Standard_Failure& e) {
+        return std::unexpected(occtError(ErrorCode::KernelFailure, e, "export3mf"));
+    } catch (const std::exception& e) {
+        return makeError(ErrorCode::Internal, std::string("export3mf: ") + e.what());
     }
 }
 

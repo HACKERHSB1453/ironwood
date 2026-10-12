@@ -1,0 +1,1199 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "ui/sketch/session.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <memory>
+#include <numbers>
+#include <set>
+#include <type_traits>
+#include <utility>
+#include <variant>
+
+namespace iw::ui {
+namespace {
+
+using sketch::ConstraintKind;
+using sketch::EntityGeometry;
+using sketch::EntityKind;
+using sketch::LineGeom;
+using sketch::Point2;
+using sketch::PointRole;
+using sketch::Sketch;
+using sketch::SketchEntityId;
+using sketch::SketchRef;
+
+constexpr double kEps = 1e-7;
+constexpr double kTwoPi = 2.0 * std::numbers::pi;
+constexpr double kAxisTolRad = 1.5 * std::numbers::pi / 180.0;   ///< Near-horizontal / vertical auto-constraint.
+
+/// One undo step: the whole sketch before and after the edit. Snapshots keep the entity ids, so undo and redo
+/// restore exactly the same ids and the id counter never hands out a retired id again.
+class SketchEditCommand final : public Command {
+public:
+    SketchEditCommand(std::string text, Sketch* target, std::shared_ptr<const Sketch> before,
+                      std::shared_ptr<const Sketch> after)
+        : text_(std::move(text)), target_(target), before_(std::move(before)), after_(std::move(after)) {}
+
+    Result<void> execute() override {
+        *target_ = *after_;
+        return {};
+    }
+    void undo() override { *target_ = *before_; }
+    std::string text() const override { return text_; }
+
+private:
+    std::string text_;
+    Sketch* target_;
+    std::shared_ptr<const Sketch> before_;
+    std::shared_ptr<const Sketch> after_;
+};
+
+// ---- small vector helpers -----------------------------------------------------------------------------------
+double dotp(Point2 a, Point2 b) { return a.x * b.x + a.y * b.y; }
+double crossp(Point2 a, Point2 b) { return a.x * b.y - a.y * b.x; }
+double lenp(Point2 a) { return std::hypot(a.x, a.y); }
+Point2 unitp(Point2 a) {
+    const double l = lenp(a);
+    return l > 0 ? a * (1.0 / l) : Point2{0, 0};
+}
+Point2 rot90(Point2 a) { return {-a.y, a.x}; }
+double wrapAngle(double a) {
+    a = std::fmod(a, kTwoPi);
+    return a < 0 ? a + kTwoPi : a;
+}
+Point2 polar(Point2 c, double r, double a) { return {c.x + r * std::cos(a), c.y + r * std::sin(a)}; }
+double angleOf(Point2 c, Point2 p) { return std::atan2(p.y - c.y, p.x - c.x); }
+double segmentDistance(Point2 p, Point2 a, Point2 b) {
+    const Point2 ab = b - a;
+    const double len2 = dotp(ab, ab);
+    double t = 0;
+    if (len2 > 0) t = std::clamp(dotp(p - a, ab) / len2, 0.0, 1.0);
+    return sketch::distance(p, a + ab * t);
+}
+
+/// Geometry of a curve for the intersection and projection maths. A line is `p + t*dir` (bounded: t in [0,1]).
+/// A circle is `c, r`; with `arc` only the CCW angular range a0..a0+sweep counts.
+struct Geo {
+    bool circle = false;
+    bool bounded = false;
+    bool arc = false;
+    Point2 p{}, dir{};
+    Point2 c{};
+    double r = 0;
+    double a0 = 0, sweep = kTwoPi;
+};
+
+std::optional<Geo> geoOf(const EntityGeometry& g) {
+    return std::visit(
+        [](const auto& x) -> std::optional<Geo> {
+            using T = std::decay_t<decltype(x)>;
+            Geo o;
+            if constexpr (std::is_same_v<T, sketch::PointGeom>) {
+                return std::nullopt;
+            } else if constexpr (std::is_same_v<T, LineGeom>) {
+                o.p = x.start;
+                o.dir = x.end - x.start;
+                o.bounded = true;
+            } else if constexpr (std::is_same_v<T, sketch::ArcGeom>) {
+                o.circle = o.arc = true;
+                o.c = x.center;
+                o.r = x.radius;
+                o.a0 = x.startAngle;
+                o.sweep = x.sweep;
+            } else {
+                o.circle = true;
+                o.c = x.center;
+                o.r = x.radius;
+            }
+            return o;
+        },
+        g);
+}
+
+bool inArc(const Geo& g, Point2 q) {
+    if (!g.arc) return true;
+    const double rel = wrapAngle(angleOf(g.c, q) - g.a0);
+    return rel <= g.sweep + 1e-9 || rel >= kTwoPi - 1e-9;
+}
+
+double lineParam(const Geo& g, Point2 q) { return dotp(q - g.p, g.dir) / dotp(g.dir, g.dir); }
+
+/// Point of `g` nearest to q that lies on the curve (bounded lines clamp; arcs need the nearest point in range).
+std::optional<Point2> nearestOn(const Geo& g, Point2 q) {
+    if (!g.circle) {
+        double t = lineParam(g, q);
+        if (g.bounded) t = std::clamp(t, 0.0, 1.0);
+        return g.p + g.dir * t;
+    }
+    const Point2 v = q - g.c;
+    const double ang = (lenp(v) > kEps) ? std::atan2(v.y, v.x) : g.a0;
+    const Point2 at = polar(g.c, g.r, ang);
+    if (!inArc(g, at)) return std::nullopt;
+    return at;
+}
+
+/// Intersection points of two curves that lie on both (bounded segments, arc ranges). Tangency gives one point.
+std::vector<Point2> roots(const Geo& A, const Geo& B) {
+    std::vector<Point2> out;
+    auto inBounds = [](const Geo& g, double t) { return !g.bounded || (t >= -1e-9 && t <= 1 + 1e-9); };
+    if (!A.circle && !B.circle) {
+        const double den = crossp(A.dir, B.dir);
+        if (std::abs(den) <= kEps * lenp(A.dir) * lenp(B.dir)) return out;   // parallel
+        const Point2 w = B.p - A.p;
+        const double t = crossp(w, B.dir) / den;
+        const double u = crossp(w, A.dir) / den;
+        if (inBounds(A, t) && inBounds(B, u)) out.push_back(A.p + A.dir * t);
+        return out;
+    }
+    if (A.circle && B.circle) {
+        const Point2 d = B.c - A.c;
+        const double dd = lenp(d);
+        if (dd < kEps || dd > A.r + B.r + 1e-9 || dd < std::abs(A.r - B.r) - 1e-9) return out;
+        const double a = (A.r * A.r - B.r * B.r + dd * dd) / (2 * dd);
+        const double h = std::sqrt(std::max(0.0, A.r * A.r - a * a));
+        const Point2 m = A.c + d * (a / dd);
+        const Point2 perp = rot90(d) * (1.0 / dd);
+        for (double s : {1.0, -1.0}) {
+            if (h < 1e-12 && s < 0) break;
+            const Point2 q = m + perp * (s * h);
+            if (inArc(A, q) && inArc(B, q)) out.push_back(q);
+        }
+        return out;
+    }
+    const Geo& L = A.circle ? B : A;
+    const Geo& C = A.circle ? A : B;
+    const Point2 f = L.p - C.c;
+    const double qa = dotp(L.dir, L.dir), qb = 2 * dotp(f, L.dir), qc = dotp(f, f) - C.r * C.r;
+    const double disc = qb * qb - 4 * qa * qc;
+    if (disc < 0) return out;
+    const double sq = std::sqrt(disc);
+    for (double t : {(-qb - sq) / (2 * qa), (-qb + sq) / (2 * qa)}) {
+        if (!inBounds(L, t)) continue;
+        const Point2 q = L.p + L.dir * t;
+        if (!inArc(C, q)) continue;
+        if (!out.empty() && sketch::distance(out.back(), q) < 1e-9) continue;
+        out.push_back(q);
+    }
+    return out;
+}
+
+/// Tangent points on a circle/arc seen from external point `from`.
+std::vector<Point2> tangentPoints(const Geo& C, Point2 from) {
+    std::vector<Point2> out;
+    const double d = lenp(from - C.c);
+    if (d <= C.r + kEps) return out;
+    const double th = angleOf(C.c, from), al = std::acos(C.r / d);
+    for (double a : {th + al, th - al}) {
+        const Point2 t = polar(C.c, C.r, a);
+        if (inArc(C, t)) out.push_back(t);
+    }
+    return out;
+}
+
+/// Circle through three points: centre, radius; nullopt when collinear.
+struct Circumcircle {
+    Point2 c;
+    double r;
+};
+std::optional<Circumcircle> circumcircle(Point2 a, Point2 b, Point2 c) {
+    const double d = 2 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+    if (std::abs(d) < kEps) return std::nullopt;
+    const double a2 = dotp(a, a), b2 = dotp(b, b), c2 = dotp(c, c);
+    const Point2 u{(a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d,
+                   (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d};
+    return Circumcircle{u, sketch::distance(u, a)};
+}
+
+/// Arc through a, b, c (b on the arc). `aIsStart`: the arc starts at a and ends at c; otherwise it starts at c.
+struct ThreePointArc {
+    sketch::ArcGeom geom;
+    bool aIsStart = true;
+};
+std::optional<ThreePointArc> threePointArc(Point2 a, Point2 b, Point2 c) {
+    const auto cc = circumcircle(a, b, c);
+    if (!cc || cc->r < kEps) return std::nullopt;
+    const double aa = angleOf(cc->c, a), ab = angleOf(cc->c, b), ac = angleOf(cc->c, c);
+    const double sweepAC = wrapAngle(ac - aa), sweepAB = wrapAngle(ab - aa);
+    ThreePointArc out;
+    if (sweepAB < sweepAC) {
+        out.geom = {cc->c, cc->r, aa, sweepAC};
+        out.aIsStart = true;
+    } else {
+        out.geom = {cc->c, cc->r, ac, wrapAngle(aa - ac)};
+        out.aIsStart = false;
+    }
+    return out;
+}
+
+/// Tangent arc from `s` continuing direction `t` (unit) to `e`. farIsStart: the arc starts at e (it runs CW from s).
+struct TangentArc {
+    sketch::ArcGeom geom;
+    bool farIsStart = false;
+    Point2 farDir{};   ///< Direction of travel at e, for the next tangent continuation.
+};
+std::optional<TangentArc> tangentArc(Point2 s, Point2 t, Point2 e) {
+    const Point2 n = rot90(t);
+    const double side = dotp(e - s, n);
+    if (std::abs(side) < kEps) return std::nullopt;   // e on the tangent line: a straight continuation
+    const double r = dotp(e - s, e - s) / (2 * std::abs(side));
+    TangentArc out;
+    if (side > 0) {
+        const Point2 c = s + n * r;
+        const double a0 = angleOf(c, s);
+        out.geom = {c, r, a0, wrapAngle(angleOf(c, e) - a0)};
+        out.farIsStart = false;
+        out.farDir = rot90(e - c) * (1.0 / r);
+    } else {
+        const Point2 c = s - n * r;
+        const double a0 = angleOf(c, e);
+        out.geom = {c, r, a0, wrapAngle(angleOf(c, s) - a0)};
+        out.farIsStart = true;
+        out.farDir = rot90(e - c) * (-1.0 / r);
+    }
+    return out;
+}
+
+/// Adds the four sides of the rectangle through corners a and b. `hitA`/`hitB` are the snaps of the two corners
+/// (constrained only when `autoOn`); side 0 starts at a, side 1 ends at b.
+Result<void> addRectangle(Sketch& s, Point2 a, Point2 b, std::array<SketchEntityId, 4>& out,
+                          const std::optional<SnapHit>& hitA, const std::optional<SnapHit>& hitB,
+                          bool autoOn);
+
+} // namespace
+
+// ---- snapping and constraint helpers shared by the tools ------------------------------------------------------
+namespace {
+
+/// Constraint a snapped point implies for the point `mine` of a new entity (coincident / midpoint). Other snap kinds
+/// imply nothing for a single point.
+void constrainPoint(Sketch& s, SketchRef mine, const SnapHit& hit) {
+    switch (hit.kind) {
+    case SnapKind::Endpoint:
+    case SnapKind::Center:
+        if (hit.ref) (void)s.addConstraint(ConstraintKind::Coincident, {mine, *hit.ref});
+        break;
+    case SnapKind::Midpoint:
+        if (hit.ref) {
+            const sketch::SketchEntity* e = s.findEntity(hit.ref->entity);
+            if (e && e->kind() == EntityKind::Line) (void)s.addConstraint(ConstraintKind::Midpoint, {mine, *hit.ref});
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+Result<void> addRectangle(Sketch& s, Point2 a, Point2 b, std::array<SketchEntityId, 4>& out,
+                          const std::optional<SnapHit>& hitA, const std::optional<SnapHit>& hitB, bool autoOn) {
+    const Point2 p0 = a, p1{b.x, a.y}, p2 = b, p3{a.x, b.y};
+    const std::array<std::pair<Point2, Point2>, 4> sides{{{p0, p1}, {p1, p2}, {p2, p3}, {p3, p0}}};
+    for (std::size_t i = 0; i < 4; ++i) {
+        auto id = s.addLine(sides[i].first, sides[i].second);
+        if (!id) return std::unexpected(id.error());
+        out[i] = *id;
+    }
+    // Corner i joins the end of side i and the start of side i+1 (mod 4).
+    for (std::size_t i = 0; i < 4; ++i) {
+        auto c = s.addConstraint(ConstraintKind::Coincident,
+                                 {SketchRef{out[i], PointRole::End}, SketchRef{out[(i + 1) % 4], PointRole::Start}});
+        if (!c) return std::unexpected(c.error());
+    }
+    for (std::size_t i : {0u, 2u}) {
+        auto c = s.addConstraint(ConstraintKind::Horizontal, {SketchRef{out[i], std::nullopt}});
+        if (!c) return std::unexpected(c.error());
+    }
+    for (std::size_t i : {1u, 3u}) {
+        auto c = s.addConstraint(ConstraintKind::Vertical, {SketchRef{out[i], std::nullopt}});
+        if (!c) return std::unexpected(c.error());
+    }
+    if (autoOn) {
+        // Corner a is the start of side 0, corner b the end of side 1.
+        if (hitA) constrainPoint(s, SketchRef{out[0], PointRole::Start}, *hitA);
+        if (hitB) constrainPoint(s, SketchRef{out[1], PointRole::End}, *hitB);
+    }
+    return {};
+}
+
+/// Adds a curve equal to `g` (same kind) to `s`. Used when trimming splits an entity.
+Result<SketchEntityId> addPiece(Sketch& s, const EntityGeometry& g, bool construction) {
+    return std::visit(
+        [&](const auto& x) -> Result<SketchEntityId> {
+            using T = std::decay_t<decltype(x)>;
+            if constexpr (std::is_same_v<T, LineGeom>) return s.addLine(x.start, x.end, construction);
+            else if constexpr (std::is_same_v<T, sketch::ArcGeom>)
+                return s.addArc(x.center, x.radius, x.startAngle, x.sweep, construction);
+            else return makeError(ErrorCode::InvalidArgument, "piece kind not supported");
+        },
+        g);
+}
+
+/// Constraint kinds that still describe a sub-piece when they reference the whole curve it came from.
+bool keepsOnPiece(ConstraintKind k) {
+    switch (k) {
+    case ConstraintKind::Horizontal:
+    case ConstraintKind::Vertical:
+    case ConstraintKind::Parallel:
+    case ConstraintKind::Perpendicular:
+    case ConstraintKind::Tangent:
+    case ConstraintKind::Collinear:
+    case ConstraintKind::Concentric:
+    case ConstraintKind::Fix:
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
+SketchSession::SketchSession(sketch::SketchPlane plane) : sketch_(std::move(plane)) { refresh(); }
+
+SketchSession::~SketchSession() = default;
+
+Result<void> SketchSession::apply(std::string text, const std::function<Result<void>(Sketch&)>& edit) {
+    Sketch next = sketch_;
+    if (auto r = edit(next); !r) return std::unexpected(r.error());
+    const sketch::SketchSolveReport solved = sketch::solveSketch(next);
+    if (!solved.ok()) {
+        return makeError(ErrorCode::InvalidArgument,
+                         solved.message.empty() ? std::string("the sketch constraints conflict") : solved.message);
+    }
+    auto before = std::make_shared<const Sketch>(sketch_);
+    auto after = std::make_shared<const Sketch>(std::move(next));
+    auto cmd = std::make_unique<SketchEditCommand>(std::move(text), &sketch_, std::move(before), std::move(after));
+    if (auto r = undo_.push(std::move(cmd)); !r) return std::unexpected(r.error());
+    refresh();
+    return {};
+}
+
+Result<void> SketchSession::applyAuto(std::string text, const std::function<Result<void>(Sketch&, bool)>& edit) {
+    auto first = apply(text, [&](Sketch& s) { return edit(s, true); });
+    if (first) return first;
+    return apply(std::move(text), [&](Sketch& s) { return edit(s, false); });
+}
+
+Result<SketchEntityId> SketchSession::addLine(Point2 a, Point2 b) {
+    SketchEntityId created;
+    auto r = apply("Create Line", [&](Sketch& s) -> Result<void> {
+        auto id = s.addLine(a, b);
+        if (!id) return std::unexpected(id.error());
+        created = *id;
+        return {};
+    });
+    if (!r) return std::unexpected(r.error());
+    return created;
+}
+
+Result<std::array<SketchEntityId, 4>> SketchSession::addRect2pt(Point2 a, Point2 b) {
+    std::array<SketchEntityId, 4> ids{};
+    auto r = apply("Create Rectangle", [&](Sketch& s) { return addRectangle(s, a, b, ids, {}, {}, false); });
+    if (!r) return std::unexpected(r.error());
+    return ids;
+}
+
+Result<std::array<SketchEntityId, 4>> SketchSession::addRectCenter(Point2 center, Point2 corner) {
+    return addRect2pt(center * 2.0 - corner, corner);
+}
+
+Result<SketchEntityId> SketchSession::addCircleCenter(Point2 center, double radius) {
+    SketchEntityId created;
+    auto r = apply("Create Circle", [&](Sketch& s) -> Result<void> {
+        auto id = s.addCircle(center, radius);
+        if (!id) return std::unexpected(id.error());
+        created = *id;
+        return {};
+    });
+    if (!r) return std::unexpected(r.error());
+    return created;
+}
+
+Result<SketchEntityId> SketchSession::addPoint(Point2 p) {
+    SketchEntityId created;
+    auto r = apply("Create Point", [&](Sketch& s) -> Result<void> {
+        auto id = s.addPoint(p);
+        if (!id) return std::unexpected(id.error());
+        created = *id;
+        return {};
+    });
+    if (!r) return std::unexpected(r.error());
+    return created;
+}
+
+Result<SketchEntityId> SketchSession::addArc3(Point2 a, Point2 through, Point2 b) {
+    const auto g = threePointArc(a, through, b);
+    if (!g) return makeError(ErrorCode::InvalidArgument, "the three points of an arc must not be collinear");
+    SketchEntityId created;
+    auto r = apply("Create Arc", [&](Sketch& s) -> Result<void> {
+        auto id = s.addArc(g->geom.center, g->geom.radius, g->geom.startAngle, g->geom.sweep);
+        if (!id) return std::unexpected(id.error());
+        created = *id;
+        return {};
+    });
+    if (!r) return std::unexpected(r.error());
+    return created;
+}
+
+Result<void> SketchSession::toggleConstruction(SketchEntityId id) {
+    const sketch::SketchEntity* e = sketch_.findEntity(id);
+    if (!e) return makeError(ErrorCode::NotFound, "no such sketch entity");
+    const bool next = !e->construction;
+    return apply("Toggle Construction", [&](Sketch& s) -> Result<void> { return s.setConstruction(id, next); });
+}
+
+void SketchSession::setTool(SketchTool t) {
+    clearPending();
+    tool_ = t;
+}
+
+// ---- inference ------------------------------------------------------------------------------------------------
+
+void SketchSession::setInference(InferenceSettings s) {
+    inference_ = s;
+    snapHint_ = inference_.enabled && cursor_ ? snapAt(*cursor_) : std::nullopt;
+}
+
+std::optional<SnapHit> SketchSession::snapAt(Point2 p) const {
+    if (!inference_.enabled) return std::nullopt;
+    const double R = inference_.radiusMm;
+
+    struct Candidate {
+        int tier;     ///< Index into the priority order (lower wins).
+        double dist;
+        SnapHit hit;
+    };
+    std::vector<Candidate> cands;
+    auto addPoint = [&](int tier, Point2 at, SnapHit h) {
+        const double d = sketch::distance(p, at);
+        if (d > R + 1e-12) return;
+        h.point = at;
+        cands.push_back({tier, d, std::move(h)});
+    };
+
+    // Tier 0 endpoint, 1 centre, 2 midpoint. Also collect the points used for alignment.
+    std::vector<Point2> alignPts;
+    std::vector<std::pair<SketchEntityId, Geo>> curves;
+    for (const auto& [id, e] : sketch_.entities()) {
+        if (auto g = geoOf(e.geometry)) curves.emplace_back(id, *g);
+        std::visit(
+            [&](const auto& x) {
+                using T = std::decay_t<decltype(x)>;
+                if constexpr (std::is_same_v<T, sketch::PointGeom>) {
+                    addPoint(0, x.p, {SnapKind::Endpoint, x.p, SketchRef{id, std::nullopt}, {}, {}});
+                    alignPts.push_back(x.p);
+                } else if constexpr (std::is_same_v<T, LineGeom>) {
+                    addPoint(0, x.start, {SnapKind::Endpoint, x.start, SketchRef{id, PointRole::Start}, {}, {}});
+                    addPoint(0, x.end, {SnapKind::Endpoint, x.end, SketchRef{id, PointRole::End}, {}, {}});
+                    const Point2 mid = (x.start + x.end) * 0.5;
+                    addPoint(2, mid, {SnapKind::Midpoint, mid, SketchRef{id, std::nullopt}, {}, {}});
+                    alignPts.push_back(x.start);
+                    alignPts.push_back(x.end);
+                } else if constexpr (std::is_same_v<T, sketch::ArcGeom>) {
+                    const Point2 st = sketch::arcStart(x), en = sketch::arcEnd(x), md = sketch::arcMid(x);
+                    addPoint(0, st, {SnapKind::Endpoint, st, SketchRef{id, PointRole::Start}, {}, {}});
+                    addPoint(0, en, {SnapKind::Endpoint, en, SketchRef{id, PointRole::End}, {}, {}});
+                    addPoint(2, md, {SnapKind::Midpoint, md, SketchRef{id, std::nullopt}, {}, {}});
+                    addPoint(1, x.center, {SnapKind::Center, x.center, SketchRef{id, PointRole::Center}, {}, {}});
+                    alignPts.push_back(st);
+                    alignPts.push_back(en);
+                    alignPts.push_back(x.center);
+                } else if constexpr (std::is_same_v<T, sketch::CircleGeom>) {
+                    addPoint(1, x.center, {SnapKind::Center, x.center, SketchRef{id, PointRole::Center}, {}, {}});
+                    alignPts.push_back(x.center);
+                }
+            },
+            e.geometry);
+    }
+
+    // Tier 3: intersections of pairs of curves.
+    for (std::size_t i = 0; i < curves.size(); ++i)
+        for (std::size_t j = i + 1; j < curves.size(); ++j)
+            for (Point2 q : roots(curves[i].second, curves[j].second))
+                addPoint(3, q, {SnapKind::Intersection, q, SketchRef{curves[i].first, std::nullopt},
+                                SketchRef{curves[j].first, std::nullopt}, {}});
+
+    // Tiers 4-5 need the pending start of the polyline.
+    if (lineStart_) {
+        const Point2 from = *lineStart_;
+        for (const auto& [id, g] : curves) {
+            if (g.circle) {
+                for (Point2 t : tangentPoints(g, from))
+                    addPoint(4, t, {SnapKind::Tangent, t, std::nullopt, SketchRef{id, std::nullopt},
+                                    {{from, t}}});
+            } else {
+                const Point2 n = unitp(rot90(g.dir));
+                const Point2 q = from + n * dotp(p - from, n);
+                if (lenp(q - from) > kEps)
+                    addPoint(5, q, {SnapKind::Perpendicular, q, std::nullopt, SketchRef{id, std::nullopt},
+                                    {{from, q}}});
+            }
+        }
+        alignPts.push_back(from);
+    }
+    if (arcStart_) alignPts.push_back(*arcStart_);
+
+    // Tier 6: nearest point on a curve.
+    for (const auto& [id, g] : curves) {
+        if (auto q = nearestOn(g, p)) addPoint(6, *q, {SnapKind::OnCurve, *q, SketchRef{id, std::nullopt}, {}, {}});
+    }
+
+    // Tier 7: horizontal / vertical alignment with an existing point; the x or y of the cursor is kept otherwise.
+    const double big = 1e4;
+    std::optional<Point2> alignH, alignV;
+    double bestDy = R, bestDx = R;
+    for (Point2 q : alignPts) {
+        if (std::abs(p.y - q.y) <= bestDy) {
+            bestDy = std::abs(p.y - q.y);
+            alignH = q;
+        }
+        if (std::abs(p.x - q.x) <= bestDx) {
+            bestDx = std::abs(p.x - q.x);
+            alignV = q;
+        }
+    }
+    if (alignH || alignV) {
+        SnapHit h;
+        h.kind = alignH ? SnapKind::Horizontal : SnapKind::Vertical;
+        h.point = {alignV ? alignV->x : p.x, alignH ? alignH->y : p.y};
+        if (alignH) h.guides.push_back({{alignH->x - big, alignH->y}, {alignH->x + big, alignH->y}});
+        if (alignV) h.guides.push_back({{alignV->x, alignV->y - big}, {alignV->x, alignV->y + big}});
+        cands.push_back({7, sketch::distance(p, h.point), std::move(h)});
+    }
+
+    if (cands.empty()) return std::nullopt;
+    const auto best = std::min_element(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
+        return a.tier != b.tier ? a.tier < b.tier : a.dist < b.dist;
+    });
+    return best->hit;
+}
+
+Point2 SketchSession::cursorPoint() const {
+    if (snapHint_) return snapHint_->point;
+    return cursor_.value_or(Point2{0, 0});
+}
+
+void SketchSession::setCursor(std::optional<Point2> p) {
+    cursor_ = p;
+    snapHint_ = inference_.enabled && p ? snapAt(*p) : std::nullopt;
+}
+
+// ---- tangent arc -----------------------------------------------------------------------------------------------
+
+bool SketchSession::canTangentArcAt(Point2 p, double tolMm) const {
+    return tool_ == SketchTool::Line && lineStart_ && joint_ && sketch::distance(p, *lineStart_) <= tolMm;
+}
+
+Result<SketchEntityId> SketchSession::tangentArcTo(Point2 end) {
+    if (!joint_ || !lineStart_) return makeError(ErrorCode::InvalidArgument, "no polyline to continue tangentially");
+    const Joint jt = *joint_;
+    std::optional<SnapHit> hit = snapAt(end);
+    const Point2 target = hit ? hit->point : end;
+    const auto ta = tangentArc(jt.p, jt.dir, target);
+    if (!ta) return makeError(ErrorCode::InvalidArgument, "the end point lies on the tangent line");
+
+    SketchEntityId created;
+    auto r = applyAuto("Create Tangent Arc", [&](Sketch& s, bool autoOn) -> Result<void> {
+        auto id = s.addArc(ta->geom.center, ta->geom.radius, ta->geom.startAngle, ta->geom.sweep);
+        if (!id) return std::unexpected(id.error());
+        created = *id;
+        const PointRole nearRole = ta->farIsStart ? PointRole::End : PointRole::Start;
+        const PointRole farRole = ta->farIsStart ? PointRole::Start : PointRole::End;
+        auto c = s.addConstraint(ConstraintKind::Coincident, {SketchRef{jt.entity, jt.role}, SketchRef{*id, nearRole}});
+        if (!c) return std::unexpected(c.error());
+        auto t = s.addConstraint(ConstraintKind::Tangent, {SketchRef{jt.entity, std::nullopt}, SketchRef{*id, std::nullopt}});
+        if (!t) return std::unexpected(t.error());
+        if (autoOn && hit) constrainPoint(s, SketchRef{*id, farRole}, *hit);
+        return {};
+    });
+    if (!r) return std::unexpected(r.error());
+
+    const PointRole farRole = ta->farIsStart ? PointRole::Start : PointRole::End;
+    lineStart_ = target;
+    lineStartHit_.reset();
+    joint_ = Joint{created, farRole, target, ta->farDir};
+    return created;
+}
+
+// ---- tools -----------------------------------------------------------------------------------------------------
+
+Result<void> SketchSession::click(Point2 p, double pickToleranceMm) {
+    switch (tool_) {
+    case SketchTool::Select:
+        selectAt(p, pickToleranceMm);
+        return {};
+
+    case SketchTool::Trim:
+        return trimAt(p, pickToleranceMm);
+
+    case SketchTool::Offset: {
+        auto r = offsetAt(p, pickToleranceMm);
+        if (!r) return std::unexpected(r.error());
+        return {};
+    }
+
+    case SketchTool::Line: {
+        const std::optional<SnapHit> hit = snapAt(p);
+        return clickLine(hit ? hit->point : p, hit);
+    }
+
+    case SketchTool::Arc: {
+        const std::optional<SnapHit> hit = snapAt(p);
+        return clickArc(hit ? hit->point : p, hit);
+    }
+
+    case SketchTool::Rectangle:
+    case SketchTool::CenterRectangle: {
+        const std::optional<SnapHit> hit = snapAt(p);
+        const Point2 q = hit ? hit->point : p;
+        if (!firstCorner_) {
+            firstCorner_ = q;
+            firstCornerHit_ = hit;
+            return {};
+        }
+        const bool centred = tool_ == SketchTool::CenterRectangle;
+        const Point2 a = centred ? *firstCorner_ * 2.0 - q : *firstCorner_;
+        const std::optional<SnapHit> hitA = centred ? std::nullopt : firstCornerHit_;
+        std::array<SketchEntityId, 4> ids{};
+        auto r = applyAuto(centred ? "Create Centre Rectangle" : "Create Rectangle", [&](Sketch& s, bool autoOn) {
+            return addRectangle(s, a, q, ids, hitA, hit, autoOn);
+        });
+        if (!r) return std::unexpected(r.error());   // degenerate second corner: keep waiting for one
+        firstCorner_.reset();
+        firstCornerHit_.reset();
+        return {};
+    }
+
+    case SketchTool::Circle: {
+        const std::optional<SnapHit> hit = snapAt(p);
+        const Point2 q = hit ? hit->point : p;
+        if (!circleCenter_) {
+            circleCenter_ = q;
+            circleCenterHit_ = hit;
+            return {};
+        }
+        const Point2 center = *circleCenter_;
+        const double radius = sketch::distance(center, q);
+        const std::optional<SnapHit> cHit = circleCenterHit_;
+        SketchEntityId created;
+        auto r = applyAuto("Create Circle", [&](Sketch& s, bool autoOn) -> Result<void> {
+            auto id = s.addCircle(center, radius);
+            if (!id) return std::unexpected(id.error());
+            created = *id;
+            if (autoOn && cHit) constrainPoint(s, SketchRef{*id, PointRole::Center}, *cHit);
+            return {};
+        });
+        if (!r) return std::unexpected(r.error());
+        circleCenter_.reset();
+        circleCenterHit_.reset();
+        return {};
+    }
+
+    case SketchTool::Point: {
+        const std::optional<SnapHit> hit = snapAt(p);
+        const Point2 q = hit ? hit->point : p;
+        SketchEntityId created;
+        auto r = applyAuto("Create Point", [&](Sketch& s, bool autoOn) -> Result<void> {
+            auto id = s.addPoint(q);
+            if (!id) return std::unexpected(id.error());
+            created = *id;
+            if (autoOn && hit) constrainPoint(s, SketchRef{*id, std::nullopt}, *hit);
+            return {};
+        });
+        if (!r) return std::unexpected(r.error());
+        return {};
+    }
+    }
+    return {};
+}
+
+Result<void> SketchSession::clickLine(Point2 q, const std::optional<SnapHit>& hit) {
+    if (!lineStart_) {
+        lineStart_ = q;
+        lineStartHit_ = hit;
+        joint_.reset();
+        return {};
+    }
+    const Point2 from = *lineStart_;
+    const std::optional<Joint> prev = joint_;
+    // A joint already connects the start of this segment, so the first point's snap is only used without one.
+    const std::optional<SnapHit> fromHit = prev ? std::nullopt : lineStartHit_;
+    SketchEntityId created;
+    auto r = applyAuto("Create Line", [&](Sketch& s, bool autoOn) -> Result<void> {
+        auto id = s.addLine(from, q);
+        if (!id) return std::unexpected(id.error());
+        created = *id;
+        if (prev) {
+            auto c = s.addConstraint(ConstraintKind::Coincident,
+                                     {SketchRef{prev->entity, prev->role}, SketchRef{*id, PointRole::Start}});
+            if (!c) return std::unexpected(c.error());
+        }
+        if (!autoOn || !inference_.enabled) return {};
+        if (fromHit) constrainPoint(s, SketchRef{*id, PointRole::Start}, *fromHit);
+        constrainPoint(s, SketchRef{*id, PointRole::End}, hit.value_or(SnapHit{}));
+        if (hit && (hit->kind == SnapKind::Perpendicular || hit->kind == SnapKind::Tangent) && hit->other) {
+            const ConstraintKind k = hit->kind == SnapKind::Perpendicular ? ConstraintKind::Perpendicular
+                                                                          : ConstraintKind::Tangent;
+            auto c = s.addConstraint(k, {SketchRef{*id, std::nullopt}, *hit->other});
+            if (!c) return std::unexpected(c.error());
+        } else {
+            // Near-axis segments become exactly horizontal or vertical.
+            const Point2 d = q - from;
+            if (std::abs(d.y) <= std::abs(d.x) * std::tan(kAxisTolRad)) {
+                (void)s.addConstraint(ConstraintKind::Horizontal, {SketchRef{*id, std::nullopt}});
+            } else if (std::abs(d.x) <= std::abs(d.y) * std::tan(kAxisTolRad)) {
+                (void)s.addConstraint(ConstraintKind::Vertical, {SketchRef{*id, std::nullopt}});
+            }
+        }
+        return {};
+    });
+    if (!r) return std::unexpected(r.error());
+    lineStart_ = q;
+    lineStartHit_ = hit;
+    joint_ = Joint{created, PointRole::End, q, unitp(q - from)};
+    return {};
+}
+
+Result<void> SketchSession::clickArc(Point2 q, const std::optional<SnapHit>& hit) {
+    if (!arcStart_) {
+        arcStart_ = q;
+        arcStartHit_ = hit;
+        return {};
+    }
+    if (!arcMid_) {
+        arcMid_ = q;
+        return {};
+    }
+    const Point2 a = *arcStart_, m = *arcMid_;
+    const std::optional<SnapHit> aHit = arcStartHit_;
+    auto g = threePointArc(a, m, q);
+    if (!g) return makeError(ErrorCode::InvalidArgument, "the three points of an arc must not be collinear");
+    auto r = applyAuto("Create Arc", [&](Sketch& s, bool autoOn) -> Result<void> {
+        auto id = s.addArc(g->geom.center, g->geom.radius, g->geom.startAngle, g->geom.sweep);
+        if (!id) return std::unexpected(id.error());
+        if (!autoOn || !inference_.enabled) return {};
+        const PointRole aRole = g->aIsStart ? PointRole::Start : PointRole::End;
+        const PointRole qRole = g->aIsStart ? PointRole::End : PointRole::Start;
+        if (aHit) constrainPoint(s, SketchRef{*id, aRole}, *aHit);
+        if (hit) constrainPoint(s, SketchRef{*id, qRole}, *hit);
+        return {};
+    });
+    if (!r) return std::unexpected(r.error());
+    arcStart_.reset();
+    arcStartHit_.reset();
+    arcMid_.reset();
+    return {};
+}
+
+void SketchSession::endPolyline() {
+    lineStart_.reset();
+    lineStartHit_.reset();
+    joint_.reset();
+    tangentDrag_.reset();
+}
+
+bool SketchSession::cancel() {
+    if (tool_ == SketchTool::Select) return false;
+    clearPending();
+    tool_ = SketchTool::Select;
+    return true;
+}
+
+bool SketchSession::hasPending() const noexcept {
+    return lineStart_ || firstCorner_ || circleCenter_ || arcStart_;
+}
+
+std::vector<EntityGeometry> SketchSession::preview() const {
+    std::vector<EntityGeometry> out;
+    if (!cursor_) return out;
+    const Point2 c = cursorPoint();
+    if (tangentDrag_ && joint_) {
+        if (auto ta = tangentArc(joint_->p, joint_->dir, *tangentDrag_)) out.emplace_back(ta->geom);
+        return out;
+    }
+    if (arcStart_) {
+        if (arcMid_) {
+            if (auto g = threePointArc(*arcStart_, *arcMid_, c)) out.emplace_back(g->geom);
+        } else if (sketch::distance(*arcStart_, c) > kEps) {
+            out.emplace_back(LineGeom{*arcStart_, c});
+        }
+        return out;
+    }
+    if (lineStart_ && sketch::distance(*lineStart_, c) > kEps) {
+        out.emplace_back(LineGeom{*lineStart_, c});
+    } else if (firstCorner_ && sketch::distance(*firstCorner_, c) > kEps) {
+        const Point2 a = *firstCorner_;
+        if (tool_ == SketchTool::CenterRectangle) {
+            const Point2 o = a * 2.0 - c;
+            const Point2 p0{o.x, o.y}, p1{c.x, o.y}, p3{o.x, c.y};
+            out.emplace_back(LineGeom{p0, p1});
+            out.emplace_back(LineGeom{p1, c});
+            out.emplace_back(LineGeom{c, p3});
+            out.emplace_back(LineGeom{p3, p0});
+        } else {
+            const Point2 p1{c.x, a.y}, p3{a.x, c.y};
+            out.emplace_back(LineGeom{a, p1});
+            out.emplace_back(LineGeom{p1, c});
+            out.emplace_back(LineGeom{c, p3});
+            out.emplace_back(LineGeom{p3, a});
+        }
+    } else if (circleCenter_ && sketch::distance(*circleCenter_, c) > kEps) {
+        out.emplace_back(sketch::CircleGeom{*circleCenter_, sketch::distance(*circleCenter_, c)});
+    }
+    return out;
+}
+
+std::optional<SketchEntityId> SketchSession::nearestEntity(Point2 p, double tolMm) const {
+    std::optional<SketchEntityId> best;
+    double bestDist = tolMm;
+    for (const auto& [id, e] : sketch_.entities()) {
+        double d = 0;
+        if (auto g = geoOf(e.geometry)) {
+            auto q = nearestOn(*g, p);
+            if (!q) {
+                // Arc: distance to its ends when the projection falls outside the arc.
+                const auto& arc = std::get<sketch::ArcGeom>(e.geometry);
+                d = std::min(sketch::distance(p, sketch::arcStart(arc)), sketch::distance(p, sketch::arcEnd(arc)));
+            } else if (g->circle) {
+                d = sketch::distance(p, *q);
+            } else {
+                d = segmentDistance(p, g->p, g->p + g->dir);
+            }
+        } else {
+            d = sketch::distance(p, std::get<sketch::PointGeom>(e.geometry).p);
+        }
+        if (d <= bestDist && (!best || d < bestDist)) {
+            best = id;
+            bestDist = d;
+        }
+    }
+    return best;
+}
+
+std::optional<SketchEntityId> SketchSession::selectAt(Point2 p, double tolMm) {
+    selected_ = nearestEntity(p, tolMm);
+    return selected_;
+}
+
+Result<void> SketchSession::trimAt(Point2 p, double tolMm) {
+    const auto target = nearestEntity(p, tolMm);
+    if (!target) return makeError(ErrorCode::InvalidArgument, "nothing to trim at that point");
+    const sketch::SketchEntity& e = *sketch_.findEntity(*target);
+    if (e.kind() != EntityKind::Line && e.kind() != EntityKind::Arc)
+        return makeError(ErrorCode::InvalidArgument, "only lines and arcs can be trimmed");
+    const Geo geo = *geoOf(e.geometry);
+    auto paramOf = [&](Point2 q) {
+        if (!geo.circle) return lineParam(geo, q);
+        return wrapAngle(angleOf(geo.c, q) - geo.a0) / geo.sweep;
+    };
+
+    // Cut parameters (0..1 along the target) where other curves cross it strictly inside.
+    std::vector<double> cuts;
+    for (const auto& [id, o] : sketch_.entities()) {
+        if (id == *target) continue;
+        auto og = geoOf(o.geometry);
+        if (!og) continue;
+        for (Point2 q : roots(geo, *og)) {
+            const double t = paramOf(q);
+            if (t > 1e-6 && t < 1 - 1e-6) cuts.push_back(t);
+        }
+    }
+    const auto tcPoint = nearestOn(geo, p);
+    if (!tcPoint) return makeError(ErrorCode::InvalidArgument, "nothing to trim at that point");
+    const double tc = paramOf(*tcPoint);
+
+    if (cuts.empty()) {
+        return apply("Trim", [&](Sketch& s) { return s.removeEntity(*target); });
+    }
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end(), [](double a, double b) { return std::abs(a - b) < 1e-9; }),
+               cuts.end());
+    double lo = 0, hi = 1;
+    for (double c : cuts) {
+        if (c <= tc) {
+            lo = c;
+        } else {
+            hi = c;
+            break;
+        }
+    }
+    const bool keepLeft = lo > 0, keepRight = hi < 1;
+
+    auto pieceGeom = [&](double t0, double t1) -> EntityGeometry {
+        if (!geo.circle) return LineGeom{geo.p + geo.dir * t0, geo.p + geo.dir * t1};
+        return sketch::ArcGeom{geo.c, geo.r, geo.a0 + geo.sweep * t0, geo.sweep * (t1 - t0)};
+    };
+    const bool construction = e.construction;
+
+    return apply("Trim", [&](Sketch& s) -> Result<void> {
+        // Dimensions on the trimmed curve no longer describe a piece: they go.
+        std::vector<sketch::SketchDimensionId> dims;
+        for (const auto& [did, d] : s.dimensions())
+            for (const SketchRef& r : d.refs)
+                if (r.entity == *target) dims.push_back(did);
+        for (auto did : dims)
+            if (auto r = s.removeDimension(did); !r) return std::unexpected(r.error());
+
+        // Constraints that touch the curve are taken out and re-created per surviving piece.
+        std::vector<sketch::SketchConstraintId> cids;
+        std::vector<std::pair<ConstraintKind, std::vector<SketchRef>>> olds;
+        for (const auto& [cid, c] : s.constraints()) {
+            bool touches = false;
+            for (const SketchRef& r : c.refs) touches = touches || r.entity == *target;
+            if (!touches) continue;
+            cids.push_back(cid);
+            olds.emplace_back(c.kind, c.refs);
+        }
+        for (auto cid : cids)
+            if (auto r = s.removeConstraint(cid); !r) return std::unexpected(r.error());
+
+        struct Piece {
+            SketchEntityId id;
+            double t0, t1;
+        };
+        std::vector<Piece> pieces;
+        if (keepLeft) {
+            if (auto r = s.setGeometry(*target, pieceGeom(0, lo)); !r) return std::unexpected(r.error());
+            pieces.push_back({*target, 0, lo});
+            if (keepRight) {
+                auto id = addPiece(s, pieceGeom(hi, 1), construction);
+                if (!id) return std::unexpected(id.error());
+                pieces.push_back({*id, hi, 1});
+            }
+        } else if (keepRight) {
+            if (auto r = s.setGeometry(*target, pieceGeom(hi, 1)); !r) return std::unexpected(r.error());
+            pieces.push_back({*target, hi, 1});
+        } else {
+            if (auto r = s.removeEntity(*target); !r) return std::unexpected(r.error());
+        }
+
+        for (const auto& [kind, refs] : olds) {
+            for (const Piece& pc : pieces) {
+                std::vector<SketchRef> mapped;
+                bool ok = true;
+                for (const SketchRef& r : refs) {
+                    if (r.entity != *target) {
+                        mapped.push_back(r);
+                    } else if (!r.role) {
+                        if (keepsOnPiece(kind)) mapped.push_back({pc.id, std::nullopt});
+                        else ok = false;
+                    } else if (*r.role == PointRole::Start && pc.t0 <= 1e-12) {
+                        mapped.push_back({pc.id, PointRole::Start});
+                    } else if (*r.role == PointRole::End && pc.t1 >= 1 - 1e-12) {
+                        mapped.push_back({pc.id, PointRole::End});
+                    } else if (*r.role == PointRole::Center && geo.circle) {
+                        mapped.push_back({pc.id, PointRole::Center});
+                    } else {
+                        ok = false;
+                    }
+                }
+                if (ok) (void)s.addConstraint(kind, mapped);   // a constraint the piece cannot carry is dropped
+            }
+        }
+        return {};
+    });
+}
+
+Result<std::vector<SketchEntityId>> SketchSession::offsetAt(Point2 p, double tolMm) {
+    const auto seed = nearestEntity(p, tolMm);
+    if (!seed) return makeError(ErrorCode::InvalidArgument, "nothing to offset at that point");
+    return offsetLoop(*seed, offsetDistance_);
+}
+
+Result<std::vector<SketchEntityId>> SketchSession::offsetLoop(SketchEntityId seed, double d) {
+    if (!std::isfinite(d) || std::abs(d) < kEps) return makeError(ErrorCode::InvalidArgument, "offset distance must be non-zero");
+
+    const sketch::ProfileLoop* loop = nullptr;
+    for (const sketch::SketchProfile& prof : profiles_) {
+        auto has = [&](const sketch::ProfileLoop& l) {
+            return std::any_of(l.edges.begin(), l.edges.end(), [&](const sketch::ProfileEdge& e) { return e.entity == seed; });
+        };
+        if (has(prof.outer)) loop = &prof.outer;
+        for (const sketch::ProfileLoop& h : prof.holes)
+            if (!loop && has(h)) loop = &h;
+        if (loop) break;
+    }
+    if (!loop) return makeError(ErrorCode::NotFound, "the entity is not on a closed profile");
+
+    // Every edge must be a whole line, arc or circle, each used once.
+    std::set<SketchEntityId> seen;
+    for (const sketch::ProfileEdge& e : loop->edges) {
+        const sketch::SketchEntity* ent = sketch_.findEntity(e.entity);
+        if (!ent || !seen.insert(e.entity).second)
+            return makeError(ErrorCode::InvalidArgument, "select a closed chain of whole lines and arcs");
+        auto near = [](Point2 a, Point2 b) { return sketch::distance(a, b) < 1e-6; };
+        bool whole = false;
+        if (ent->kind() == EntityKind::Line) {
+            const auto& g = std::get<LineGeom>(ent->geometry);
+            whole = !e.isArc && ((near(e.start, g.start) && near(e.end, g.end)) || (near(e.start, g.end) && near(e.end, g.start)));
+        } else if (ent->kind() == EntityKind::Arc) {
+            whole = e.isArc && std::abs(std::abs(e.sweep) - std::get<sketch::ArcGeom>(ent->geometry).sweep) < 1e-6;
+        } else if (ent->kind() == EntityKind::Circle) {
+            whole = e.isArc && std::abs(std::abs(e.sweep) - kTwoPi) < 1e-6;
+        }
+        if (!whole) return makeError(ErrorCode::InvalidArgument, "select a closed chain of whole lines and arcs");
+    }
+
+    // Edge k: its offset curve, plus the outward normal (away from the loop interior: right of travel for a CCW
+    // loop, left for a CW loop) that decides how an arc's radius moves.
+    const bool ccw = loop->area > 0;
+    struct Edge {
+        SketchEntityId id;
+        bool line = false;
+        Point2 s, e;        ///< Traversal start and end.
+        Point2 t;           ///< Line: unit direction of travel.
+        Point2 nrm;         ///< Outward normal at the start (lines).
+        Geo off;            ///< Offset curve.
+        Point2 c;           ///< Arc/circle centre.
+        double sweep = 0;   ///< Signed traversal sweep (arcs).
+    };
+    std::vector<Edge> edges;
+    for (const sketch::ProfileEdge& pe : loop->edges) {
+        const sketch::SketchEntity* ent = sketch_.findEntity(pe.entity);
+        Edge ed;
+        ed.id = pe.entity;
+        ed.s = pe.start;
+        ed.e = pe.end;
+        if (ent->kind() == EntityKind::Line) {
+            ed.line = true;
+            ed.t = unitp(pe.end - pe.start);
+            ed.nrm = ccw ? Point2{ed.t.y, -ed.t.x} : Point2{-ed.t.y, ed.t.x};
+            ed.off = Geo{};
+            ed.off.p = pe.start + ed.nrm * d;
+            ed.off.dir = ed.t;
+        } else {
+            // A circle is traversed as a full turn: it has the same centre and radius as an arc with sweep 2*pi.
+            sketch::ArcGeom cg{};
+            if (const auto* arc = std::get_if<sketch::ArcGeom>(&ent->geometry)) {
+                cg = *arc;
+            } else {
+                const auto& circ = std::get<sketch::CircleGeom>(ent->geometry);
+                cg = sketch::ArcGeom{circ.center, circ.radius, 0, kTwoPi};
+            }
+            ed.c = cg.center;
+            ed.sweep = pe.sweep;
+            const double am = angleOf(cg.center, pe.start) + pe.sweep / 2;
+            const Point2 rad = unitp(polar(cg.center, 1.0, am));
+            const Point2 tv = pe.sweep > 0 ? rot90(rad) : rot90(rad) * -1.0;
+            const Point2 nrm = ccw ? Point2{tv.y, -tv.x} : Point2{-tv.y, tv.x};
+            const double rNew = cg.radius + (dotp(nrm, rad) >= 0 ? d : -d);
+            if (rNew <= kEps) return makeError(ErrorCode::InvalidArgument, "the offset collapses an arc");
+            ed.off = Geo{};
+            ed.off.circle = true;
+            ed.off.c = cg.center;
+            ed.off.r = rNew;
+        }
+        edges.push_back(ed);
+    }
+
+    const std::size_t n = edges.size();
+    std::vector<Point2> joints(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const Edge& prev = edges[(i + n - 1) % n];
+        const Edge& cur = edges[i];
+        const Point2 P = cur.s;
+        if (n == 1) {
+            joints[i] = P;   // full circle: no joints
+            continue;
+        }
+        if (prev.line && cur.line && std::abs(crossp(prev.off.dir, cur.off.dir)) < 1e-9) {
+            // Parallel neighbours: they join at the common offset point, which must lie on both.
+            const Point2 j = P + cur.nrm * d;
+            if (std::abs(crossp(prev.off.dir, j - prev.off.p)) > 1e-6 * std::max(1.0, std::abs(d)))
+                return makeError(ErrorCode::InvalidArgument, "the offset cannot join opposite parallel edges");
+            joints[i] = j;
+            continue;
+        }
+        const auto rs = roots(prev.off, cur.off);
+        if (rs.empty()) return makeError(ErrorCode::InvalidArgument, "the offset is too large for this profile");
+        joints[i] = *std::min_element(rs.begin(), rs.end(), [&](Point2 a, Point2 b) {
+            return sketch::distance(a, P) < sketch::distance(b, P);
+        });
+    }
+
+    std::vector<SketchEntityId> created;
+    auto r = apply("Offset", [&](Sketch& s) -> Result<void> {
+        struct Placed {
+            SketchEntityId id;
+            PointRole startRole, endRole;
+        };
+        std::vector<Placed> placed;
+        for (std::size_t i = 0; i < n; ++i) {
+            const Edge& ed = edges[i];
+            const Point2 j0 = joints[i], j1 = joints[(i + 1) % n];
+            if (ed.line) {
+                auto id = s.addLine(j0, j1);
+                if (!id) return std::unexpected(id.error());
+                placed.push_back({*id, PointRole::Start, PointRole::End});
+                if (std::abs(ed.t.y) < 1e-9)
+                    (void)s.addConstraint(ConstraintKind::Horizontal, {SketchRef{*id, std::nullopt}});
+                else if (std::abs(ed.t.x) < 1e-9)
+                    (void)s.addConstraint(ConstraintKind::Vertical, {SketchRef{*id, std::nullopt}});
+            } else if (n == 1) {
+                auto id = s.addCircle(ed.off.c, ed.off.r);
+                if (!id) return std::unexpected(id.error());
+                placed.push_back({*id, PointRole::Start, PointRole::End});
+            } else {
+                const double as = angleOf(ed.off.c, j0), ae = angleOf(ed.off.c, j1);
+                const bool fwd = ed.sweep > 0;
+                const double start = fwd ? as : ae;
+                const double sw = fwd ? wrapAngle(ae - as) : wrapAngle(as - ae);
+                if (sw < 1e-9 || sw >= kTwoPi) return makeError(ErrorCode::InvalidArgument, "the offset collapses an arc");
+                auto id = s.addArc(ed.off.c, ed.off.r, start, sw);
+                if (!id) return std::unexpected(id.error());
+                placed.push_back({*id, fwd ? PointRole::Start : PointRole::End, fwd ? PointRole::End : PointRole::Start});
+            }
+        }
+        if (n > 1) {
+            for (std::size_t i = 0; i < n; ++i) {
+                const Placed& a = placed[i];
+                const Placed& b = placed[(i + 1) % n];
+                auto c = s.addConstraint(ConstraintKind::Coincident,
+                                         {SketchRef{a.id, a.endRole}, SketchRef{b.id, b.startRole}});
+                if (!c) return std::unexpected(c.error());
+            }
+        }
+        created.clear();
+        for (const Placed& pl : placed) created.push_back(pl.id);
+        return {};
+    });
+    if (!r) return std::unexpected(r.error());
+    return created;
+}
+
+void SketchSession::clearPending() noexcept {
+    lineStart_.reset();
+    lineStartHit_.reset();
+    joint_.reset();
+    firstCorner_.reset();
+    firstCornerHit_.reset();
+    circleCenter_.reset();
+    circleCenterHit_.reset();
+    arcStart_.reset();
+    arcStartHit_.reset();
+    arcMid_.reset();
+    tangentDrag_.reset();
+}
+
+Result<void> SketchSession::undo() {
+    auto r = undo_.undo();
+    clearPending();
+    refresh();
+    return r;
+}
+
+Result<void> SketchSession::redo() {
+    auto r = undo_.redo();
+    clearPending();
+    refresh();
+    return r;
+}
+
+void SketchSession::refresh() {
+    auto profiles = sketch::detectProfiles(sketch_);
+    profiles_ = profiles ? std::move(*profiles) : std::vector<sketch::SketchProfile>{};
+    report_ = sketch::diagnoseSketch(sketch_);
+    if (selected_ && !sketch_.findEntity(*selected_)) selected_.reset();
+    snapHint_ = inference_.enabled && cursor_ ? snapAt(*cursor_) : std::nullopt;
+}
+
+} // namespace iw::ui

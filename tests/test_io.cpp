@@ -11,7 +11,12 @@
 #include <string_view>
 #include <vector>
 
+#include "core/expr.hpp"
+#include "core/params.hpp"
 #include "io/document_io.hpp"
+#include "kernel/ops.hpp"
+#include "naming/naming_map.hpp"
+#include "recompute/evaluator.hpp"
 
 namespace {
 
@@ -157,9 +162,10 @@ TEST_F(IoTest, UnknownKindIsNotFound) {
 TEST_F(IoTest, VersionAboveSupportedIsParseError) {
     ASSERT_TRUE(iw::io::saveDocument(doc(), makeDocument()).has_value());
     std::string text = readFile(manifest());
-    const auto pos = text.find("\"version\": 0");
+    const std::string current = "\"version\": " + std::to_string(iw::io::kDocumentFormatVersion);
+    const auto pos = text.find(current);
     ASSERT_NE(pos, std::string::npos);
-    text.replace(pos, std::string("\"version\": 0").size(), "\"version\": 99");
+    text.replace(pos, current.size(), "\"version\": 99");
     writeFile(manifest(), text);
     auto loaded = iw::io::loadDocument(doc(), makeRegistry());
     ASSERT_FALSE(loaded.has_value());
@@ -265,4 +271,167 @@ TEST_F(IoTest, SaveRejectsRegularFileAsTarget) {
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error().code, ErrorCode::InvalidArgument);
     EXPECT_EQ(readFile(doc()), "occupied");
+}
+
+// ---- parameter table persistence (format v1) and stamps after reload ------------------------------------------
+
+namespace {
+
+/// Test feature: a box whose width is an expression, evaluated against the parameter table at compute time.
+class ParamBoxFeature final : public Feature {
+public:
+    ParamBoxFeature(FeatureId id, std::string width) : id_(id), width_(std::move(width)) {}
+    FeatureId id() const override { return id_; }
+    std::string_view kind() const override { return "test.parambox"; }
+    std::vector<iw::BodyId> writesBodies() const override { return {iw::BodyId{1}}; }
+    std::vector<std::string> parameterReferences() const override {
+        auto ex = iw::Expression::parse(width_);
+        return ex ? ex->references() : std::vector<std::string>{};
+    }
+    std::uint64_t paramHash() const override { return std::hash<std::string>{}(width_); }
+    std::string paramsJson() const override { return "{\"width\":\"" + width_ + "\"}"; }
+    iw::Result<FeatureResult> compute(const EvalContext& ctx) const override {
+        auto ex = iw::Expression::parse(width_);
+        if (!ex) return std::unexpected(ex.error());
+        auto q = ex->evaluate([&ctx](std::string_view name) -> iw::Result<iw::Quantity> {
+            if (!ctx.params) return iw::makeError(ErrorCode::NotFound, "no parameter table");
+            return ctx.params->evaluate(name);
+        });
+        if (!q) return std::unexpected(q.error());
+        auto box = iw::kernel::makeBox({0, 0, 0}, q->value, 2, 2);
+        if (!box) return std::unexpected(box.error());
+        FeatureResult out;
+        iw::naming::NamingMap map;
+        map.resize(box->shape.subShapeCount(iw::kernel::SubShapeKind::Face),
+                   box->shape.subShapeCount(iw::kernel::SubShapeKind::Edge),
+                   box->shape.subShapeCount(iw::kernel::SubShapeKind::Vertex));
+        out.bodies.emplace(iw::BodyId{1}, std::move(box->shape));
+        out.namings.emplace(iw::BodyId{1}, std::move(map));
+        return out;
+    }
+
+private:
+    FeatureId id_;
+    std::string width_;
+};
+
+FeatureRegistry paramRegistry() {
+    FeatureRegistry reg;
+    reg.add("test.parambox", [](FeatureId id, std::string_view params) -> iw::Result<std::shared_ptr<Feature>> {
+        // Params are {"width":"<expr>"} with no escapes in the expressions used by these tests.
+        const std::string key = "\"width\":\"";
+        const auto at = std::string(params).find(key);
+        if (at == std::string::npos) return iw::makeError(ErrorCode::ParseError, "parambox: bad params");
+        const std::string text(params);
+        const auto start = at + key.size();
+        const auto end = text.find('"', start);
+        if (end == std::string::npos) return iw::makeError(ErrorCode::ParseError, "parambox: bad params");
+        return std::make_shared<ParamBoxFeature>(id, text.substr(start, end - start));
+    });
+    return reg;
+}
+
+/// Stamp of body 1 for each feature-body pair (what the evaluator hands out).
+std::uint64_t bodyStamp(const iw::recompute::EvalResult& r) { return r.bodies.at(iw::BodyId{1}).stamp().value; }
+
+} // namespace
+
+TEST_F(IoTest, ParametersRoundTripWithAllFields) {
+    iw::io::Document d;
+    d.name = "params";
+    d.nextId = 10;
+    ASSERT_TRUE(d.parameters.add("d1", "2 in + 5 mm", "mm", "wall thickness"));
+    ASSERT_TRUE(d.parameters.add("d2", "d1 * 2", "", ""));
+    ASSERT_TRUE(d.parameters.add("ang", "30 deg", "deg", "tilt"));
+    ASSERT_TRUE(d.parameters.setFavourite("d1", true));
+    ASSERT_TRUE(iw::io::saveDocument(doc(), d).has_value());
+
+    auto loaded = iw::io::loadDocument(doc(), paramRegistry());
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    const auto& ps = loaded->parameters.parameters();
+    ASSERT_EQ(ps.size(), 3u);
+    EXPECT_EQ(ps[0].name, "d1");
+    EXPECT_EQ(ps[0].expression.source(), "2 in + 5 mm");
+    EXPECT_EQ(ps[0].unit, "mm");
+    EXPECT_EQ(ps[0].comment, "wall thickness");
+    EXPECT_TRUE(ps[0].favourite);
+    EXPECT_EQ(ps[1].name, "d2");
+    EXPECT_EQ(ps[1].expression.source(), "d1 * 2");
+    EXPECT_FALSE(ps[1].favourite);
+    EXPECT_EQ(ps[2].unit, "deg");
+    auto d2 = loaded->parameters.evaluate("d2");
+    ASSERT_TRUE(d2.has_value());
+    EXPECT_NEAR(d2->value, 2 * 55.8, 1e-9);
+}
+
+TEST_F(IoTest, StampsAreIdenticalAfterReload) {
+    iw::io::Document d;
+    d.name = "stamps";
+    d.nextId = 10;
+    ASSERT_TRUE(d.parameters.add("w", "12 mm"));
+    ASSERT_TRUE(d.parameters.add("unused", "1 mm"));
+    d.timeline.append(std::make_shared<ParamBoxFeature>(FeatureId{1}, "w"));
+    ASSERT_TRUE(iw::io::saveDocument(doc(), d).has_value());
+
+    auto loaded = iw::io::loadDocument(doc(), paramRegistry());
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+
+    iw::recompute::Evaluator before, after;
+    auto a = before.evaluate(d.timeline, &d.parameters);
+    auto b = after.evaluate(loaded->timeline, &loaded->parameters);
+    ASSERT_TRUE(a && b);
+    ASSERT_EQ(a->statuses[0].state, iw::recompute::FeatureStatus::State::Ok) << a->statuses[0].error.message;
+    EXPECT_EQ(bodyStamp(*a), bodyStamp(*b));
+    EXPECT_EQ(d.parameters.hashOfUsed(std::vector<std::string>{"w"}),
+              loaded->parameters.hashOfUsed(std::vector<std::string>{"w"}));
+
+    // Editing the used parameter after reload recomputes; the unused one does not.
+    auto edited = loaded->parameters;
+    ASSERT_TRUE(edited.setExpression("unused", "2 mm"));
+    auto same = after.evaluate(loaded->timeline, &edited);
+    ASSERT_TRUE(same.has_value());
+    EXPECT_EQ(same->computedCount, 0u);
+    ASSERT_TRUE(edited.setExpression("w", "20 mm"));
+    auto changed = after.evaluate(loaded->timeline, &edited);
+    ASSERT_TRUE(changed.has_value());
+    EXPECT_EQ(changed->computedCount, 1u);
+    EXPECT_NE(bodyStamp(*changed), bodyStamp(*b));
+}
+
+TEST_F(IoTest, V0ManifestWithoutParametersLoadsAsEmptyTable) {
+    const std::string v0 = R"({
+  "format": "ironwood-document",
+  "version": 0,
+  "name": "old",
+  "displayUnit": "mm",
+  "nextId": 3,
+  "timeline": {
+    "rollbackMarker": null,
+    "suppressed": [],
+    "features": [ { "id": 1, "kind": "test.box", "params": { "h": 3 } } ]
+  }
+})";
+    fs::create_directories(doc());
+    writeFile(manifest(), v0);
+    auto loaded = iw::io::loadDocument(doc(), makeRegistry());
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_TRUE(loaded->parameters.parameters().empty());
+    EXPECT_EQ(loaded->timeline.size(), 1u);
+}
+
+TEST_F(IoTest, V1ManifestWithoutParametersIsParseError) {
+    fs::create_directories(doc());
+    writeFile(manifest(), R"({"format":"ironwood-document","version":1,"name":"x","displayUnit":"mm","nextId":2,)"
+                          R"("timeline":{"rollbackMarker":null,"suppressed":[],"features":[]}})");
+    auto loaded = iw::io::loadDocument(doc(), makeRegistry());
+    EXPECT_EQ(loaded.error().code, ErrorCode::ParseError);
+}
+
+TEST_F(IoTest, SavedManifestIsVersion1WithParametersArray) {
+    iw::io::Document d = makeDocument();
+    ASSERT_TRUE(d.parameters.add("p", "5 mm"));
+    ASSERT_TRUE(iw::io::saveDocument(doc(), d).has_value());
+    const std::string text = readFile(manifest());
+    EXPECT_NE(text.find("\"version\": 1"), std::string::npos);
+    EXPECT_NE(text.find("\"parameters\""), std::string::npos);
 }

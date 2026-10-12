@@ -2,6 +2,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -117,17 +118,34 @@ private:
 /// Latest-wins helper for speculative previews (drag a slider -> many requests, only the newest matters).
 /// `submit()` cancels the previous in-flight job and starts a new one; `latest()` is the newest handle.
 /// Thread-safe. Stale results are simply never consumed by callers who always read `latest()`.
+/// The job is submitted WITHOUT holding the internal mutex: if JobSystem runs it inline (its enqueue fallback
+/// on a posting failure), the job may itself call latest()/submit()/cancel() without self-deadlocking.
 template <class T> class LatestWins {
 public:
     explicit LatestWins(JobSystem& jobs) : jobs_(jobs) {}
 
     /// The previous job is cancelled only after the new one has been accepted, so a throwing submit
-    /// leaves the previous job as `latest()`, not a cancelled one.
+    /// leaves the previous job as `latest()`, not a cancelled one. Submissions are ordered by a ticket taken
+    /// under the lock: a slower concurrent submit that finishes after a newer one is cancelled, never installed.
     template <class F> JobHandle<T> submit(Priority p, F&& fn) {
-        std::lock_guard lock(mutex_);
-        JobHandle<T> next = jobs_.submit(p, std::forward<F>(fn));
-        if (latest_.valid()) latest_.cancel();
-        latest_ = next;
+        std::uint64_t ticket = 0;
+        {
+            std::lock_guard lock(mutex_);
+            ticket = ++nextTicket_;
+        }
+        JobHandle<T> next = jobs_.submit(p, std::forward<F>(fn)); // mutex NOT held: see class comment
+        JobHandle<T> superseded;
+        {
+            std::lock_guard lock(mutex_);
+            if (ticket > latestTicket_) {
+                superseded = latest_;
+                latest_ = next;
+                latestTicket_ = ticket;
+            } else {
+                next.cancel(); // a newer submit already won the race
+            }
+        }
+        if (superseded.valid()) superseded.cancel();
         return next;
     }
     /// Newest handle (invalid before first submit).
@@ -145,6 +163,8 @@ private:
     JobSystem& jobs_;
     mutable std::mutex mutex_;
     JobHandle<T> latest_;
+    std::uint64_t nextTicket_ = 0;   ///< last ticket handed out (guarded by mutex_)
+    std::uint64_t latestTicket_ = 0; ///< ticket of latest_ (guarded by mutex_)
 };
 
 } // namespace iw

@@ -61,4 +61,21 @@ struct StlOptions {
 Result<void> exportStl(const std::filesystem::path& path, const Shape& shape, const StlOptions& options = {},
                        CancelToken cancel = {});
 
+/// One solid to export as a 3MF object. `color` is the sRGB display colour (alpha written as opaque); absent
+/// means the exporter's neutral grey.
+struct MeshBody {
+    std::string name;
+    Shape shape;
+    std::optional<Color> color;
+};
+
+/// Writes a 3MF package (OPC zip: [Content_Types].xml, _rels/.rels, 3D/3dmodel.model) with one <object> per body,
+/// `unit="millimeter"`, and colours as one <basematerials> group. Each body is tessellated with `options`
+/// (same BRepMesh parameters as exportStl; per-face vertices, no welding, so counts equal tess::tessellate with
+/// the same deflections). The zip is written with the STORED method (no compression) and CRC-32 checked entries.
+/// Errors: InvalidArgument (no bodies, null shape, empty path, bad deflection), KernelFailure (a face
+/// failed to mesh or OCCT threw), IoError, Cancelled.
+Result<void> export3mf(const std::filesystem::path& path, const std::vector<MeshBody>& bodies,
+                       const StlOptions& options = {}, CancelToken cancel = {});
+
 } // namespace iw::kernel

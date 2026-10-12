@@ -19,7 +19,7 @@
 #include "naming/element_name.hpp"
 #include "naming/naming_map.hpp"
 #include "recompute/evaluator.hpp"
-#include "recompute/extrude_feature.hpp"
+#include "features/extrude_feature.hpp"
 #include "recompute/timeline.hpp"
 #include "tess/tessellate.hpp"
 
@@ -58,18 +58,20 @@ std::string firstDifference(const Snapshot& a, const Snapshot& b) {
 recompute::Timeline makeTimeline() {
     recompute::Timeline timeline;
     auto prism = [](std::uint64_t id, double x0, double y0, double w, double h, double height,
-                    recompute::ExtrudeParams::Operation op) {
-        recompute::ExtrudeParams p;
-        p.planeOrigin = {0, 0, 0};
-        p.planeNormal = {0, 0, 1};
-        p.planeXDir = {1, 0, 0};
-        p.points = {{x0, y0}, {x0 + w, y0}, {x0 + w, y0 + h}, {x0, y0 + h}};
-        p.vector = {0, 0, height};
+                    features::ExtrudeParams::Operation op) {
+        features::ExtrudeParams p;
+        features::PolygonSource src;
+        src.planeOrigin = {0, 0, 0};
+        src.planeNormal = {0, 0, 1};
+        src.planeXDir = {1, 0, 0};
+        src.points = {{x0, y0}, {x0 + w, y0}, {x0 + w, y0 + h}, {x0, y0 + h}};
+        src.vector = {0, 0, height};
+        p.source = src;
         p.operation = op;
         p.body = BodyId{1};
-        return std::make_shared<recompute::ExtrudeFeature>(FeatureId{id}, p);
+        return std::make_shared<features::ExtrudeFeature>(FeatureId{id}, p);
     };
-    using Op = recompute::ExtrudeParams::Operation;
+    using Op = features::ExtrudeParams::Operation;
     timeline.append(prism(1, 0, 0, 4, 3, 6, Op::NewBody));
     timeline.append(prism(2, 2, 1, 4, 3, 4, Op::Join));
     timeline.append(prism(3, 1, 2, 2, 5, 3, Op::Join));

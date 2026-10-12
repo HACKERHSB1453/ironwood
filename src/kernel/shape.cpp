@@ -2,12 +2,20 @@
 #include "kernel/shape.hpp"
 
 #include <Bnd_Box.hxx>
+#include <GeomAbs_SurfaceType.hxx>
+#include <gp_Cone.hxx>
+#include <gp_Cylinder.hxx>
+#include <gp_Pln.hxx>
+#include <gp_Pnt.hxx>
+#include <BRepAdaptor_Surface.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
 #include <BRep_Tool.hxx>
 #include <GProp_GProps.hxx>
 #include <TopoDS.hxx>
+#include <TopoDS_Face.hxx>
 #include <cmath>
+#include <gp_Dir.hxx>
 #include <Standard_Failure.hxx>
 #include <Standard_Version.hxx>
 #include <TopAbs_ShapeEnum.hxx>
@@ -55,6 +63,50 @@ Shape Shape::withStamp(ShapeStamp s) const {
 std::uint32_t Shape::subShapeCount(SubShapeKind kind) const {
     if (isNull()) return 0;
     return static_cast<std::uint32_t>(impl_->index->map(kind).Extent());
+}
+
+FaceGeometry Shape::faceGeometry(std::uint32_t index) const {
+    FaceGeometry g;
+    if (isNull() || index >= subShapeCount(SubShapeKind::Face)) return g;
+    const TopoDS_Face face = TopoDS::Face(impl_->index->faces.FindKey(static_cast<int>(index) + 1));
+    const bool reversed = face.Orientation() == TopAbs_REVERSED;
+    const auto toVec = [](const gp_Dir& d) { return Vec3{d.X(), d.Y(), d.Z()}; };
+    const auto toPnt = [](const gp_Pnt& p) { return Vec3{p.X(), p.Y(), p.Z()}; };
+    try {
+        BRepAdaptor_Surface surf(face);
+        switch (surf.GetType()) {
+        case GeomAbs_Plane: {
+            const gp_Pln pl = surf.Plane();
+            g.kind = FaceGeometry::Kind::Plane;
+            g.point = toPnt(pl.Location());
+            g.normal = toVec(pl.Axis().Direction());
+            if (reversed) g.normal = g.normal * -1.0;
+            break;
+        }
+        case GeomAbs_Cylinder: {
+            const gp_Cylinder cy = surf.Cylinder();
+            g.kind = FaceGeometry::Kind::Cylinder;
+            g.point = toPnt(cy.Location());
+            g.direction = toVec(cy.Axis().Direction());
+            g.radius = cy.Radius();
+            break;
+        }
+        case GeomAbs_Cone: {
+            const gp_Cone co = surf.Cone();
+            g.kind = FaceGeometry::Kind::Cone;
+            g.point = toPnt(co.Location());
+            g.direction = toVec(co.Axis().Direction());
+            g.radius = co.RefRadius();
+            break;
+        }
+        default:
+            g.point = toPnt(surf.Value(surf.FirstUParameter(), surf.FirstVParameter()));
+            break;
+        }
+    } catch (const Standard_Failure&) {
+        return FaceGeometry{};
+    }
+    return g;
 }
 
 Box3 Shape::boundingBox() const {

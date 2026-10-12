@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Benchmark harness. Writes one JSON document to stdout; progress and diagnostics go to stderr.
-//   {"version":1,"machine":{"cpu":"...","cores":N,"gpu":null},"results":[{"name":"...","ms":0.0,"n":0}]}
+//   {"version":1,"machine":{"cpu":"...","cores":N,"gpu":"..."|null},"results":[{"name":"...","ms":0.0,"n":0}]}
+// "gpu" is the preferred Vulkan physical device name (discrete GPUs first), or null when no loader/ICD is present.
 // Every timing is the median of kReps runs. "n" is the count of work items the run covered (nodes, triangles,
 // features actually computed); for the re-evaluations it is the number of features recomputed, which shows the
 // cache reach directly. Exits non-zero if any feature in the timeline fails, so a broken build cannot produce
 // a plausible-looking baseline.
+#include <dlfcn.h>
 #include <unistd.h>
+
+// Only the Vulkan types and the PFN_ typedefs are used; the loader is opened with dlopen, so no link dependency.
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
 
 #include <algorithm>
 #include <chrono>
@@ -25,7 +31,7 @@
 #include "kernel/exchange.hpp"
 #include "kernel/ops.hpp"
 #include "recompute/evaluator.hpp"
-#include "recompute/extrude_feature.hpp"
+#include "features/extrude_feature.hpp"
 #include "recompute/timeline.hpp"
 #include "tess/tessellate.hpp"
 
@@ -95,17 +101,19 @@ kernel::ImportedAssembly makeFixtureAssembly() {
 // Timeline: feature 1 creates body 1 from a 2 x 2 mm square prism; features 2..50 join overlapping prisms
 // (each 1 mm wide, stepping 0.5 mm along x) onto it. `editedHeight` replaces the extrusion height of one feature.
 std::shared_ptr<const recompute::Feature> makePrism(int index, double height) {
-    recompute::ExtrudeParams p;
-    p.planeOrigin = {0, 0, 0};
-    p.planeNormal = {0, 0, 1};
-    p.planeXDir = {1, 0, 0};
+    iw::features::ExtrudeParams p;
+    iw::features::PolygonSource src;
+    src.planeOrigin = {0, 0, 0};
+    src.planeNormal = {0, 0, 1};
+    src.planeXDir = {1, 0, 0};
     const double x0 = index * 0.5;
     const double x1 = x0 + 1.0;
-    p.points = {{x0, 0.0}, {x1, 0.0}, {x1, 2.0}, {x0, 2.0}};
-    p.vector = {0, 0, height};
-    p.operation = index == 1 ? recompute::ExtrudeParams::Operation::NewBody : recompute::ExtrudeParams::Operation::Join;
+    src.points = {{x0, 0.0}, {x1, 0.0}, {x1, 2.0}, {x0, 2.0}};
+    src.vector = {0, 0, height};
+    p.source = src;
+    p.operation = index == 1 ? iw::features::ExtrudeParams::Operation::NewBody : iw::features::ExtrudeParams::Operation::Join;
     p.body = iw::BodyId{1};
-    return std::make_shared<recompute::ExtrudeFeature>(iw::FeatureId{static_cast<std::uint64_t>(index)}, p);
+    return std::make_shared<iw::features::ExtrudeFeature>(iw::FeatureId{static_cast<std::uint64_t>(index)}, p);
 }
 
 recompute::Timeline makeTimeline() {
@@ -143,6 +151,53 @@ std::string cpuModel() {
     return "unknown";
 }
 
+// Name of the preferred Vulkan physical device (discrete GPU first), or empty when the loader or no device is
+// available. Creates a throwaway instance; loads libvulkan.so.1 at run time so the harness stays link-free.
+std::string gpuName() {
+    void* lib = ::dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) return {};
+    auto getProc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(::dlsym(lib, "vkGetInstanceProcAddr"));
+    if (!getProc) return {};
+    auto create = reinterpret_cast<PFN_vkCreateInstance>(getProc(VK_NULL_HANDLE, "vkCreateInstance"));
+    if (!create) return {};
+
+    VkApplicationInfo app{};
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.pApplicationName = "ironwood-bench";
+    app.apiVersion = VK_API_VERSION_1_0;
+    VkInstanceCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    info.pApplicationInfo = &app;
+    VkInstance instance = VK_NULL_HANDLE;
+    if (create(&info, nullptr, &instance) != VK_SUCCESS || instance == VK_NULL_HANDLE) return {};
+
+    std::string name;
+    auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(getProc(instance, "vkEnumeratePhysicalDevices"));
+    auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(getProc(instance, "vkGetPhysicalDeviceProperties"));
+    auto destroy = reinterpret_cast<PFN_vkDestroyInstance>(getProc(instance, "vkDestroyInstance"));
+    std::uint32_t count = 0;
+    if (enumerate && properties && enumerate(instance, &count, nullptr) == VK_SUCCESS && count > 0) {
+        std::vector<VkPhysicalDevice> devices(count);
+        if (enumerate(instance, &count, devices.data()) == VK_SUCCESS) {
+            VkPhysicalDeviceProperties best{};
+            bool have = false;
+            for (const VkPhysicalDevice device : devices) {
+                VkPhysicalDeviceProperties p{};
+                properties(device, &p);
+                const bool discrete = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+                const bool bestDiscrete = best.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+                if (!have || (discrete && !bestDiscrete)) {
+                    best = p;
+                    have = true;
+                }
+            }
+            if (have) name = best.deviceName;
+        }
+    }
+    if (destroy) destroy(instance, nullptr);
+    return name;
+}
+
 std::string jsonEscape(const std::string& s) {
     std::string out;
     for (char c : s) {
@@ -175,9 +230,10 @@ private:
     int savedStdout_ = -1;
 };
 
-void writeJson(FILE* out, const std::vector<Result>& results) {
-    std::fprintf(out, "{\"version\":1,\"machine\":{\"cpu\":\"%s\",\"cores\":%u,\"gpu\":null},\"results\":[",
-                 jsonEscape(cpuModel()).c_str(), std::thread::hardware_concurrency());
+void writeJson(FILE* out, const std::vector<Result>& results, const std::string& gpu) {
+    const std::string gpuJson = gpu.empty() ? "null" : "\"" + jsonEscape(gpu) + "\"";
+    std::fprintf(out, "{\"version\":1,\"machine\":{\"cpu\":\"%s\",\"cores\":%u,\"gpu\":%s},\"results\":[",
+                 jsonEscape(cpuModel()).c_str(), std::thread::hardware_concurrency(), gpuJson.c_str());
     for (std::size_t i = 0; i < results.size(); ++i) {
         const auto& r = results[i];
         std::fprintf(out, "%s{\"name\":\"%s\",\"ms\":%.3f,\"n\":%zu}", i ? "," : "", r.name.c_str(), r.ms, r.n);
@@ -276,6 +332,13 @@ int main() {
             return true;
         };
         if (!tessellateAll({body}, "tessellate_body")) return 1;
+        // Curved body: a cylinder (the planar prism above is insensitive to the deflection setting).
+        auto curved = kernel::makeCylinder({0, 0, 0}, {0, 0, 1}, 10.0, 20.0);
+        if (!curved) {
+            std::fprintf(stderr, "error: makeCylinder failed: %s\n", curved.error().message.c_str());
+            return 1;
+        }
+        if (!tessellateAll({curved->shape}, "tessellate_cylinder")) return 1;
         if (!tessellateAll(importedShapes, "tessellate_step")) return 1;
 
         // 4. Re-evaluation after editing feature 50, then after editing feature 1. A warm Evaluator is primed once
@@ -313,7 +376,7 @@ int main() {
             std::fprintf(stderr, "error: cannot open JSON output\n");
             return 1;
         }
-        writeJson(json, results);
+        writeJson(json, results, gpuName());
         std::fclose(json);
         return 0;
     } catch (const std::exception& e) {

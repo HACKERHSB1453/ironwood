@@ -4,23 +4,36 @@
 #include <QAction>
 #include <QActionGroup>
 #include <QDockWidget>
+#include <QEvent>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHeaderView>
 #include <QLabel>
 #include <QMenu>
 #include <QMenuBar>
+#include <QMouseEvent>
 #include <QProgressBar>
+#include <QSettings>
 #include <QStatusBar>
 #include <QTimer>
 #include <QToolBar>
 #include <QTreeWidget>
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 
 #include "render/demo_scene.hpp"
 #include "render/viewport.hpp"
+#include "ui/command_actions.hpp"
+#include "ui/command_dialog.hpp"
+#include "ui/default_commands.hpp"
+#include "ui/manipulators.hpp"
+#include "ui/marking_menu.hpp"
+#include "ui/ribbon.hpp"
+#include "ui/sbox.hpp"
+#include "ui/sketch/plane_chooser.hpp"
+#include "ui/sketch/sketch_mode.hpp"
 
 namespace iw::ui {
 namespace {
@@ -69,6 +82,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     });
 
     buildActions();
+    setupCommands();
     showDemoScene();
 }
 
@@ -256,10 +270,7 @@ void MainWindow::buildActions() {
     auto* open = new QAction(tr("&Open..."), this);
     open->setShortcut(QKeySequence::Open);
     open->setToolTip(tr("Open a STEP or STL file (Ctrl+O)"));
-    connect(open, &QAction::triggered, this, [this] {
-        const QString path = QFileDialog::getOpenFileName(this, tr("Open"), QString(), tr(kOpenFilter));
-        if (!path.isEmpty()) openFile(path);
-    });
+    connect(open, &QAction::triggered, this, [this] { chooseAndOpenFile(); });
     openAction_ = open;
     cancelAction_ = new QAction(tr("&Cancel import"), this);
     cancelAction_->setShortcut(Qt::Key_Escape);
@@ -334,6 +345,165 @@ void MainWindow::buildActions() {
     bar->addSeparator();
     bar->addAction(yUp);
     bar->addAction(zUp);
+}
+
+void MainWindow::chooseAndOpenFile() {
+    const QString path = QFileDialog::getOpenFileName(this, tr("Open"), QString(), tr(kOpenFilter));
+    if (!path.isEmpty()) openFile(path);
+}
+
+void MainWindow::setupCommands() {
+    cmdCtx_.parent = this;
+    cmdCtx_.doc = &doc_;
+    cmdCtx_.jobs = &jobs_;
+    cmdCtx_.importFile = [this] { chooseAndOpenFile(); };
+    cmdCtx_.showPanel = [this](QWidget* panel) { showCommandPanel(panel); };
+    cmdCtx_.openCommandSearch = [this] { openCommandSearch(); };
+
+    if (auto r = registerDefaultCommands(commands_); !r)
+        status_->setText(tr("Command setup failed: %1").arg(QString::fromStdString(r.error().message)));
+    QSettings settings;
+    commands_.loadShortcuts(settings);
+    pinned_.clear();
+    for (const QString& id : settings.value(QStringLiteral("toolbar/pinned")).toStringList())
+        if (commands_.find(id.toStdString())) pinned_.push_back(id.toStdString());
+
+    actions_ = new CommandActions(commands_, cmdCtx_, this);
+    for (const Command& c : commands_.all()) addAction(actions_->action(c.id));
+    connect(actions_, &CommandActions::failed, this, [this](const QString& m) { status_->setText(m); });
+
+    auto* edit = menuBar()->addMenu(tr("&Edit"));
+    edit->addAction(actions_->action("undo"));
+    edit->addAction(actions_->action("redo"));
+    auto* modify = menuBar()->addMenu(tr("&Modify"));
+    modify->addAction(actions_->action("parameters"));
+
+    auto* ribbonBar = addToolBar(tr("Ribbon"));
+    ribbonBar->setObjectName("ribbonToolbar");
+    ribbonBar->setMovable(false);
+    ribbon_ = new RibbonBar(commands_, *actions_, this);
+    ribbonBar->addWidget(ribbon_);
+    ribbon_->setPinned(pinned_);
+
+    palette_ = new CommandPalette(commands_, this);
+    palette_->setRecent([&] {
+        std::vector<std::string> ids;
+        for (const QString& id : settings.value(QStringLiteral("commands/recent")).toStringList())
+            if (commands_.find(id.toStdString())) ids.push_back(id.toStdString());
+        return ids;
+    }());
+    palette_->hide();
+    connect(palette_, &CommandPalette::commandChosen, this, [this](const QString& id) {
+        QSettings s;
+        QStringList recent;
+        for (const std::string& r : palette_->recent()) recent << QString::fromStdString(r);
+        s.setValue(QStringLiteral("commands/recent"), recent);
+        actions_->run(id.toStdString());
+    });
+    connect(palette_, &CommandPalette::pinRequested, this,
+            [this](const QString& id) { pinCommand(id.toStdString()); });
+
+    marking_ = new MarkingMenu(commands_, cmdCtx_, viewport_);
+    marking_->hide();
+    connect(marking_, &MarkingMenu::commandChosen, this,
+            [this](const QString& id) { actions_->run(id.toStdString()); });
+
+    overlay_ = new ManipulatorOverlay(viewport_);
+    overlay_->setGeometry(viewport_->rect());
+    viewport_->installEventFilter(this);
+
+    sketch_ = new SketchMode(viewport_, this);
+    connect(sketch_, &SketchMode::status, this, [this](const QString& text) { status_->setText(text); });
+
+    panelDock_ = new QDockWidget(tr("Command"), this);
+    panelDock_->setObjectName("commandDock");
+    addDockWidget(Qt::RightDockWidgetArea, panelDock_);
+    panelDock_->hide();
+
+    // Enablement depends on document state (undo history, parameters): re-evaluate a few times a second.
+    refreshTimer_ = new QTimer(this);
+    refreshTimer_->setInterval(250);
+    connect(refreshTimer_, &QTimer::timeout, this, [this] { actions_->refresh(); });
+    refreshTimer_->start();
+    actions_->refresh();
+}
+
+void MainWindow::pinCommand(const std::string& id) {
+    if (!commands_.find(id)) return;
+    if (std::find(pinned_.begin(), pinned_.end(), id) == pinned_.end()) pinned_.push_back(id);
+    ribbon_->setPinned(pinned_);
+    QSettings settings;
+    QStringList ids;
+    for (const std::string& p : pinned_) ids << QString::fromStdString(p);
+    settings.setValue(QStringLiteral("toolbar/pinned"), ids);
+    status_->setText(tr("Pinned %1 to the toolbar").arg(QString::fromStdString(id)));
+}
+
+void MainWindow::showCommandPanel(QWidget* panel) {
+    if (!panel) return;
+    if (QWidget* old = panelDock_->widget()) old->deleteLater();
+    panelDock_->setWidget(panel);
+    if (auto* p = qobject_cast<CommandPanel*>(panel))
+        connect(p, &CommandPanel::finished, this, [this] { panelDock_->hide(); });
+    panelDock_->show();
+}
+
+void MainWindow::chooseSketchPlane() {
+    if (!sketch_) return;
+    auto* chooser = new SketchPlaneChooser(this);
+    connect(chooser, &SketchPlaneChooser::planeChosen, this, [this](int choice) {
+        const auto plane = static_cast<PlaneChoice>(choice);
+        panelDock_->hide();
+        sketch_->start(originPlane(plane), planeName(plane));
+    });
+    connect(chooser, &SketchPlaneChooser::cancelled, this, [this] { panelDock_->hide(); });
+    showCommandPanel(chooser);
+}
+
+void MainWindow::openCommandSearch() {
+    const int w = std::min(480, width() - 40);
+    palette_->setGeometry((width() - w) / 2, 80, w, 360);
+    palette_->open();
+}
+
+void MainWindow::showMarkingMenu(QPoint viewportPos) {
+    marking_->popup(viewportPos);
+}
+
+bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == viewport_) {
+        switch (event->type()) {
+        case QEvent::Resize:
+            if (overlay_) overlay_->setGeometry(viewport_->rect());
+            break;
+        case QEvent::MouseButtonPress: {
+            auto* me = static_cast<QMouseEvent*>(event);
+            if (me->button() == Qt::RightButton) {
+                rightPressed_ = true;
+                rightPressPos_ = me->position().toPoint();
+            }
+            break;
+        }
+        case QEvent::MouseMove: {
+            auto* me = static_cast<QMouseEvent*>(event);
+            // A right drag orbits; only a right click (no movement) opens the marking menu.
+            if (rightPressed_ && (me->position().toPoint() - rightPressPos_).manhattanLength() > 4)
+                rightPressed_ = false;
+            break;
+        }
+        case QEvent::MouseButtonRelease: {
+            auto* me = static_cast<QMouseEvent*>(event);
+            if (me->button() == Qt::RightButton && rightPressed_) {
+                rightPressed_ = false;
+                showMarkingMenu(me->position().toPoint());
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    return QMainWindow::eventFilter(watched, event);
 }
 
 } // namespace iw::ui

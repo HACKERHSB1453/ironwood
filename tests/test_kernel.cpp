@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
+#include <numbers>
+#include <span>
+#include <optional>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "kernel/exchange.hpp"
@@ -19,6 +25,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kTwoPi = 2 * kPi;
 
 fs::path tmpDir() {
     static const fs::path d = [] {
@@ -487,4 +494,505 @@ TEST(KernelIo, StlRoundTripAreaWithin1Percent) {
     EXPECT_EQ(exportStl(tmpDir() / "c.stl", part, {}, cs.token()).error().code, ErrorCode::Cancelled);
     EXPECT_EQ(exportStl(tmpDir() / "x.stl", Shape{}).error().code, ErrorCode::InvalidArgument);
     EXPECT_EQ(exportStl(tmpDir() / "no_dir" / "x.stl", part).error().code, ErrorCode::IoError);
+}
+
+// ------------------------------------------------------------------------------------------ P1a A4 ops
+
+namespace {
+
+using Arr4 = std::array<double, 4>;
+
+/// Index of the sub-shape whose geometric key (centroid x,y,z, measure) matches `want` within 1e-6.
+std::optional<std::uint32_t> findSub(const Shape& s, SubShapeKind k, const Arr4& want) {
+    for (std::uint32_t i = 0; i < s.subShapeCount(k); ++i) {
+        const Arr4 key = s.subShapeKey(k, i);
+        bool ok = true;
+        for (int c = 0; c < 4; ++c) ok = ok && std::abs(key[c] - want[c]) <= 1e-6;
+        if (ok) return i;
+    }
+    return std::nullopt;
+}
+
+/// Output faces referenced by any history entry (generated, modified or unchanged).
+std::set<std::uint32_t> coveredFaces(const ShapeHistory& h) {
+    std::set<std::uint32_t> out;
+    auto take = [&](const std::vector<OutputSubShape>& v) {
+        for (const auto& o : v)
+            if (o.kind == SubShapeKind::Face) out.insert(o.index);
+    };
+    for (const auto& [k, v] : h.generated) take(v);
+    for (const auto& [k, v] : h.modified) take(v);
+    for (const auto& [k, o] : h.unchanged) take({o});
+    return out;
+}
+
+void expectEveryOutputFaceMapped(const ShapeResult& r) {
+    const auto cov = coveredFaces(r.history);
+    for (std::uint32_t f = 0; f < r.shape.subShapeCount(SubShapeKind::Face); ++f)
+        EXPECT_TRUE(cov.contains(f)) << "output face " << f << " has no history entry";
+}
+
+std::vector<std::uint32_t> ids(std::initializer_list<std::uint32_t> l) { return std::vector<std::uint32_t>(l); }
+
+} // namespace
+
+TEST(KernelOps, PlaneAndAxisHelpers) {
+    auto p = planeFromThreePoints({0, 0, 2}, {1, 0, 2}, {0, 1, 2});
+    ASSERT_TRUE(p);
+    EXPECT_NEAR(p->normal.z, 1, 1e-12);
+    EXPECT_NEAR(p->origin.z, 2, 1e-12);
+    EXPECT_EQ(planeFromThreePoints({0, 0, 0}, {1, 1, 1}, {2, 2, 2}).error().code, ErrorCode::InvalidArgument);
+
+    auto pn = planeFromPointNormal({1, 2, 3}, {0, 3, 4});
+    ASSERT_TRUE(pn);
+    EXPECT_NEAR(length(pn->normal), 1, 1e-12);
+    EXPECT_NEAR(length(pn->xDir), 1, 1e-12);
+    EXPECT_NEAR(dot(pn->normal, pn->xDir), 0, 1e-12);
+    // Deterministic: same normal -> same frame
+    EXPECT_EQ(planeFromPointNormal({0, 0, 0}, {0, 3, 4})->xDir, planeFromPointNormal({9, 9, 9}, {0, 6, 8})->xDir);
+    EXPECT_EQ(planeFromPointNormal({}, {0, 0, 0}).error().code, ErrorCode::InvalidArgument);
+
+    // Box faces: outward normals
+    Shape b = box(10, 10, 10);
+    auto top = findSub(b, SubShapeKind::Face, {5, 5, 10, 100});
+    auto bottom = findSub(b, SubShapeKind::Face, {5, 5, 0, 100});
+    ASSERT_TRUE(top && bottom);
+    auto pt = planeFromFace(b, *top);
+    ASSERT_TRUE(pt) << pt.error().message;
+    EXPECT_NEAR(pt->normal.z, 1, 1e-9);
+    EXPECT_NEAR(pt->origin.z, 10, 1e-9);
+    auto pb = planeFromFace(b, *bottom);
+    ASSERT_TRUE(pb);
+    EXPECT_NEAR(pb->normal.z, -1, 1e-9);
+    EXPECT_EQ(planeFromFace(b, 99).error().code, ErrorCode::InvalidArgument);
+    // Cylinder: exactly one non-planar face (the lateral surface) is rejected.
+    Shape cyl = makeCylinder({0, 0, 0}, {0, 0, 1}, 1, 2)->shape;
+    int rejected = 0;
+    for (std::uint32_t f = 0; f < cyl.subShapeCount(SubShapeKind::Face); ++f) {
+        auto r = planeFromFace(cyl, f);
+        if (!r) {
+            EXPECT_EQ(r.error().code, ErrorCode::InvalidArgument);
+            ++rejected;
+        }
+    }
+    EXPECT_EQ(rejected, 1);
+
+    auto edge = findSub(b, SubShapeKind::Edge, {5, 0, 10, 10});
+    ASSERT_TRUE(edge);
+    auto ax = axisFromEdge(b, *edge);
+    ASSERT_TRUE(ax) << ax.error().message;
+    EXPECT_NEAR(std::abs(ax->direction.x), 1, 1e-9);
+    EXPECT_NEAR(length(ax->direction), 1, 1e-12);
+    EXPECT_EQ(axisFromEdge(cyl, 0).error().code, ErrorCode::InvalidArgument); // circle edge, not a line
+    EXPECT_EQ(axisFromPoints({1, 1, 1}, {1, 1, 1}).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(axisFromEdge(b, 999).error().code, ErrorCode::InvalidArgument);
+}
+
+TEST(KernelOps, RevolveRingVolumeHistoryAndErrors) {
+    const std::vector<Vec3> pts{{1, 0, 0}, {3, 0, 0}, {3, 0, 2}, {1, 0, 2}};
+    auto face = makePolygonFace(pts);
+    ASSERT_TRUE(face);
+    const Axis zAxis{{0, 0, 0}, {0, 0, 1}};
+    auto full = revolve(*face, zAxis, kTwoPi);
+    ASSERT_TRUE(full) << full.error().message;
+    EXPECT_EQ(full->shape.type(), ShapeType::Solid);
+    EXPECT_NEAR(volume(full->shape), kPi * (9 - 1) * 2, 1e-6);
+    EXPECT_EQ(full->shape.subShapeCount(SubShapeKind::Face), 4u); // inner + outer cylinder, two annular caps
+    expectEveryOutputFaceMapped(*full);
+    for (std::uint32_t e = 0; e < 4; ++e) EXPECT_TRUE(full->history.generated.contains({0, SubShapeKind::Edge, e})) << e;
+
+    auto quarter = revolve(*face, zAxis, kPi / 2);
+    ASSERT_TRUE(quarter) << quarter.error().message;
+    EXPECT_NEAR(volume(quarter->shape), kPi * 8 * 2 / 4, 1e-6);
+    // Partial revolve: start cap modified, end cap generated (face-profile convention).
+    EXPECT_TRUE(quarter->history.modified.contains({0, SubShapeKind::Face, 0}));
+    EXPECT_TRUE(quarter->history.generated.contains({0, SubShapeKind::Face, 0}));
+    expectEveryOutputFaceMapped(*quarter);
+
+    // Wire profile gives the same solid.
+    auto wire = makePolygonWire(pts);
+    ASSERT_TRUE(wire);
+    auto fromWire = revolve(*wire, zAxis, kPi / 2);
+    ASSERT_TRUE(fromWire) << fromWire.error().message;
+    EXPECT_NEAR(volume(fromWire->shape), volume(quarter->shape), 1e-9);
+
+    EXPECT_EQ(revolve(*face, zAxis, 0).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(revolve(*face, zAxis, 7.0).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(revolve(*face, {{0, 0, 0}, {0, 0, 0}}, 1).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(revolve(Shape{}, zAxis, 1).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(revolve(box(1, 1, 1), zAxis, 1).error().code, ErrorCode::InvalidArgument);
+    CancelSource cs;
+    cs.cancel();
+    EXPECT_EQ(revolve(*face, zAxis, 1, cs.token()).error().code, ErrorCode::Cancelled);
+}
+
+TEST(KernelOps, FilletBoxEdgeVolumeHistoryAndDeterminism) {
+    Shape b = box(10, 10, 10);
+    auto e = findSub(b, SubShapeKind::Edge, {5, 0, 10, 10});
+    ASSERT_TRUE(e);
+    const double r = 1.0;
+    auto f = filletEdges(b, ids({*e}), r);
+    ASSERT_TRUE(f) << f.error().message;
+    // Removed material per unit length: (1 - pi/4) r^2
+    EXPECT_NEAR(volume(f->shape), 1000 - 10 * (1 - kPi / 4) * r * r, 1e-6);
+    EXPECT_EQ(f->shape.subShapeCount(SubShapeKind::Face), 7u);
+    // Exactly one new face, generated from the filleted edge: a quarter cylinder of area pi/2 * r * L.
+    auto gen = f->history.generated.find({0, SubShapeKind::Edge, *e});
+    ASSERT_NE(gen, f->history.generated.end());
+    ASSERT_EQ(gen->second.size(), 1u);
+    EXPECT_EQ(gen->second[0].kind, SubShapeKind::Face);
+    EXPECT_NEAR(f->shape.subShapeKey(SubShapeKind::Face, gen->second[0].index)[3], kPi / 2 * r * 10, 1e-6);
+    // The two faces adjacent to the edge are trimmed, and so are the two end faces at its vertices; the remaining
+    // two faces (bottom and back) are untouched.
+    int modifiedFaces = 0, unchangedFaces = 0;
+    for (std::uint32_t fi = 0; fi < 6; ++fi) {
+        modifiedFaces += f->history.modified.contains({0, SubShapeKind::Face, fi});
+        unchangedFaces += f->history.unchanged.contains({0, SubShapeKind::Face, fi});
+    }
+    EXPECT_EQ(modifiedFaces, 4);
+    EXPECT_EQ(unchangedFaces, 2);
+    expectEveryOutputFaceMapped(*f);
+    EXPECT_NEAR(volume(b), 1000, 1e-9); // input untouched
+
+    const auto refFp = fingerprint(f->shape);
+    for (int i = 0; i < 20; ++i) {
+        auto g = filletEdges(b, ids({*e}), r);
+        ASSERT_TRUE(g);
+        ASSERT_EQ(fingerprint(g->shape), refFp) << i;
+        ASSERT_EQ(g->history.generated, f->history.generated) << i;
+        ASSERT_EQ(g->history.modified, f->history.modified) << i;
+        ASSERT_EQ(g->history.deleted, f->history.deleted) << i;
+    }
+
+    // Input validation
+    EXPECT_EQ(filletEdges(b, {}, r).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(filletEdges(b, ids({999}), r).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(filletEdges(b, ids({*e}), 0).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(filletEdges(Shape{}, ids({0}), r).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(filletEdges(*makePolygonFace(std::vector<Vec3>{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}}), ids({0}), r).error().code,
+              ErrorCode::InvalidArgument);
+    CancelSource cs;
+    cs.cancel();
+    EXPECT_EQ(filletEdges(b, ids({*e}), r, cs.token()).error().code, ErrorCode::Cancelled);
+}
+
+TEST(KernelOps, FilletRadiusTooLargeNamesTheEdge) {
+    Shape small = box(1, 1, 1);
+    auto e = findSub(small, SubShapeKind::Edge, {0.5, 0, 1, 1});
+    ASSERT_TRUE(e);
+    auto f = filletEdges(small, ids({*e}), 1.5);
+    ASSERT_FALSE(f);
+    EXPECT_EQ(f.error().code, ErrorCode::KernelFailure);
+    EXPECT_NE(f.error().message.find("fillet radius too large for edge " + std::to_string(*e)), std::string::npos)
+        << f.error().message;
+}
+
+TEST(KernelOps, ChamferBoxEdgeVolumeAreaAndDeterminism) {
+    Shape b = box(10, 10, 10);
+    auto e = findSub(b, SubShapeKind::Edge, {5, 0, 10, 10});
+    ASSERT_TRUE(e);
+    // Asymmetric: triangle legs 2 and 3 -> removed 0.5 * 2 * 3 * 10 = 30.
+    auto c = chamferEdges(b, ids({*e}), 2, 3);
+    ASSERT_TRUE(c) << c.error().message;
+    EXPECT_NEAR(volume(c->shape), 970, 1e-6);
+    EXPECT_EQ(c->shape.subShapeCount(SubShapeKind::Face), 7u);
+    auto gen = c->history.generated.find({0, SubShapeKind::Edge, *e});
+    ASSERT_NE(gen, c->history.generated.end());
+    ASSERT_EQ(gen->second.size(), 1u);
+    EXPECT_NEAR(c->shape.subShapeKey(SubShapeKind::Face, gen->second[0].index)[3], 10 * std::sqrt(13.0), 1e-6);
+    expectEveryOutputFaceMapped(*c);
+
+    // Equal legs via distance + angle (45 deg): removed 0.5 * 2 * 2 * 10 = 20.
+    auto a = chamferEdgesByAngle(b, ids({*e}), 2, kPi / 4);
+    ASSERT_TRUE(a) << a.error().message;
+    EXPECT_NEAR(volume(a->shape), 980, 1e-6);
+
+    const auto refFp = fingerprint(c->shape);
+    for (int i = 0; i < 20; ++i) {
+        auto g = chamferEdges(b, ids({*e}), 2, 3);
+        ASSERT_TRUE(g);
+        ASSERT_EQ(fingerprint(g->shape), refFp) << i;
+        ASSERT_EQ(g->history.generated, c->history.generated) << i;
+    }
+    EXPECT_EQ(chamferEdges(b, ids({*e}), 0, 3).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(chamferEdgesByAngle(b, ids({*e}), 2, 0).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(chamferEdges(b, ids({12345}), 1, 1).error().code, ErrorCode::InvalidArgument);
+}
+
+TEST(KernelOps, ChamferTooLargeNamesTheEdge) {
+    Shape small = box(1, 1, 1);
+    auto e = findSub(small, SubShapeKind::Edge, {0.5, 0, 1, 1});
+    ASSERT_TRUE(e);
+    auto c = chamferEdges(small, ids({*e}), 2, 2);
+    ASSERT_FALSE(c);
+    EXPECT_EQ(c.error().code, ErrorCode::KernelFailure);
+    EXPECT_NE(c.error().message.find("chamfer distance too large for edge " + std::to_string(*e)), std::string::npos)
+        << c.error().message;
+}
+
+TEST(KernelOps, HoleThroughRemovesExactVolume) {
+    Shape b = box(10, 10, 10);
+    HoleSpec spec;
+    spec.diameter = 2;
+    spec.through = true;
+    // Top-face entry, drilling down (-Z).
+    auto h = hole(b, Axis{{5, 5, 10}, {0, 0, -1}}, spec);
+    ASSERT_TRUE(h) << h.error().message;
+    EXPECT_NEAR(volume(h->shape), 1000 - kPi * 1 * 10, 1e-6);
+    EXPECT_EQ(h->shape.subShapeCount(SubShapeKind::Face), 7u); // six box faces (top + bottom gain a hole) + wall
+    expectEveryOutputFaceMapped(*h);
+
+    // Side-face entry, through along +X: same removed volume.
+    auto side = hole(b, Axis{{0, 5, 5}, {1, 0, 0}}, spec);
+    ASSERT_TRUE(side) << side.error().message;
+    EXPECT_NEAR(volume(side->shape), 1000 - kPi * 10, 1e-6);
+
+    const auto refFp = fingerprint(h->shape);
+    for (int i = 0; i < 20; ++i) {
+        auto g = hole(b, Axis{{5, 5, 10}, {0, 0, -1}}, spec);
+        ASSERT_TRUE(g);
+        ASSERT_EQ(fingerprint(g->shape), refFp) << i;
+        ASSERT_EQ(g->history.modified, h->history.modified) << i;
+    }
+}
+
+TEST(KernelOps, HoleBlindWithDrillPointAndFlatBottom) {
+    Shape b = box(10, 10, 10);
+    HoleSpec spec;
+    spec.diameter = 2;
+    spec.depth = 5;
+    spec.drillPointAngle = kPi; // flat bottom
+    auto flat = hole(b, Axis{{5, 5, 10}, {0, 0, -1}}, spec);
+    ASSERT_TRUE(flat) << flat.error().message;
+    EXPECT_NEAR(volume(flat->shape), 1000 - kPi * 1 * 5, 1e-6);
+
+    // 118 deg drill point: cone of height r / tan(59 deg) below the flat-bottom depth.
+    spec.drillPointAngle = 2.0943951023931953;
+    auto drilled = hole(b, Axis{{5, 5, 10}, {0, 0, -1}}, spec);
+    ASSERT_TRUE(drilled) << drilled.error().message;
+    const double coneH = 1.0 / std::tan(2.0943951023931953 / 2);
+    EXPECT_NEAR(volume(drilled->shape), 1000 - kPi * 5 - kPi * coneH / 3, 1e-6);
+    expectEveryOutputFaceMapped(*drilled);
+}
+
+TEST(KernelOps, HoleCounterboreAndCountersinkVolumes) {
+    Shape b = box(10, 10, 10);
+    // Counterbore dia 4 depth 3 on a through hole dia 2: 12 pi (cbore) + 7 pi (hole below it).
+    HoleSpec cb;
+    cb.kind = HoleKind::Counterbore;
+    cb.diameter = 2;
+    cb.through = true;
+    cb.counterboreDiameter = 4;
+    cb.counterboreDepth = 3;
+    auto c = hole(b, Axis{{5, 5, 10}, {0, 0, -1}}, cb);
+    ASSERT_TRUE(c) << c.error().message;
+    EXPECT_NEAR(volume(c->shape), 1000 - 19 * kPi, 1e-6);
+    expectEveryOutputFaceMapped(*c);
+
+    // Countersink dia 4, 90 deg, on a through hole dia 2: cone cavity 7 pi / 3 + hole 9 pi.
+    HoleSpec cs;
+    cs.kind = HoleKind::Countersink;
+    cs.diameter = 2;
+    cs.through = true;
+    cs.countersinkDiameter = 4;
+    cs.countersinkAngle = kPi / 2;
+    auto s = hole(b, Axis{{5, 5, 10}, {0, 0, -1}}, cs);
+    ASSERT_TRUE(s) << s.error().message;
+    EXPECT_NEAR(volume(s->shape), 1000 - 34 * kPi / 3, 1e-6);
+    expectEveryOutputFaceMapped(*s);
+}
+
+TEST(KernelOps, HoleValidationAndErrors) {
+    Shape b = box(10, 10, 10);
+    const Axis down{{5, 5, 10}, {0, 0, -1}};
+    HoleSpec ok;
+    ok.diameter = 2;
+    ok.depth = 5;
+    EXPECT_TRUE(hole(b, down, ok));
+
+    HoleSpec noDia = ok;
+    noDia.diameter = 0;
+    EXPECT_EQ(hole(b, down, noDia).error().code, ErrorCode::InvalidArgument);
+    HoleSpec noDepth = ok;
+    noDepth.depth = 0;
+    EXPECT_EQ(hole(b, down, noDepth).error().code, ErrorCode::InvalidArgument);
+    HoleSpec badDrill = ok;
+    badDrill.drillPointAngle = 4.0;
+    EXPECT_EQ(hole(b, down, badDrill).error().code, ErrorCode::InvalidArgument);
+    HoleSpec badCb = ok;
+    badCb.kind = HoleKind::Counterbore;
+    badCb.counterboreDiameter = 1.5; // not larger than the hole
+    badCb.counterboreDepth = 1;
+    EXPECT_EQ(hole(b, down, badCb).error().code, ErrorCode::InvalidArgument);
+    HoleSpec badCs = ok;
+    badCs.kind = HoleKind::Countersink;
+    badCs.countersinkDiameter = 4;
+    badCs.countersinkAngle = kPi / 2;
+    badCs.depth = 0.5; // countersink (depth 1) deeper than the hole
+    EXPECT_EQ(hole(b, down, badCs).error().code, ErrorCode::InvalidArgument);
+    // Through hole whose entry lies beyond the part along the drill direction
+    HoleSpec thr = ok;
+    thr.through = true;
+    EXPECT_EQ(hole(b, Axis{{5, 5, 20}, {0, 0, 1}}, thr).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(hole(b, Axis{{5, 5, 10}, {0, 0, 0}}, ok).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(hole(Shape{}, down, ok).error().code, ErrorCode::InvalidArgument);
+    CancelSource cs;
+    cs.cancel();
+    EXPECT_EQ(hole(b, down, ok, cs.token()).error().code, ErrorCode::Cancelled);
+}
+
+TEST(KernelOps, TransformIsRigidAndMapsSubShapesOneToOne) {
+    Shape b = box(2, 3, 4);
+    // 90 deg about +Z, then translate by (5, 0, 0): x' = -y + 5, y' = x.
+    Transform t;
+    t.m = {0, -1, 0, 5, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    auto r = transform(b, t);
+    ASSERT_TRUE(r) << r.error().message;
+    const Box3 bb = r->shape.boundingBox();
+    EXPECT_NEAR(bb.min.x, 2, 1e-7);
+    EXPECT_NEAR(bb.max.x, 5, 1e-7);
+    EXPECT_NEAR(bb.min.y, 0, 1e-7);
+    EXPECT_NEAR(bb.max.y, 2, 1e-7);
+    EXPECT_NEAR(volume(r->shape), 24, 1e-9);
+    for (std::uint32_t f = 0; f < 6; ++f) {
+        auto it = r->history.modified.find({0, SubShapeKind::Face, f});
+        ASSERT_NE(it, r->history.modified.end());
+        ASSERT_EQ(it->second, (std::vector<OutputSubShape>{{SubShapeKind::Face, f}}));
+    }
+    expectEveryOutputFaceMapped(*r);
+
+    Transform scaled = t;
+    scaled.m[0] = 2;
+    EXPECT_EQ(transform(b, scaled).error().code, ErrorCode::InvalidArgument);
+    Transform mirror;
+    mirror.m = {-1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    EXPECT_EQ(transform(b, mirror).error().code, ErrorCode::InvalidArgument);
+    Transform projective = t;
+    projective.m[12] = 1;
+    EXPECT_EQ(transform(b, projective).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(transform(Shape{}, t).error().code, ErrorCode::InvalidArgument);
+}
+
+TEST(KernelOps, IntersectWithMatchesCommon) {
+    Shape a = box(10, 10, 10);
+    Shape c = box(10, 10, 10, {5, 0, 0});
+    auto i = intersectWith(a, c);
+    ASSERT_TRUE(i);
+    EXPECT_NEAR(volume(i->shape), 500, 1e-6);
+}
+
+// ---- B1b (F15 / F19 / G1 chains) -----------------------------------------------------------------------------------
+
+namespace {
+double b1bVolume(const Shape& s) {
+    auto mp = massProperties(s);
+    EXPECT_TRUE(mp.has_value());
+    return mp ? mp->volume : 0.0;
+}
+} // namespace
+
+TEST(KernelB1b, MirrorReflectsGeometryKeepsVolumeAndHistory) {
+    auto box = makeBox({1, 2, 3}, 4, 5, 6); // x in [1,5]
+    ASSERT_TRUE(box.has_value());
+    auto m = mirror(box->shape, Plane{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}});
+    ASSERT_TRUE(m.has_value()) << m.error().message;
+    EXPECT_NEAR(b1bVolume(m->shape), 120.0, 1e-6);
+    const Box3 bb = m->shape.boundingBox();
+    EXPECT_NEAR(bb.min.x, -5.0, 1e-6);
+    EXPECT_NEAR(bb.max.x, -1.0, 1e-6);
+    ASSERT_EQ(m->shape.subShapeCount(SubShapeKind::Face), box->shape.subShapeCount(SubShapeKind::Face));
+    for (std::uint32_t i = 0; i < box->shape.subShapeCount(SubShapeKind::Face); ++i) {
+        auto it = m->history.modified.find({0, SubShapeKind::Face, i});
+        ASSERT_NE(it, m->history.modified.end());
+        ASSERT_EQ(it->second.size(), 1u);
+        EXPECT_EQ(it->second[0].index, i);
+    }
+    // Mirror of a mirror is the identity placement (volume and bounds).
+    auto back = mirror(m->shape, Plane{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}});
+    ASSERT_TRUE(back.has_value());
+    EXPECT_NEAR(back->shape.boundingBox().min.x, 1.0, 1e-6);
+}
+
+TEST(KernelB1b, MirrorRejectsZeroNormalAndNullShape) {
+    auto box = makeBox({0, 0, 0}, 1, 1, 1);
+    ASSERT_TRUE(box.has_value());
+    EXPECT_EQ(mirror(box->shape, Plane{{0, 0, 0}, {0, 0, 0}, {1, 0, 0}}).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(mirror(Shape{}, Plane{}).error().code, ErrorCode::InvalidArgument);
+}
+
+TEST(KernelB1b, UniformScaleAboutAPoint) {
+    auto box = makeBox({1, 0, 0}, 2, 2, 2);
+    ASSERT_TRUE(box.has_value());
+    auto s = scale(box->shape, {0, 0, 0}, 2.0);
+    ASSERT_TRUE(s.has_value()) << s.error().message;
+    EXPECT_NEAR(b1bVolume(s->shape), 8.0 * 8.0, 1e-6);
+    EXPECT_NEAR(s->shape.boundingBox().min.x, 2.0, 1e-6);
+    EXPECT_NEAR(s->shape.boundingBox().max.x, 6.0, 1e-6);
+    EXPECT_EQ(scale(box->shape, {0, 0, 0}, 0.0).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(scale(box->shape, {0, 0, 0}, -1.0).error().code, ErrorCode::InvalidArgument);
+}
+
+TEST(KernelB1b, FaceGeometryGivesNormalsAndAxes) {
+    auto box = makeBox({0, 0, 0}, 2, 3, 4);
+    ASSERT_TRUE(box.has_value());
+    int planes = 0;
+    for (std::uint32_t i = 0; i < box->shape.subShapeCount(SubShapeKind::Face); ++i) {
+        const FaceGeometry g = box->shape.faceGeometry(i);
+        ASSERT_EQ(g.kind, FaceGeometry::Kind::Plane);
+        ++planes;
+        // The outward normal points away from the box centre (1, 1.5, 2).
+        const Vec3 c{1, 1.5, 2};
+        EXPECT_GT(dot(g.normal, g.point - c), 0.0);
+        EXPECT_NEAR(length(g.normal), 1.0, 1e-12);
+    }
+    EXPECT_EQ(planes, 6);
+    auto cyl = makeCylinder({0, 0, 0}, {0, 0, 1}, 2.5, 5);
+    ASSERT_TRUE(cyl.has_value());
+    int cylinders = 0;
+    for (std::uint32_t i = 0; i < cyl->shape.subShapeCount(SubShapeKind::Face); ++i) {
+        const FaceGeometry g = cyl->shape.faceGeometry(i);
+        if (g.kind != FaceGeometry::Kind::Cylinder) continue;
+        ++cylinders;
+        EXPECT_NEAR(std::abs(g.direction.z), 1.0, 1e-12);
+        EXPECT_NEAR(g.radius, 2.5, 1e-9);
+    }
+    EXPECT_EQ(cylinders, 1);
+    EXPECT_EQ(box->shape.faceGeometry(999).kind, FaceGeometry::Kind::Other);
+}
+
+TEST(KernelB1b, TangentChainOfABoxEdgeIsItself) {
+    auto box = makeBox({0, 0, 0}, 1, 1, 1);
+    ASSERT_TRUE(box.has_value());
+    const std::uint32_t e[] = {0};
+    auto chain = tangentChain(box->shape, e);
+    ASSERT_TRUE(chain.has_value()) << chain.error().message;
+    EXPECT_EQ(*chain, std::vector<std::uint32_t>{0});
+    const std::uint32_t bad[] = {500};
+    EXPECT_EQ(tangentChain(box->shape, bad).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(tangentChain(box->shape, std::span<const std::uint32_t>{}).error().code, ErrorCode::InvalidArgument);
+}
+
+TEST(KernelB1b, TangentChainFollowsTheTangentEdgesOfAFilletedCorner) {
+    auto box = makeBox({0, 0, 0}, 10, 10, 10);
+    ASSERT_TRUE(box.has_value());
+    // Vertical edge at (10, 10): fillet it, then chain from the top fillet arc (length pi/2 for r = 1).
+    std::uint32_t vertical = 0;
+    for (std::uint32_t i = 0; i < box->shape.subShapeCount(SubShapeKind::Edge); ++i) {
+        const auto k = box->shape.subShapeKey(SubShapeKind::Edge, i);
+        if (std::abs(k[0] - 10) < 1e-6 && std::abs(k[1] - 10) < 1e-6 && std::abs(k[3] - 10) < 1e-6) vertical = i;
+    }
+    const std::uint32_t vEdge[] = {vertical};
+    auto f = filletEdges(box->shape, vEdge, 1.0);
+    ASSERT_TRUE(f.has_value()) << f.error().message;
+    std::uint32_t arc = UINT32_MAX;
+    for (std::uint32_t i = 0; i < f->shape.subShapeCount(SubShapeKind::Edge); ++i) {
+        const auto k = f->shape.subShapeKey(SubShapeKind::Edge, i);
+        if (std::abs(k[3] - std::numbers::pi / 2) < 1e-6 && std::abs(k[2] - 10) < 1e-6) { arc = i; break; }
+    }
+    ASSERT_NE(arc, UINT32_MAX);
+    const std::uint32_t arcEdge[] = {arc};
+    auto chain = tangentChain(f->shape, arcEdge);
+    ASSERT_TRUE(chain.has_value()) << chain.error().message;
+    // The arc meets two top straight edges tangentially; those meet the next corner at 90 degrees, so the chain is 3.
+    EXPECT_EQ(chain->size(), 3u);
 }

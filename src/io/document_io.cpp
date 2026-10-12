@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "io/document_io.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <exception>
@@ -22,9 +25,18 @@ using json = nlohmann::json;
 namespace {
 
 constexpr const char* kFormatTag = "ironwood-document";
-constexpr std::uint64_t kFormatVersion = 0;
+constexpr std::uint64_t kFormatVersion = kDocumentFormatVersion; // v1: "parameters" array
 constexpr std::uint64_t kMaxSafeId = (std::uint64_t{1} << 53) - 1; // FORMAT.md: ids < 2^53 in v0
 constexpr const char* kManifestName = "manifest.json";
+
+/// Flushes a file or directory to stable storage (POSIX fsync). False if it cannot be opened or synced.
+bool fsyncPath(const fs::path& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+}
 
 /// Reads a persisted id (FeatureId/BodyId-sized integer): unsigned JSON number in [1, 2^53).
 bool readSafeId(const json& v, std::uint64_t& out) {
@@ -70,6 +82,17 @@ Result<json> buildManifest(const Document& doc) {
     const std::size_t size = doc.timeline.size();
     if (doc.timeline.rollbackMarker() != size) rollback = doc.timeline.rollbackMarker();
 
+    json params = json::array();
+    for (const Parameter& p : doc.parameters.parameters()) {
+        json e = json::object();
+        e["name"] = p.name;
+        e["expression"] = p.expression.source();
+        e["unit"] = p.unit;
+        e["comment"] = p.comment;
+        e["favourite"] = p.favourite;
+        params.push_back(std::move(e));
+    }
+
     json timeline = json::object();
     timeline["rollbackMarker"] = rollback;
     timeline["suppressed"] = std::move(suppressed);
@@ -82,6 +105,7 @@ Result<json> buildManifest(const Document& doc) {
     manifest["displayUnit"] = std::string(unitSymbol(doc.displayUnit));
     manifest["nextId"] = doc.nextId;
     manifest["timeline"] = std::move(timeline);
+    manifest["parameters"] = std::move(params);
     return manifest;
 }
 
@@ -119,6 +143,12 @@ Result<void> writeAtomically(const fs::path& target, const std::string& text) {
             return makeError(ErrorCode::IoError, "failed writing manifest.json");
         }
     }
+    // F3: the manifest and the staging directory entry must be on stable storage before the rename makes
+    // them visible as the document; otherwise a power cut can publish an empty or truncated manifest.
+    if (!fsyncPath(staging / kManifestName) || !fsyncPath(staging)) {
+        dropStaging();
+        return makeError(ErrorCode::IoError, "cannot flush document to disk");
+    }
 
     const bool hadTarget = fs::exists(target, ec);
     if (ec) {
@@ -139,6 +169,8 @@ Result<void> writeAtomically(const fs::path& target, const std::string& text) {
         dropStaging();
         return makeError(ErrorCode::IoError, "cannot publish document: " + ec.message());
     }
+    // Make the renames durable: the parent directory holds the new entry for `target`.
+    if (!fsyncPath(parent)) return makeError(ErrorCode::IoError, "cannot flush document directory to disk");
     if (hadTarget) {
         std::error_code e;
         fs::remove_all(backup, e);
@@ -172,6 +204,32 @@ Result<Document> buildDocument(const json& m, const recompute::FeatureRegistry& 
     if (!parsedUnit) return makeError(ErrorCode::ParseError, "unknown displayUnit: " + unit->get<std::string>());
     doc.displayUnit = *parsedUnit;
     if (!readSafeId(*nextId, doc.nextId)) return makeError(ErrorCode::ParseError, "nextId is invalid");
+
+    // v1: parameters. A v0 manifest has none, which means an empty table.
+    if (const json* params = member(m, "parameters")) {
+        if (!params->is_array()) return makeError(ErrorCode::ParseError, "manifest parameters is invalid");
+        for (const json& e : *params) {
+            const json* name = member(e, "name");
+            const json* expr = member(e, "expression");
+            const json* unit = member(e, "unit");
+            const json* comment = member(e, "comment");
+            const json* fav = member(e, "favourite");
+            if (!name || !name->is_string() || !expr || !expr->is_string() || !unit || !unit->is_string() || !comment ||
+                !comment->is_string() || !fav || !fav->is_boolean())
+                return makeError(ErrorCode::ParseError, "manifest parameter entry is invalid");
+            // Saved in insertion order, so every reference to a parameter defined earlier resolves as before.
+            if (auto r = doc.parameters.add(name->get<std::string>(), expr->get<std::string>(), unit->get<std::string>(),
+                                            comment->get<std::string>());
+                !r)
+                return makeError(ErrorCode::ParseError, "manifest parameter '" + name->get<std::string>() + "': " + r.error().message);
+            if (fav->get<bool>()) {
+                if (auto r = doc.parameters.setFavourite(name->get<std::string>(), true); !r)
+                    return makeError(ErrorCode::ParseError, r.error().message);
+            }
+        }
+    } else if (version->get<std::uint64_t>() >= 1) {
+        return makeError(ErrorCode::ParseError, "manifest version 1 requires 'parameters'");
+    }
 
     const json* features = member(*timeline, "features");
     if (!features || !features->is_array()) return makeError(ErrorCode::ParseError, "timeline.features is invalid");

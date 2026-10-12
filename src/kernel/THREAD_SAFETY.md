@@ -25,6 +25,13 @@ status changes. Facade functions in `ops.hpp` / `exchange.hpp` inherit the weake
 | `Precision::*`, `Message::DefaultMessenger()`, `Interface_Static` | global | UNVERIFIED | Global state: isolate / configure once at startup |
 | `BRepTools::Clean` | tess cache | UNVERIFIED | Mutates shared TShape |
 | `BRep_Builder` (editing shared shapes) | any | UNVERIFIED | Never edit a Shape visible to another thread |
+| `BRepPrimAPI_MakeRevol` | revolve, hole (tool) | UNVERIFIED | Built serially on private copies of the profile face; single-thread determinism test (`KernelOps.RevolveRingVolumeHistoryAndErrors`). Full-turn history gap handled by geometric cap linking (`linkFullTurnCaps`). |
+| `BRepFilletAPI_MakeFillet` | filletEdges | UNVERIFIED | Serial; single-thread 20x determinism test (`KernelOps.FilletBoxEdgeVolumeHistoryAndDeterminism`). Per-edge failure diagnosis retries edges one by one. |
+| `BRepFilletAPI_MakeChamfer` (`Add`, `AddDA`) | chamferEdges, chamferEdgesByAngle | UNVERIFIED | Serial; 20x determinism test (`KernelOps.ChamferBoxEdgeVolumeAreaAndDeterminism`). Adjacent face chosen by lowest face index. |
+| `TopExp::MapShapesAndAncestors` | chamfer face selection | UNVERIFIED | Built per call on the immutable input; read-only use of the shared shape. |
+| `BRepBuilderAPI_Transform` (rigid, copy=false) | transform | UNVERIFIED | Location-only move; history built index-wise (topology order preserved). Single-thread test only. |
+| `BRepAdaptor_Surface` / `BRepAdaptor_Curve` | planeFromFace, axisFromEdge, linkFullTurnCaps | UNVERIFIED | Read-only adaptors on the shared shape; not stress-tested. |
+| `BRepAlgoAPI_Cut` (holes) | hole | UNVERIFIED | Same serial, non-destructive settings as `cut()`; hole tool built privately. Volumes checked analytically (`KernelOps.Hole*`). |
 
 ## Notes added by the kernel implementation task
 * `Shape` itself is immutable; its sub-shape index tables are built in `wrapShape()` and never mutated, so all

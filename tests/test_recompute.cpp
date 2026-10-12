@@ -8,10 +8,11 @@
 #include "io/document_io.hpp"
 #include "kernel/ops.hpp"
 #include "recompute/evaluator.hpp"
-#include "recompute/extrude_feature.hpp"
+#include "features/extrude_feature.hpp"
 
 using namespace iw;
 using namespace iw::recompute;
+using namespace iw::features;
 
 namespace {
 
@@ -47,9 +48,11 @@ struct CancellingFeature : Feature {
 ExtrudeParams rect(double x0, double y0, double w, double h, double dz, BodyId body,
                    ExtrudeParams::Operation op = ExtrudeParams::Operation::NewBody, Vec3 origin = {}) {
     ExtrudeParams p;
-    p.planeOrigin = origin;
-    p.points = {{x0, y0}, {x0 + w, y0}, {x0 + w, y0 + h}, {x0, y0 + h}};
-    p.vector = {0, 0, dz};
+    PolygonSource src;
+    src.planeOrigin = origin;
+    src.points = {{x0, y0}, {x0 + w, y0}, {x0 + w, y0 + h}, {x0, y0 + h}};
+    src.vector = {0, 0, dz};
+    p.source = src;
     p.operation = op;
     p.body = body;
     return p;
@@ -268,7 +271,7 @@ TEST(Evaluator, FailingFeatureLaterFeaturesSeePreviousState) {
     Timeline t = makeTimeline();
     // Feature 2 fails (extrusion vector lies in the profile plane); feature 3 (independent of B2) still runs.
     ExtrudeParams bad = rect(0, 0, 4, 4, 0, kB2, ExtrudeParams::Operation::NewBody, {100, 0, 0});
-    bad.vector = {1, 0, 0};
+    std::get<PolygonSource>(bad.source).vector = {1, 0, 0};
     ASSERT_TRUE(t.replace(ext(2, bad)));
     auto r = e.evaluate(t);
     ASSERT_TRUE(r.has_value());
@@ -285,7 +288,7 @@ TEST(Evaluator, FailureSkipsDependentsAndPropagates) {
     Evaluator e;
     Timeline t = makeTimeline();
     ExtrudeParams bad = rect(0, 0, 10, 10, 0, kB1);
-    bad.vector = {1, 0, 0};
+    std::get<PolygonSource>(bad.source).vector = {1, 0, 0};
     ASSERT_TRUE(t.replace(ext(1, bad)));
     t.append(ext(4, rect(0, 0, 1, 1, 1, kB1, ExtrudeParams::Operation::Join))); // reads B1 transitively
     auto r = e.evaluate(t);

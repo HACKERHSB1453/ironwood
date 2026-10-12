@@ -7,7 +7,7 @@
 add_library(iw_kernel_occt INTERFACE)
 target_link_libraries(iw_kernel_occt INTERFACE
     TKernel TKMath TKBRep TKG2d TKG3d TKGeomBase TKGeomAlgo TKTopAlgo TKPrim TKBO TKBool
-    TKShHealing TKMesh TKDE TKDESTEP TKDESTL TKXSBase TKXCAF TKLCAF TKCAF TKCDF)
+    TKShHealing TKFillet TKMesh TKDE TKDESTEP TKDESTL TKXSBase TKXCAF TKLCAF TKCAF TKCDF)
 
 iw_add_module(kernel
     SOURCES shape.cpp ops.cpp exchange.cpp

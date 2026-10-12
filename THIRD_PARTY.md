@@ -11,6 +11,7 @@ Ironwood is GPL-3.0-or-later. Every dependency below is license-compatible as li
 | pybind11 | 3.1 | BSD-3-Clause | header-only (from P1a) | future `api/` | not yet used |
 | Tracy | tag in `cmake/IronwoodTracy.cmake` | BSD-3-Clause | static, profiling builds only | `iw_core` zone macros | optional (`IRONWOOD_TRACY`, default OFF) |
 | nlohmann/json | 3.12.0 | MIT | header-only, vendored at `third_party/nlohmann/` (private to `iw_io`; not in public headers) | `iw_io` native document manifest (`document_io.cpp`) | required |
+| FreeCAD planegcs (Sketcher 2D constraint solver) | 1.1.4 (commit `4fd3bf3`) | LGPL-2.0-or-later (per file headers; see `third_party/planegcs/README.md`) | static, vendored at `third_party/planegcs/` (patches in `PATCHES.md`) | `iw_sketch_solver` | required (P1a) |
 
 Planned (see docs/ARCHITECTURE.md section 2): Manifold (Apache-2.0), planegcs (LGPL-2.1+), Netgen (LGPL-2.1),
 Clipper2 (BSL-1.0), QuickJS (MIT). LibreDWG (GPL-3) only as a separate converter process.

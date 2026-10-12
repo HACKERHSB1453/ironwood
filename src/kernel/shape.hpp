@@ -33,6 +33,22 @@ struct ShapeStamp {
     }
 };
 
+/// Surface description of one face (F19: naming signatures include normals / axes). Units mm.
+///  * Plane: `point` on the plane, `normal` = outward unit normal (honours the face orientation: a reversed face of a
+///    solid boundary points out of the solid).
+///  * Cylinder / Cone: `point` = a point on the axis (cone: the apex-side location of the surface), `direction` = unit
+///    axis, `radius` = cylinder radius, or the cone's reference radius at `point`.
+///  * Other (sphere, torus, B-spline, ...): only `point` (surface origin) is filled.
+/// Vectors not used by a kind are zero. Pure, thread-safe.
+struct FaceGeometry {
+    enum class Kind : std::uint8_t { Plane, Cylinder, Cone, Other };
+    Kind kind = Kind::Other;
+    Vec3 point;
+    Vec3 normal;
+    Vec3 direction;
+    double radius = 0;
+};
+
 /// Immutable value handle to a B-rep shape. Copies are O(1) and share the underlying (never mutated)
 /// geometry, so a Shape may be read concurrently from any number of threads. No OCCT type is exposed.
 ///
@@ -68,6 +84,10 @@ public:
     /// immutable shape (concurrent calls on a const Shape are expected safe; UNVERIFIED by stress test).
     /// Returns {0,0,0,0} for a null shape or out-of-range index.
     std::array<double, 4> subShapeKey(SubShapeKind kind, std::size_t index) const;
+
+    /// Surface geometry of face `index` (ordering contract). Default-constructed (Kind::Other, zeros) for a null shape or
+    /// an out-of-range index.
+    FaceGeometry faceGeometry(std::uint32_t index) const;
 
     /// Axis-aligned bounding box in mm (may be slightly enlarged by tolerance). Empty for null shape.
     Box3 boundingBox() const;

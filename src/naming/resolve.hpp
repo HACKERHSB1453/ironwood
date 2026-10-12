@@ -32,7 +32,8 @@ struct Resolution {
 ///  * several indices carry the name (should not happen; map corruption) -> Error Ambiguous. Never guess.
 ///  * name absent, one unique history successor        -> HistoryDerived, with a warning.
 ///  * name absent, history gives several successors    -> Error Ambiguous (caller shows a disambiguation UI).
-///  * name absent, no history; geometric fallback is allowed ONLY when it yields a single candidate -> warning.
+///  * name absent, no history; geometric fallback is NOT implemented in v0 (P1a): such refs resolve to NotFound.
+///    GeometricFallback is reserved for that future path and is never produced by v0.
 ///  * nothing found                                    -> Error NotFound (feature is then marked broken/red).
 /// The function is pure and thread-safe.
 Result<Resolution> resolve(const ElementRef& ref, const NamingMap& map);

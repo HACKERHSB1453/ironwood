@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <string>
 
+#include "core/params.hpp"
 #include "core/result.hpp"
 #include "core/units.hpp"
 #include "recompute/feature.hpp"
@@ -11,14 +12,18 @@
 
 namespace iw::io {
 
-/// The persisted document: metadata + the feature timeline. Derived data (shapes, meshes) is NOT stored
-/// in v0; it is recomputed on load. See FORMAT.md (v0, UNSTABLE - may change without migration).
+/// The persisted document: metadata, the parameter table (format v1+) and the feature timeline. Derived data
+/// (shapes, meshes) is NOT stored; it is recomputed on load. See FORMAT.md (UNSTABLE: no migration promise yet).
 struct Document {
     std::string name;
     LengthUnit displayUnit = LengthUnit::Millimeter;
     std::uint64_t nextId = 1;   ///< Next unallocated Feature/Body/Component id (never reuse).
+    ParameterTable parameters;  ///< User parameters, persisted with name, expression, unit, comment, favourite.
     recompute::Timeline timeline;
 };
+
+/// Manifest format version written by saveDocument. Version 0 (no "parameters") still loads.
+inline constexpr std::uint64_t kDocumentFormatVersion = 1;
 
 /// Writes `doc` to the directory `path` (created; must not be a file). Atomic-ish: writes to a temp
 /// sibling then renames. Errors: IoError, InvalidArgument.

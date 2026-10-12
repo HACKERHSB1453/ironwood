@@ -15,6 +15,7 @@ namespace {
 struct State {
     std::map<BodyId, kernel::Shape> bodies;
     std::map<BodyId, naming::NamingMap> namings;
+    std::map<FeatureId, ConstructionGeometry> constructions; ///< Published by Ok construction features.
     std::set<BodyId> poisoned;          ///< Bodies a failed/skipped feature should have written.
     std::set<FeatureId> broken;         ///< Failed or Skipped features (explicit refs into them are dead).
 };
@@ -25,16 +26,17 @@ struct Entry {
     FeatureStatus status;               ///< `reused` is filled per call.
 };
 
-std::uint64_t chainStep(std::uint64_t prev, const Feature& f, bool suppressed) {
+std::uint64_t chainStep(std::uint64_t prev, const Feature& f, std::uint64_t paramTableHash, bool suppressed) {
     kernel::ShapeStamp s{prev};
     s = kernel::ShapeStamp::combine(s, f.id().value());
     s = kernel::ShapeStamp::combine(s, f.paramHash());
+    s = kernel::ShapeStamp::combine(s, paramTableHash);
     s = kernel::ShapeStamp::combine(s, suppressed ? 0x5355505052455353ULL : 0x41435449564521ULL);
     return s.value;
 }
 
-Entry computeEntry(const Feature& f, bool suppressed, std::uint64_t chain, const State& prev, CancelToken cancel,
-                   Error* cancelled) {
+Entry computeEntry(const Feature& f, bool suppressed, std::uint64_t chain, const State& prev, const ParameterTable* params,
+                   CancelToken cancel, Error* cancelled) {
     Entry e;
     e.chain = chain;
     e.status.id = f.id();
@@ -75,7 +77,7 @@ Entry computeEntry(const Feature& f, bool suppressed, std::uint64_t chain, const
 
     Result<FeatureResult> res = makeError(ErrorCode::Internal, "not computed");
     try {
-        EvalContext ctx{prev.bodies, prev.namings, cancel};
+        EvalContext ctx{prev.bodies, prev.namings, cancel, params, &prev.constructions};
         res = f.compute(ctx);
     } catch (const std::exception& ex) {
         res = makeError(ErrorCode::Internal, std::string("feature threw: ") + ex.what());
@@ -112,7 +114,13 @@ Entry computeEntry(const Feature& f, bool suppressed, std::uint64_t chain, const
         st->namings.insert_or_assign(id, std::move(res->namings.at(id)));
         st->poisoned.erase(id);
     }
+    st->constructions.erase(f.id());
+    if (res->constructionGeometry) {
+        st->constructions.insert_or_assign(f.id(), *res->constructionGeometry);
+        e.status.construction = *res->constructionGeometry;
+    }
     e.status.state = FeatureStatus::State::Ok;
+    e.status.attributes = std::move(res->attributes);
     e.status.diagnostics = std::move(res->diagnostics);
     e.state = std::move(st);
     return e;
@@ -129,6 +137,10 @@ Evaluator::Evaluator() : impl_(std::make_unique<Impl>()) {}
 Evaluator::~Evaluator() = default;
 
 Result<EvalResult> Evaluator::evaluate(const Timeline& timeline, CancelToken cancel) {
+    return evaluate(timeline, nullptr, cancel);
+}
+
+Result<EvalResult> Evaluator::evaluate(const Timeline& timeline, const ParameterTable* params, CancelToken cancel) {
     IW_ZONE("recompute::evaluate");
     std::lock_guard lock(impl_->mutex);
     auto& cache = impl_->cache;
@@ -142,7 +154,8 @@ Result<EvalResult> Evaluator::evaluate(const Timeline& timeline, CancelToken can
     for (std::size_t k = 0; k < marker; ++k) {
         const Feature& f = *timeline.at(k);
         const bool suppressed = timeline.isSuppressed(f.id());
-        const std::uint64_t chain = chainStep(prevChain, f, suppressed);
+        const std::uint64_t paramStamp = params ? params->hashOfUsed(f.parameterReferences()) : 0;
+        const std::uint64_t chain = chainStep(prevChain, f, paramStamp, suppressed);
 
         if (valid && k < cache.size() && cache[k].chain == chain) {
             ++out.reusedCount;
@@ -153,7 +166,7 @@ Result<EvalResult> Evaluator::evaluate(const Timeline& timeline, CancelToken can
             if (valid) { if (cache.size() > k) cache.erase(cache.begin() + static_cast<std::ptrdiff_t>(k), cache.end()); valid = false; } // first mismatch: later entries derive from stale state
             if (cancel.cancelled()) return makeError(ErrorCode::Cancelled, "evaluation cancelled");
             Error cancelledErr;
-            Entry e = computeEntry(f, suppressed, chain, *prev, cancel, &cancelledErr);
+            Entry e = computeEntry(f, suppressed, chain, *prev, params, cancel, &cancelledErr);
             if (!e.state) return std::unexpected(cancelledErr); // feature observed cancellation; cache holds [0,k)
             ++out.computedCount;
             cache.push_back(std::move(e));
