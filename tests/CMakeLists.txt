@@ -21,3 +21,10 @@ if(IRONWOOD_BUILD_GUI)
     iw_add_module_test(render LIBS iw_render)
     iw_add_module_test(ui LIBS iw_ui)
 endif()
+
+# P1a: each task drops tests/<name>.cmake containing its own iw_add_module_test(...) line(s).
+# This avoids parallel edits to this file.
+file(GLOB _iw_test_fragments CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cmake)
+foreach(_f IN LISTS _iw_test_fragments)
+    include(${_f})
+endforeach()
