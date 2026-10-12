@@ -1,0 +1,17 @@
+# P0 follow-ups (supervisor log)
+
+| # | From | Item | Decision | Owner / when |
+|---|---|---|---|---|
+| F1 | T4 | Split-sibling ordinals ranked by kernel index, not geometry | T1 adds `Shape::subShapeKey`; T4 follow-up wires it into `deriveNamingMap`, rewords header comments ("ordinals by geometric key"; deriving reads geometry only for tie-breaks), moves `deriveFromCounts` into a `naming/detail.hpp` instead of test re-declaration | **DONE** (21/21; operand-swap test proves kernel-order independence) |
+| F2 | T2 | TSAN not clean: 25 reports, mostly handoffs inside uninstrumented system libtbb.so (classic false positives) | Known gap for now. Proper fix: TSAN preset builds oneTBB from source with `-fsanitize=thread` (FetchContent), then re-run; any report that remains is a real bug. No blanket suppression file. | **DONE** — 0 reports with instrumented oneTBB (tsan preset). Next: also run with clang (GCC TSAN ignores fences) |
+| F3 | T7 | No fsync on save; no geometry blobs yet | fsync before rename in P1a; blobs once kernel serialisation (BRep) is wired | P1a |
+| F4 | T7 | Writer emits `rollbackMarker: null` when marker is at end (Timeline lacks "is set" accessor) | Accepted (behaviourally equivalent) | — |
+| F5 | T5 | Join with a disjoint solid: test accepts Ok or Failed — behaviour unpinned | Decide Fusion-parity rule [VERIFY in Fusion: error vs multi-lump body], then pin it in kernel::fuse + test | P1a |
+| F6 | T5 | tests/CMakeLists.txt edited so test_recompute links iw_io (avoids recompute→io cycle) | Accepted | — |
+| F7 | T3 | tess includes kernel/internal/shape_impl.hpp (boundary violation); no makeSphere for pole-normal test | Add sanctioned `kernel/occt_access.hpp` (iw-internal accessor), switch tess to it; add kernel::makeSphere + sphere normal test | **DONE** (kernel 21, tess 15) |
+| F8 | T8 | No automated test of `ironwood-cli import --stats`; bench gpu field null; tessellate_body bench is planar (deflection has no effect) | Add CLI ctest with a generated fixture; detect GPU via Vulkan/NVML; use a curved body in tess bench | P1a |
+| F9 | T8 | 50-feature cold evaluate = 537 ms (~10 ms/feature, mostly fuse); edit-late = 18.8 ms (prefix reuse works, 28× faster than edit-first) | Baseline recorded. Bench JSON → bench/baselines/ once P0 closes | — |
+| F10 | T6 | `test_render` Offscreen.PickOrientation* HANGS when run with QT_QPA_PLATFORM=wayland (passes offscreen/GL in ctest) | Bug: find the hang (likely readback/frame never delivered on a real window surface); add a timeout to every GPU test | **DONE (T9)**: real hang was `ironwood --selftest` under offscreen (QRhiWidget never renders there, so the pick waited forever); fixed by a headless pick path on a private QRhi, a 2 s pick watchdog, a 20 s selftest limit and a 60 s per-test watchdog in test_render/test_ui. Wayland `PickOrientation*` did NOT reproduce on this machine (passed every run, 5/5); the unbounded wait it would hit is now bounded. | P1a, first |
+| F11 | T6 | Vulkan validation instance not attached in app (Qt owns QRhiWidget instance; attaching crashed at teardown); edges are 1 px | Debug layer via setDebugLayerEnabled is fine; fat/AA edge lines in P1a | P1a |
+| F12 | flock | 355 findings → ~40 issues → 6 REAL (docs/REVIEW_FLOCK_P0.md). R1, R2, R3, R6 | Sent to T9 | T9 |
+| F13 | flock | R4 resolve.hpp promises geometric fallback (code: v0 NotFound); R5 LatestWins inline-run under lock; nits: timeline.hpp includes, `undo()` noexcept | Small cleanup task | P1a start |
