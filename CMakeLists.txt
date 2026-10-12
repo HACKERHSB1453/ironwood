@@ -50,7 +50,7 @@ add_subdirectory(src/tess)
 add_subdirectory(src/recompute)
 add_subdirectory(src/io)
 # P1a modules: registered automatically once their CMakeLists.txt exists (avoids parallel edits here).
-foreach(_iw_mod IN ITEMS src/sketch src/features)
+foreach(_iw_mod IN ITEMS src/sketch src/features api)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${_iw_mod}/CMakeLists.txt)
         add_subdirectory(${_iw_mod})
     endif()
