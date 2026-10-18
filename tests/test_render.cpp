@@ -703,3 +703,161 @@ TEST(Offscreen, PickInFlightAcrossSceneChangeReportsNothing) {
     ASSERT_TRUE(stale.has_value());
     EXPECT_FALSE(stale->bodyIndex.has_value()) << "a readback taken before setScene must not name a body";
 }
+
+// ------------------------------------------------------------------- section analysis & translucent overlays
+namespace {
+Camera viewFrom(const Vec3& eyeDir, const Box3& bounds, int w = 480, int h = 360) {
+    Camera c = makeCamera(UpAxis::Y, Projection::Perspective, w, h);
+    c.setState(c.poseForEyeDirection(eyeDir));
+    c.fit(bounds);
+    return c;
+}
+Box3 unionOf(const std::vector<SceneBody>& bodies) {
+    Box3 b;
+    for (const auto& body : bodies) {
+        b.extend(body.mesh->bounds.min);
+        b.extend(body.mesh->bounds.max);
+    }
+    return b;
+}
+QPoint toPx(const Camera& c, const Vec3& w) {
+    const auto n = *c.project(w);
+    return QPoint(int((n.x * 0.5 + 0.5) * 480), int((0.5 - n.y * 0.5) * 360));
+}
+bool isOrange(QRgb p, int tol = 4) {
+    return std::abs(qRed(p) - 255) <= tol && std::abs(qGreen(p) - 140) <= tol && std::abs(qBlue(p) - 26) <= tol;
+}
+/// Section with the kept side n·p + d >= 0.
+SectionRequest sectionAt(Vec3 n, double d) {
+    SectionRequest s;
+    s.enabled = true;
+    s.clipPlane = {n.x, n.y, n.z, d};
+    return s;
+}
+} // namespace
+
+TEST(Section, ClipRemovesTheHalfSpaceAndKeepsTheOtherSide) {
+    const auto bodies = oneBox();
+    const Camera c = viewFrom({0, 0, 1}, unionOf(bodies));   // front: looking at the +Z face
+    const QPoint pRemoved = toPx(c, {-25, 0, 50});           // x < 0: removed by the plane x = 0
+    const QPoint pKept = toPx(c, {25, 0, 50});               // x > 0: kept
+    const auto plain = renderOffscreen(bodies, c, {480, 360});
+    if (!plain) GTEST_SKIP() << "no QRhi backend available";
+    const auto clipped = renderOffscreen(bodies, c, {480, 360}, {}, 4, {}, {}, sectionAt({1, 0, 0}, 0));
+    ASSERT_TRUE(clipped.has_value());
+    const QImage& cut = clipped->image;
+    maybeDump(cut, "section_front_halfspace");
+
+    // removed side shows the background (same as the far-left column of the same row)
+    EXPECT_LE(std::abs(luma(px(cut, pRemoved.x(), pRemoved.y())) - luma(px(cut, 5, pRemoved.y()))), 2);
+    // the unclipped frame shows the box there, so the removal is what changed it
+    EXPECT_GT(std::abs(luma(px(plain->image, pRemoved.x(), pRemoved.y())) - luma(px(cut, 5, pRemoved.y()))), 20);
+    // kept side is unchanged
+    EXPECT_LE(std::abs(luma(px(cut, pKept.x(), pKept.y())) - luma(px(plain->image, pKept.x(), pKept.y()))), 2);
+}
+
+TEST(Section, CapPaintsTheCutInCapColour) {
+    const auto bodies = oneBox();
+    const Camera c = viewFrom({-1, 0, 0}, unionOf(bodies));   // from -X: the removed half is between eye and cut
+    auto plain = renderOffscreen(bodies, c, {480, 360});
+    if (!plain) GTEST_SKIP() << "no QRhi backend available";
+    EXPECT_FALSE(isOrange(px(plain->image, 240, 180))) << "without a section the near face is grey";
+
+    const auto cut = renderOffscreen(bodies, c, {480, 360}, {}, 4, {}, {}, sectionAt({1, 0, 0}, 0));
+    ASSERT_TRUE(cut.has_value());
+    maybeDump(cut->image, "section_box_cap");
+    EXPECT_TRUE(isOrange(px(cut->image, 240, 180))) << "the cut face must show capColour";
+    int capPixels = 0;
+    for (int y = 0; y < 360; ++y)
+        for (int x = 0; x < 480; ++x) capPixels += isOrange(px(cut->image, x, y)) ? 1 : 0;
+    EXPECT_GT(capPixels, 5000);   // most of the 100 x 100 mm cut is in view
+}
+
+TEST(Section, FlippingThePlaneFlipsTheKeptHalf) {
+    const auto bodies = oneBox();
+    const Vec3 fromNegX{-1, 0, 0}, fromPosX{1, 0, 0};
+    const Camera fromNeg = viewFrom(fromNegX, unionOf(bodies));
+    const Camera fromPos = viewFrom(fromPosX, unionOf(bodies));
+    const auto a = renderOffscreen(bodies, fromNeg, {480, 360}, {}, 4, {}, {}, sectionAt({1, 0, 0}, 0));
+    if (!a) GTEST_SKIP() << "no QRhi backend available";
+    const auto flipped = renderOffscreen(bodies, fromNeg, {480, 360}, {}, 4, {}, {}, sectionAt({-1, 0, 0}, 0));
+    const auto flippedOtherSide = renderOffscreen(bodies, fromPos, {480, 360}, {}, 4, {}, {}, sectionAt({-1, 0, 0}, 0));
+    const auto original = renderOffscreen(bodies, fromPos, {480, 360}, {}, 4, {}, {}, sectionAt({1, 0, 0}, 0));
+    ASSERT_TRUE(flipped && flippedOtherSide && original);
+    // kept x >= 0: the cap is seen from -X; kept x <= 0: the cap is hidden and the near face at x = -50 is seen
+    EXPECT_TRUE(isOrange(px(a->image, 240, 180)));
+    EXPECT_FALSE(isOrange(px(flipped->image, 240, 180)));
+    // mirror: kept x <= 0 seen from +X shows the cap; kept x >= 0 seen from +X shows the far face at x = 50
+    EXPECT_TRUE(isOrange(px(flippedOtherSide->image, 240, 180)));
+    EXPECT_FALSE(isOrange(px(original->image, 240, 180)));
+}
+
+TEST(Section, PickingIgnoresTheClippedHalf) {
+    // A is entirely in the removed half (x < 0), B is behind the cut (x > 0). Viewed from -X the ray through the
+    // centre meets A first unless the section clips it.
+    std::vector<SceneBody> two(2);
+    two[0].mesh = makeBoxMesh({-60, -20, -20}, {-20, 20, 20});
+    two[1].mesh = makeBoxMesh({20, -20, -20}, {60, 20, 20});
+    const Camera c = viewFrom({-1, 0, 0}, unionOf(two));
+    const QPoint centre(240, 180);
+    const auto plain = renderOffscreen(two, c, {480, 360}, {centre});
+    if (!plain) GTEST_SKIP() << "no QRhi backend available";
+    ASSERT_EQ(plain->picks.size(), 1u);
+    EXPECT_EQ(plain->picks[0].bodyIndex, 0u);
+
+    const auto clipped = renderOffscreen(two, c, {480, 360}, {centre}, 4, {}, {}, sectionAt({1, 0, 0}, 0));
+    ASSERT_TRUE(clipped.has_value());
+    ASSERT_EQ(clipped->picks.size(), 1u);
+    EXPECT_EQ(clipped->picks[0].bodyIndex, 1u) << "the pick must pass through the clipped half and hit B";
+
+    // only geometry in the removed half: nothing is picked
+    const std::vector<SceneBody> onlyA{two[0]};
+    const Camera cA = viewFrom({-1, 0, 0}, unionOf(onlyA));
+    const auto none = renderOffscreen(onlyA, cA, {480, 360}, {centre}, 4, {}, {}, sectionAt({1, 0, 0}, 0));
+    ASSERT_TRUE(none.has_value());
+    EXPECT_FALSE(none->picks[0].bodyIndex.has_value());
+}
+
+TEST(Overlay, TranslucentOverlayTintsTheBodyAndIsPickedWithPriority) {
+    const auto bodies = oneBox();
+    const Camera c = viewFrom({0, 0, 1}, unionOf(bodies));
+    OverlayFace profile;
+    profile.triangles = {{-20, -20, 50.5}, {20, -20, 50.5}, {20, 20, 50.5},
+                         {-20, -20, 50.5}, {20, 20, 50.5}, {-20, 20, 50.5}};
+    profile.rgba = {1.f, 0.f, 0.f, 0.5f};
+    const QPoint inside = toPx(c, {0, 0, 50});
+    const QPoint outside = toPx(c, {35, 0, 50});
+    const auto plain = renderOffscreen(bodies, c, {480, 360}, {inside, outside});
+    if (!plain) GTEST_SKIP() << "no QRhi backend available";
+    const auto frame = renderOffscreen(bodies, c, {480, 360}, {inside, outside}, 4, {}, {}, {}, {profile});
+    ASSERT_TRUE(frame.has_value());
+    maybeDump(frame->image, "profile_overlay");
+
+    const QRgb tinted = px(frame->image, inside.x(), inside.y());
+    const QRgb beside = px(frame->image, outside.x(), outside.y());
+    EXPECT_GT(qRed(tinted), qRed(beside) + 25) << "overlay is red over the grey face";
+    EXPECT_LT(qGreen(tinted), qGreen(beside) - 25) << "translucent: the face still shows through, tinted";
+    EXPECT_GT(qGreen(tinted), 0);
+
+    ASSERT_EQ(frame->picks.size(), 2u);
+    EXPECT_EQ(frame->picks[0].overlayIndex, 0u) << "the overlay wins over the body behind it";
+    EXPECT_FALSE(frame->picks[0].bodyIndex.has_value());
+    EXPECT_EQ(frame->picks[1].bodyIndex, 0u);
+    EXPECT_FALSE(frame->picks[1].overlayIndex.has_value());
+}
+
+TEST(Overlay, OverlayBehindABodyIsHiddenAndNotPicked) {
+    const auto bodies = oneBox();
+    const Camera c = viewFrom({0, 0, 1}, unionOf(bodies));
+    OverlayFace hidden;
+    hidden.triangles = {{-20, -20, -60}, {20, -20, -60}, {20, 20, -60}, {-20, -20, -60}, {20, 20, -60}, {-20, 20, -60}};
+    hidden.rgba = {1.f, 0.f, 0.f, 0.9f};
+    const QPoint centre(240, 180);
+    const auto frame = renderOffscreen(bodies, c, {480, 360}, {centre}, 4, {}, {}, {}, {hidden});
+    if (!frame) GTEST_SKIP() << "no QRhi backend available";
+    const QRgb p = px(frame->image, centre.x(), centre.y());
+    EXPECT_LT(qRed(p) - qGreen(p), 30) << "depth test: the box in front hides the overlay";
+    ASSERT_EQ(frame->picks.size(), 1u);
+    EXPECT_FALSE(frame->picks[0].overlayIndex.has_value());
+    EXPECT_EQ(frame->picks[0].bodyIndex, 0u);
+}

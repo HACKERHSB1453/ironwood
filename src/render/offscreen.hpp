@@ -32,7 +32,9 @@ struct OffscreenFrame {
 std::optional<OffscreenFrame> renderOffscreen(const std::vector<SceneBody>& bodies, const Camera& camera,
                                               QSize size, const std::vector<QPoint>& pickPoints = {},
                                               int samples = 4, const PickResult& hover = {},
-                                              const PickResult& selection = {});
+                                              const PickResult& selection = {},
+                                              const SectionRequest& section = {},
+                                              const std::vector<OverlayFace>& overlays = {});
 
 /// Test seam for the stale-readback guard: submits a pick at (x,y) for `bodies`, then swaps the scene to
 /// `replacement` (when given) before the GPU readback is taken. Returns what the pick callback received (empty when the scene

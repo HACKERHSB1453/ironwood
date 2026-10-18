@@ -10,7 +10,9 @@
 
 #include "core/expr.hpp"
 #include "features/feature_json.hpp"
+#include "kernel/naming_support.hpp"
 #include "kernel/ops.hpp"
+#include "naming/naming_map.hpp"
 
 namespace iw::features {
 namespace {
@@ -44,6 +46,56 @@ bool validThread(const std::string& s) {
     if (s[i] != 'x' && s[i] != 'X') return false;
     ++i;
     return digits(true) && i == s.size();
+}
+
+/// Names of the hole tool (operand 1 of the cut), by ROLE. The tool is a revolved polygon; each profile segment has a
+/// role ("wall", "floor", "drill_cone", "cbore_wall", ...) that does not depend on any dimension, so the faces and edges
+/// the tool contributes to the body keep their names when the diameter, depth or position of the hole is edited.
+///   profile face -> "holetool.profile"; profile edge -> "holetool.<role>"; profile vertex -> "holetool.v_<role of the
+///   segment it starts>"; the tool's own elements then derive from those through the revolve history (ops "holetool.<...>").
+/// Ops "hole.*" are what the cut itself creates where the tool meets the body (rim edges and vertices), named from the
+/// body face and the tool face they lie between.
+Result<naming::NamingMap> holeToolNaming(FeatureId id, const kernel::HoleDetail& hd, const naming::SiblingFrame& frame) {
+    const auto& pts = hd.profile.points;
+    const auto& roles = hd.profile.segmentRoles;
+    const std::size_t n = pts.size();
+    naming::NamingMap prof;
+    prof.resize(hd.profileFace.subShapeCount(kernel::SubShapeKind::Face), hd.profileFace.subShapeCount(kernel::SubShapeKind::Edge),
+                hd.profileFace.subShapeCount(kernel::SubShapeKind::Vertex));
+    auto make = [&](ElementType t, const std::string& op) {
+        naming::ElementName nm;
+        nm.feature = id;
+        nm.type = t;
+        nm.op = op;
+        return nm;
+    };
+    for (std::uint32_t i = 0; i < prof.size(ElementType::Face); ++i)
+        if (auto r = prof.set(ElementType::Face, i, make(ElementType::Face, "holetool.profile")); !r) return std::unexpected(r.error());
+    auto close = [](const Vec3& a, const Vec3& b) {
+        return length(a - b) <= 1e-6 * (1.0 + std::max(length(a), length(b)));
+    };
+    for (std::uint32_t i = 0; i < prof.size(ElementType::Edge); ++i) {
+        const auto k = kernel::stableSubShapeKey(hd.profileFace, kernel::SubShapeKind::Edge, i);
+        bool found = false;
+        for (std::size_t s = 0; s < n && !found; ++s) {
+            const Vec3 mid = (pts[s] + pts[(s + 1) % n]) * 0.5;
+            if (!close(mid, Vec3{k[0], k[1], k[2]})) continue;
+            found = true;
+            if (auto r = prof.set(ElementType::Edge, i, make(ElementType::Edge, "holetool." + roles[s])); !r) return std::unexpected(r.error());
+        }
+        if (!found) return makeError(ErrorCode::Internal, "hole: tool profile edge does not match a profile segment");
+    }
+    for (std::uint32_t i = 0; i < prof.size(ElementType::Vertex); ++i) {
+        const auto k = hd.profileFace.subShapeKey(kernel::SubShapeKind::Vertex, i);
+        bool found = false;
+        for (std::size_t s = 0; s < n && !found; ++s) {
+            if (!close(pts[s], Vec3{k[0], k[1], k[2]})) continue;
+            found = true;
+            if (auto r = prof.set(ElementType::Vertex, i, make(ElementType::Vertex, "holetool.v_" + roles[s])); !r) return std::unexpected(r.error());
+        }
+        if (!found) return makeError(ErrorCode::Internal, "hole: tool profile vertex does not match a profile point");
+    }
+    return naming::deriveNamingMap(id, "holetool", hd.tool.shape, {&prof}, hd.tool.history, &frame);
 }
 
 } // namespace
@@ -163,9 +215,18 @@ Result<FeatureResult> HoleFeature::compute(const EvalContext& ctx) const {
     if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "hole cancelled");
 
     const kernel::Axis placement{entry, plane->normal * -1.0};
-    auto result = kernel::hole(*body, placement, spec, ctx.cancel);
-    if (!result) return std::unexpected(result.error());
-    auto out = common::modifyBody(id_, p.body, ctx, *result, "hole", std::move(diags));
+    auto detail = kernel::holeWithTool(*body, placement, spec, ctx.cancel);
+    if (!detail) return std::unexpected(detail.error());
+    // Sibling ranks are taken in the hole's own frame (origin = entry point, z = drill direction, x = the face plane's x), so
+    // translating or rotating the hole together with its body cannot reorder siblings.
+    naming::SiblingFrame frame;
+    frame.origin = entry;
+    frame.zAxis = placement.direction;
+    frame.xAxis = plane->xDir;
+    frame.yAxis = cross(frame.zAxis, frame.xAxis);
+    auto toolNames = holeToolNaming(id_, *detail, frame);
+    if (!toolNames) return std::unexpected(toolNames.error());
+    auto out = common::modifyBody(id_, p.body, ctx, detail->result, "hole", std::move(diags), &*toolNames, &frame);
     if (!out) return std::unexpected(out.error());
     if (!p.thread.empty()) out->attributes["thread"] = p.thread;
     return out;

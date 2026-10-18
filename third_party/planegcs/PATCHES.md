@@ -32,3 +32,11 @@ library. `compat/Base/Console.h` provides those names:
 - Built against the system Eigen 5.0.1 and Boost 1.92 headers without source changes.
   `EIGEN_SPARSEQR_COMPATIBLE` is defined by upstream when Eigen's sparse module is available,
   and the sparse QR path is used.
+
+## Adapter note: F20-sym (not a planegcs patch)
+
+`System::addConstraintP2PSymmetric` adds two constraints but returns only the last index. The Ironwood adapter
+(`src/sketch/solver/sketch_solver.cpp`, case `Symmetric`) used to register just that index for `rescaleConstraint`,
+so the first constraint (perpendicular / point-on-perp-bisector) kept the scale computed at construction time, when
+every parameter was still 0. That made `SymmetricAboutLineAndAboutPoint` fail with a bogus conflict. The adapter now
+adds both constraints itself and registers both. The vendored planegcs sources are unchanged.

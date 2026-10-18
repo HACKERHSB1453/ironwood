@@ -3,6 +3,7 @@
 
 #include <QAction>
 #include <QComboBox>
+#include <QEvent>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -16,11 +17,14 @@
 #include <algorithm>
 
 #include "ui/command_actions.hpp"
+#include "ui/icons.hpp"
 
 namespace iw::ui {
 namespace {
 constexpr const char* kWorkspace = "DESIGN";
 constexpr const char* kQuickAccessTab = "";
+constexpr int kRibbonIconPx = 32; // large icon above the label (Fusion-style)
+constexpr int kQuickIconPx = 24;  // quick access row is a single compact line
 } // namespace
 
 const std::vector<std::string>& RibbonBar::tabNames() {
@@ -37,8 +41,10 @@ const std::vector<std::string>& RibbonBar::workspaceNames() {
 RibbonBar::RibbonBar(const CommandRegistry& registry, CommandActions& actions, QWidget* parent)
     : QWidget(parent), registry_(registry), actions_(actions) {
     setObjectName("ribbon");
+    theme_ = iconThemeFor(palette());
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(4, 2, 4, 2);
+    root->setSpacing(2);
 
     auto* top = new QHBoxLayout;
     workspace_ = new QComboBox(this);
@@ -60,6 +66,7 @@ RibbonBar::RibbonBar(const CommandRegistry& registry, CommandActions& actions, Q
     quickFrame->setObjectName("quickAccess");
     quickLayout_ = new QHBoxLayout(quickFrame);
     quickLayout_->setContentsMargins(0, 0, 0, 0);
+    quickLayout_->setSpacing(2);
     top->addWidget(quickFrame, 1);
     root->addLayout(top);
     buildQuickAccess();
@@ -85,6 +92,25 @@ RibbonBar::RibbonBar(const CommandRegistry& registry, CommandActions& actions, Q
     root->addWidget(tabs_);
     root->addWidget(pages_);
     tabs_->setCurrentIndex(0);
+    applyIcons();
+}
+
+void RibbonBar::changeEvent(QEvent* event) {
+    QWidget::changeEvent(event);
+    if (event->type() == QEvent::PaletteChange) {
+        const IconTheme now = iconThemeFor(palette());
+        if (now != theme_) {
+            theme_ = now;
+            applyIcons();
+        }
+    }
+}
+
+void RibbonBar::applyIcons() {
+    for (const Command& c : registry_.all()) {
+        if (c.icon.empty()) continue;
+        if (QAction* a = actions_.action(c.id)) a->setIcon(icon(c.icon, kRibbonIconPx, theme_));
+    }
 }
 
 void RibbonBar::buildQuickAccess() {
@@ -99,6 +125,8 @@ void RibbonBar::buildQuickAccess() {
         auto* b = new QToolButton(quickLayout_->parentWidget());
         b->setDefaultAction(a);
         b->setToolButtonStyle(Qt::ToolButtonIconOnly);
+        b->setIconSize(QSize(kQuickIconPx, kQuickIconPx));
+        b->setAutoRaise(true);
         b->setObjectName(QString::fromStdString("quick_" + id));
         quickLayout_->addWidget(b);
         quickIds_.push_back(id);
@@ -113,8 +141,8 @@ void RibbonBar::buildQuickAccess() {
 void RibbonBar::buildTab(const std::string& tab, QWidget* page) {
     auto* row = new QHBoxLayout(page);
     row->setContentsMargins(2, 2, 2, 2);
+    row->setSpacing(4);
     row->setAlignment(Qt::AlignLeft);
-
     const auto groups = registry_.groups(kWorkspace, tab);
     if (groups.empty()) {
         auto* note = new QLabel(tr("%1 - coming soon").arg(QString::fromStdString(tab)), page);
@@ -128,31 +156,50 @@ void RibbonBar::buildTab(const std::string& tab, QWidget* page) {
         panel->setObjectName(QString::fromStdString("group_" + g));
         panel->setFrameShape(QFrame::StyledPanel);
         auto* col = new QVBoxLayout(panel);
-        col->setContentsMargins(4, 2, 4, 2);
+        col->setContentsMargins(3, 2, 3, 1);
+        col->setSpacing(1);
 
+        // Fusion layout: large icons with short labels on top, the group name and its dropdown arrow underneath.
         auto* buttons = new QHBoxLayout;
+        buttons->setSpacing(2);
         const auto cmds = registry_.inGroup(kWorkspace, tab, g);
         for (const Command* c : cmds) {
             auto* b = new QToolButton(panel);
-            b->setDefaultAction(actions_.action(c->id));
+            QAction* action = actions_.action(c->id);
+            b->setDefaultAction(action);
+            if (action && !c->shortLabel.isEmpty()) {
+                // The ribbon shows the short label ("Parameters"); the action keeps the full one for menus and S-box.
+                // Connected after setDefaultAction, so this runs after the button copied the action's text.
+                const QString shortText = c->shortLabel;
+                b->setText(shortText);
+                connect(action, &QAction::changed, b, [b, shortText] { b->setText(shortText); });
+            }
             b->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+            b->setIconSize(QSize(kRibbonIconPx, kRibbonIconPx));
+            b->setAutoRaise(true);
             b->setObjectName(QString::fromStdString("btn_" + c->id));
             buttons->addWidget(b);
         }
         auto* title = new QHBoxLayout;
+        title->setSpacing(2);
         auto* label = new QLabel(QString::fromStdString(g), panel);
         label->setObjectName(QString::fromStdString("title_" + g));
+        label->setAlignment(Qt::AlignCenter);
+        title->addStretch(1);
         title->addWidget(label);
         auto* more = new QToolButton(panel);
         more->setText(QStringLiteral("▾")); // small down triangle: dropdown arrow
         more->setToolTip(tr("More %1 commands").arg(QString::fromStdString(g)));
         more->setPopupMode(QToolButton::InstantPopup);
+        more->setAutoRaise(true);
+        more->setObjectName(QString::fromStdString("more_" + g));
         auto* menu = new QMenu(more);
         for (const Command* c : cmds) menu->addAction(actions_.action(c->id));
         more->setMenu(menu);
         title->addWidget(more);
-        col->addLayout(title);
+        title->addStretch(1);
         col->addLayout(buttons);
+        col->addLayout(title);
 
         row->addWidget(panel);
     }

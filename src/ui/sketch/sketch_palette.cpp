@@ -4,7 +4,7 @@
 #include <QAbstractButton>
 #include <QButtonGroup>
 #include <QCheckBox>
-#include <QDoubleSpinBox>
+#include <QGridLayout>
 #include <QLabel>
 #include <QCoreApplication>
 #include <QHBoxLayout>
@@ -28,7 +28,8 @@ SketchPalette::SketchPalette(QWidget* parent) : QWidget(parent) {
     root->addWidget(title_);
 
     // Tools: exclusive checkable buttons. Shortcuts L, R, C, P and X are handled by the sketch mode.
-    auto* toolRow = new QHBoxLayout;
+    auto* toolRow = new QGridLayout;
+    int toolCount = 0;
     auto* group = new QButtonGroup(this);
     group->setExclusive(true);
     const struct {
@@ -45,6 +46,7 @@ SketchPalette::SketchPalette(QWidget* parent) : QWidget(parent) {
         {SketchTool::Arc, "Arc (A)", "tool_arc"},
         {SketchTool::Trim, "Trim (T)", "tool_trim"},
         {SketchTool::Offset, "Offset (O)", "tool_offset"},
+        {SketchTool::Dimension, "Dimension (D)", "tool_dimension"},
     };
     for (const auto& t : kTools) {
         auto* b = new QToolButton(this);
@@ -52,7 +54,8 @@ SketchPalette::SketchPalette(QWidget* parent) : QWidget(parent) {
         b->setObjectName(QString::fromLatin1(t.objectName));
         b->setCheckable(true);
         group->addButton(b);
-        toolRow->addWidget(b);
+        toolRow->addWidget(b, toolCount / 4, toolCount % 4);
+        ++toolCount;
         tools_.emplace_back(t.tool, b);
         connect(b, &QToolButton::clicked, this, [this, tool = t.tool] { emit toolRequested(tool); });
     }
@@ -68,6 +71,42 @@ SketchPalette::SketchPalette(QWidget* parent) : QWidget(parent) {
     editRow->addWidget(undo);
     editRow->addWidget(redo);
     root->addLayout(editRow);
+
+    // Constraint toolbar: select entities, then click.
+    auto* conGrid = new QGridLayout;
+    const struct {
+        sketch::ConstraintKind kind;
+        const char* text;
+        const char* objectName;
+    } kCons[] = {
+        {sketch::ConstraintKind::Horizontal, "H", "con_horizontal"},
+        {sketch::ConstraintKind::Vertical, "V", "con_vertical"},
+        {sketch::ConstraintKind::Coincident, "Coincident", "con_coincident"},
+        {sketch::ConstraintKind::Tangent, "Tangent", "con_tangent"},
+        {sketch::ConstraintKind::Equal, "Equal", "con_equal"},
+        {sketch::ConstraintKind::Parallel, "Parallel", "con_parallel"},
+        {sketch::ConstraintKind::Perpendicular, "Perpendicular", "con_perpendicular"},
+        {sketch::ConstraintKind::Fix, "Fix / Unfix", "con_fix"},
+        {sketch::ConstraintKind::Midpoint, "Midpoint", "con_midpoint"},
+        {sketch::ConstraintKind::Concentric, "Concentric", "con_concentric"},
+        {sketch::ConstraintKind::Collinear, "Collinear", "con_collinear"},
+        {sketch::ConstraintKind::Symmetric, "Symmetry", "con_symmetric"},
+        {sketch::ConstraintKind::PointOnObject, "Point on object", "con_pointonobject"},
+    };
+    int conCount = 0;
+    for (const auto& c : kCons) {
+        auto* b = new QToolButton(this);
+        b->setText(T(c.text));
+        b->setObjectName(QString::fromLatin1(c.objectName));
+        conGrid->addWidget(b, conCount / 3, conCount % 3);
+        ++conCount;
+        if (c.kind == sketch::ConstraintKind::Fix) {
+            connect(b, &QToolButton::clicked, this, [this] { emit fixToggleRequested(); });
+        } else {
+            connect(b, &QToolButton::clicked, this, [this, k = c.kind] { emit constraintRequested(k); });
+        }
+    }
+    root->addLayout(conGrid);
 
     // Display toggles.
     auto emitOptions = [this] {
@@ -89,22 +128,16 @@ SketchPalette::SketchPalette(QWidget* parent) : QWidget(parent) {
         connect(b, &QAbstractButton::toggled, this, [emitOptions] { emitOptions(); });
     }
 
-    // Inference: snapping and auto-constraints. Off by default (unassisted drawing is literal).
+    // Inference: snapping and auto-constraints. On by default.
     snap_ = new QCheckBox(T("Snap and auto-constraints"), this);
     snap_->setObjectName("toggleSnap");
     root->addWidget(snap_);
     connect(snap_, &QCheckBox::toggled, this, [this](bool on) { emit snapToggled(on); });
 
-    auto* offsetRow = new QHBoxLayout;
-    offsetRow->addWidget(new QLabel(T("Offset (mm)"), this));
-    offset_ = new QDoubleSpinBox(this);
-    offset_->setObjectName("offsetDistance");
-    offset_->setRange(-1000.0, 1000.0);
-    offset_->setDecimals(3);
-    offset_->setValue(2.0);
-    connect(offset_, &QDoubleSpinBox::valueChanged, this, [this](double v) { emit offsetDistanceChanged(v); });
-    offsetRow->addWidget(offset_);
-    root->addLayout(offsetRow);
+    dof_ = new QLabel(this);
+    dof_->setObjectName("sketchDof");
+    dof_->setWordWrap(true);
+    root->addWidget(dof_);
 
     status_ = new QLabel(this);
     status_->setObjectName("sketchStatus");
@@ -146,13 +179,27 @@ void SketchPalette::setSnapEnabled(bool on) {
 
 bool SketchPalette::snapEnabled() const { return snap_->isChecked(); }
 
-void SketchPalette::setOffsetDistance(double mm) {
-    offset_->blockSignals(true);
-    offset_->setValue(mm);
-    offset_->blockSignals(false);
+void SketchPalette::setConstraintStatus(int dof, ConstraintState state, const QString& message) {
+    QString text = QCoreApplication::translate("SketchPalette", "DOF: %1").arg(dof);
+    QString color;
+    switch (state) {
+    case ConstraintState::Fully:
+        text += QCoreApplication::translate("SketchPalette", " - fully constrained");
+        break;
+    case ConstraintState::Conflicting:
+        text += QCoreApplication::translate("SketchPalette", " - conflicting constraints");
+        color = QStringLiteral("color: #eb4034;");
+        break;
+    case ConstraintState::Under:
+        text += QCoreApplication::translate("SketchPalette", " - under-constrained");
+        break;
+    }
+    if (!message.isEmpty() && state == ConstraintState::Conflicting) text += QStringLiteral("\n") + message;
+    dof_->setStyleSheet(color);
+    dof_->setText(text);
 }
 
-double SketchPalette::offsetDistance() const { return offset_->value(); }
+QString SketchPalette::dofText() const { return dof_->text(); }
 
 void SketchPalette::setStatus(const QString& text) { status_->setText(text); }
 

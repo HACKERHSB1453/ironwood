@@ -70,8 +70,13 @@ Result<recompute::FeatureResult> applyBodyOp(FeatureId feature, BodyOp op, BodyI
 
 /// Result of an in-place modification of `body` (fillet, chamfer, hole, move): the new shape with names derived from
 /// the current body's names and the kernel history. `opTag` is the operation tag used for new names.
+/// `toolNaming` (N1/F27): names of operand 1 of the kernel operation (the hole tool). When given, the history of operand 1
+/// is kept, so elements born from the tool derive from the tool's names; otherwise operand-1 history is dropped.
+/// `frame`: sibling ordinals are ranked in this frame (see naming::SiblingFrame); null = translation-relative world keys.
 Result<recompute::FeatureResult> modifyBody(FeatureId feature, BodyId body, const recompute::EvalContext& ctx,
                                             const kernel::ShapeResult& result, std::string_view opTag,
-                                            std::vector<recompute::Diagnostic> diags);
+                                            std::vector<recompute::Diagnostic> diags,
+                                            const naming::NamingMap* toolNaming = nullptr,
+                                            const naming::SiblingFrame* frame = nullptr);
 
 } // namespace iw::features::common

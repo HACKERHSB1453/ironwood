@@ -16,4 +16,5 @@ qt_add_shaders(iw_render iw_render_shaders
     NOHLSL
     NOMSL
     FILES shaders/bg.vert shaders/bg.frag shaders/mesh.vert shaders/mesh.frag shaders/mesh_pick.frag
-          shaders/edge.vert shaders/edge.frag shaders/edge_pick.frag)
+          shaders/mask.frag shaders/edge.vert shaders/edge.frag shaders/edge_pick.frag
+          shaders/overlay.vert shaders/overlay.frag shaders/overlay_pick.frag)

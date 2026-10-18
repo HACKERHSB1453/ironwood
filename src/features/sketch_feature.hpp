@@ -7,6 +7,7 @@
 // id and profile name (SketchReferenceSource); the Document resolves those references before evaluation.
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -36,6 +37,9 @@ struct SketchSolution {
     std::vector<sketch::SketchProfile> profiles;  ///< detectProfiles(sketch), sorted by name.
     sketch::SketchSolveReport report;             ///< DOF and redundancy diagnostics.
     std::vector<recompute::Diagnostic> diagnostics;
+    /// Measured value of every driven (reference) dimension on the solved geometry (mm, or rad for angles). A driven
+    /// dimension that cannot be measured is omitted and reported as a Warning in `diagnostics`.
+    std::map<sketch::SketchDimensionId, double> drivenValues;
 };
 
 class SketchFeature final : public recompute::Feature {
@@ -53,7 +57,8 @@ public:
     std::vector<BodyId> writesBodies() const override { return {}; }
     std::uint64_t paramHash() const override;
     std::string paramsJson() const override;
-    /// Publishes dof / profile-count attributes. Errors: the solve errors of solve().
+    /// Publishes dof / profile-count attributes, and one "driven.<dimension id>" attribute per measured driven
+    /// dimension (its value, decimal, mm or rad). Errors: the solve errors of solve().
     Result<recompute::FeatureResult> compute(const recompute::EvalContext& ctx) const override;
 
     /// Resolves the plane at `ctx`, solves against ctx.params and detects profiles. Failures: InvalidArgument with the

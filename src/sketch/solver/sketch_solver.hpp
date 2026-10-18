@@ -83,6 +83,8 @@ enum class SolverConstraintKind : std::uint8_t {
     // refs: 1 entity. Fixes the whole entity at its current position (point: x and y;
     // line: both endpoints; circle: centre and radius; arc: centre, endpoints and radius).
     Fix,
+    // refs: point (entity or sub-point), then 1 line, circle or arc. The point lies on that curve.
+    PointOnObject,
     // refs: 2 points. value: distance (mm).
     Distance,
     // refs: 2 points. value: signed x (or y) difference, second minus first (mm).

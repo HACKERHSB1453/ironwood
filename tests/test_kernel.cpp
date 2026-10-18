@@ -16,6 +16,7 @@
 
 #include "kernel/exchange.hpp"
 #include "kernel/internal/profile_support.hpp"
+#include "kernel/internal/validate.hpp"
 #include "kernel/ops.hpp"
 
 using namespace iw;
@@ -995,4 +996,119 @@ TEST(KernelB1b, TangentChainFollowsTheTangentEdgesOfAFilletedCorner) {
     ASSERT_TRUE(chain.has_value()) << chain.error().message;
     // The arc meets two top straight edges tangentially; those meet the next corner at 90 degrees, so the chain is 3.
     EXPECT_EQ(chain->size(), 3u);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// K1 robustness: result validation (F38), edge-op pre-validation (F37/F39). Seed-level regressions (the exact
+// replayed scenarios of F37/F38/F39) run through ctest from tests/kernel_robustness.cmake.
+
+namespace {
+Box3 makeBoxRange(Vec3 lo, Vec3 hi) {
+    Box3 b;
+    b.min = lo;
+    b.max = hi;
+    return b;
+}
+} // namespace
+
+TEST(KernelCheck, BooleanVolumeInvariants) {
+    using check::BooleanKind;
+    // Fuse: max(|A|,|B|) <= |R| <= |A|+|B|
+    EXPECT_TRUE(check::volumesPlausible(BooleanKind::Fuse, 10, 10, 10));  // identical operands
+    EXPECT_TRUE(check::volumesPlausible(BooleanKind::Fuse, 10, 10, 15));
+    EXPECT_TRUE(check::volumesPlausible(BooleanKind::Fuse, 10, 10, 20));
+    EXPECT_FALSE(check::volumesPlausible(BooleanKind::Fuse, 10, 4, 9.9));   // volume lost (F38 class)
+    EXPECT_FALSE(check::volumesPlausible(BooleanKind::Fuse, 10, 4, 20.5));  // volume created
+    // Cut: |R| <= |A|
+    EXPECT_TRUE(check::volumesPlausible(BooleanKind::Cut, 10, 4, 6));
+    EXPECT_TRUE(check::volumesPlausible(BooleanKind::Cut, 10, 4, 10));
+    EXPECT_FALSE(check::volumesPlausible(BooleanKind::Cut, 10, 4, 10.5));
+    // Common: |R| <= min(|A|,|B|)
+    EXPECT_TRUE(check::volumesPlausible(BooleanKind::Common, 10, 4, 4));
+    EXPECT_FALSE(check::volumesPlausible(BooleanKind::Common, 10, 4, 5));
+    // Relative tolerance of 1e-5 of (|A|+|B|): a 1e-6 relative slip passes, a 1e-3 one fails.
+    EXPECT_TRUE(check::volumesPlausible(BooleanKind::Fuse, 1000, 0, 1000 * (1 - 1e-6)));
+    EXPECT_FALSE(check::volumesPlausible(BooleanKind::Fuse, 1000, 0, 1000 * (1 - 1e-3)));
+    // Non-finite or negative volumes never pass.
+    EXPECT_FALSE(check::volumesPlausible(BooleanKind::Fuse, 10, 10, std::numeric_limits<double>::quiet_NaN()));
+    EXPECT_FALSE(check::volumesPlausible(BooleanKind::Cut, 10, 4, -1));
+}
+
+TEST(KernelCheck, BoundsGrowthAllowance) {
+    const Box3 in = makeBoxRange({0, 0, 0}, {10, 10, 10});
+    EXPECT_TRUE(check::boundsWithin(in, makeBoxRange({-0.5, 0, 0}, {10.5, 10, 10.5}), 1.0));
+    EXPECT_FALSE(check::boundsWithin(in, makeBoxRange({-0.5, 0, 0}, {10.5, 10, 10.5}), 0.1));
+    // F39 class: a sliver face hundreds of mm away from a 10 mm body
+    EXPECT_FALSE(check::boundsWithin(in, makeBoxRange({0, -77, -21}, {10, 45, 11}), 1.6));
+    // Empty boxes never match
+    EXPECT_FALSE(check::boundsWithin(Box3{}, in, 1.0));
+    EXPECT_FALSE(check::boundsWithin(in, Box3{}, 1.0));
+}
+
+TEST(KernelCheck, SolidValidityRejectsNonSolids) {
+    EXPECT_TRUE(check::isSolidValid(box(10, 10, 10)));
+    EXPECT_FALSE(check::isSolidValid(Shape{}));
+    auto face = makePolygonFace(std::vector<Vec3>{{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}});
+    ASSERT_TRUE(face.has_value());
+    EXPECT_FALSE(check::isSolidValid(*face)); // a face is not a solid
+}
+
+TEST(KernelCheck, SolidValidityVerdictIsMemoisedConsistently) {
+    // K2: the structural verdict is memoised on the shape. Repeated calls, and calls on a copy (which carries the memo),
+    // must agree with the first, uncached verdict; a non-solid stays rejected on every call.
+    const Shape b = box(10, 10, 10);
+    EXPECT_TRUE(check::isSolidValid(b));
+    EXPECT_TRUE(check::isSolidValid(b));
+    const Shape copy = b;
+    EXPECT_TRUE(check::isSolidValid(copy));
+    auto face = makePolygonFace(std::vector<Vec3>{{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}});
+    ASSERT_TRUE(face.has_value());
+    EXPECT_FALSE(check::isSolidValid(*face));
+    EXPECT_FALSE(check::isSolidValid(*face));
+}
+
+TEST(KernelCheck, CoincidentAndTouchingOperandsKeepExactVolumes) {
+    const Shape a = box(10, 10, 10);
+    auto same = fuse(a, a);
+    ASSERT_TRUE(same.has_value()) << same.error().message;
+    EXPECT_NEAR(volume(same->shape), 1000, 1e-6);
+    auto touching = fuse(a, box(10, 10, 10, {10, 0, 0}));
+    ASSERT_TRUE(touching.has_value()) << touching.error().message;
+    EXPECT_NEAR(volume(touching->shape), 2000, 1e-6);
+    // Cutting a solid from itself leaves nothing: a clean failure, never a zero-volume solid.
+    EXPECT_EQ(cut(a, a).error().code, ErrorCode::KernelFailure);
+    // A 1e-9 mm overlap is a sliver-level case; the result must still satisfy the volume invariant.
+    auto sliver = fuse(a, box(10, 10, 10, {10 - 1e-9, 0, 0}));
+    ASSERT_TRUE(sliver.has_value()) << sliver.error().message;
+    EXPECT_NEAR(volume(sliver->shape), 2000, 1e-3);
+}
+
+TEST(KernelOps, ChamferSetbackMustStayShorterThanAdjacentEdges) {
+    // Thin plate 1 x 10 x 10: the 10 mm edge along y at x = 0, z = 0 has 1 mm neighbours along x.
+    Shape plate = box(1, 10, 10);
+    auto e = findSub(plate, SubShapeKind::Edge, {0, 5, 0, 10});
+    ASSERT_TRUE(e.has_value());
+    auto c = chamferEdges(plate, ids({*e}), 2, 2);
+    ASSERT_FALSE(c.has_value());
+    EXPECT_EQ(c.error().code, ErrorCode::KernelFailure);
+    EXPECT_NE(c.error().message.find("reaches an adjacent edge"), std::string::npos) << c.error().message;
+    // A setback inside the neighbours' length is fine.
+    auto ok = chamferEdges(plate, ids({*e}), 0.5, 0.5);
+    EXPECT_TRUE(ok.has_value()) << (ok ? "" : ok.error().message);
+}
+
+TEST(KernelOps, DegenerateEdgesAreRejectedBeforeOcct) {
+    // A sphere's poles are degenerate (zero-length) edges of its parametrisation.
+    auto sphere = makeSphere({0, 0, 0}, 5);
+    ASSERT_TRUE(sphere.has_value());
+    std::optional<std::uint32_t> degenerate;
+    for (std::uint32_t i = 0; i < sphere->shape.subShapeCount(SubShapeKind::Edge); ++i)
+        if (sphere->shape.subShapeKey(SubShapeKind::Edge, i)[3] < 1e-9) { degenerate = i; break; }
+    ASSERT_TRUE(degenerate.has_value()) << "sphere has no zero-length edge to test with";
+    auto f = filletEdges(sphere->shape, ids({*degenerate}), 0.5);
+    ASSERT_FALSE(f.has_value());
+    EXPECT_EQ(f.error().code, ErrorCode::KernelFailure);
+    auto c = chamferEdges(sphere->shape, ids({*degenerate}), 0.5, 0.5);
+    ASSERT_FALSE(c.has_value());
+    EXPECT_EQ(c.error().code, ErrorCode::KernelFailure);
 }

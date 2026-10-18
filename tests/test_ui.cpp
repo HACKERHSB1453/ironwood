@@ -365,9 +365,12 @@ TEST(UiImport, StepAssemblyImportsIntoTreeAndViewport) {
     EXPECT_TRUE(w.windowTitle().contains("assembly.step"));
 
     // Tree: one root group with three named leaves, in assembly order.
+    // The browser also lists the document groups (Origin, Sketches, Bodies, Construction); the import is its own root.
     QTreeWidget* tree = w.browser();
-    ASSERT_EQ(tree->topLevelItemCount(), 1);
-    QTreeWidgetItem* root = tree->topLevelItem(0);
+    QTreeWidgetItem* root = nullptr;
+    for (int i = 0; i < tree->topLevelItemCount(); ++i)
+        if (tree->topLevelItem(i)->text(0) == "Assembly") root = tree->topLevelItem(i);
+    ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->text(0), "Assembly");
     ASSERT_EQ(root->childCount(), 3);
     EXPECT_EQ(root->child(0)->text(0), "Bracket");

@@ -7,8 +7,10 @@
 #include <vector>
 
 #include "ui/command.hpp"
+#include "ui/icons.hpp"
 
 class QComboBox;
+class QEvent;
 class QHBoxLayout;
 class QTabBar;
 class QStackedWidget;
@@ -41,12 +43,17 @@ public:
     /// Replaces the pinned commands shown after Undo/Redo in the quick-access row.
     void setPinned(const std::vector<std::string>& ids);
 
+protected:
+    void changeEvent(QEvent* event) override;
+
 signals:
     void workspaceChanged(const QString& workspace);
 
 private:
     void buildTab(const std::string& tab, QWidget* page);
     void buildQuickAccess();
+    /// Sets each command's icon (rendered for the current palette theme). Disabled commands grey out via Qt.
+    void applyIcons();
 
     const CommandRegistry& registry_;
     CommandActions& actions_;
@@ -56,6 +63,7 @@ private:
     QHBoxLayout* quickLayout_ = nullptr;
     std::vector<std::string> quickIds_;
     std::vector<std::string> pinned_;
+    IconTheme theme_ = IconTheme::Light;
 };
 
 } // namespace iw::ui

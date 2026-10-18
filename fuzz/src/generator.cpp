@@ -2,26 +2,43 @@
 #include "fuzz/generator.hpp"
 
 #include <algorithm>
-#include <cmath>
-#include <cstdio>
 
 namespace iw::fuzz {
 
-bool sameGeometry(const GeomSig& a, const GeomSig& b) {
-    if (a.type != b.type) return false;
-    constexpr double kCentroidTol = 1e-4; // mm
-    for (std::size_t i = 0; i < 3; ++i)
-        if (std::abs(a.key[i] - b.key[i]) > kCentroidTol) return false;
-    const double m = std::abs(a.key[3] - b.key[3]);
-    return m <= 1e-6 + 1e-6 * std::max(std::abs(a.key[3]), std::abs(b.key[3]));
+FeatureId GenContext::writerOf(BodyId body) const {
+    FeatureId out;
+    for (std::size_t i = 0; i < timeline.size(); ++i) {
+        const auto& f = timeline.at(i);
+        for (BodyId b : f->writesBodies())
+            if (b == body) out = f->id();
+    }
+    return out;
 }
 
-std::string describe(const GeomSig& s) {
-    static constexpr const char* kTypes[] = {"F", "E", "V"};
-    char buf[160];
-    std::snprintf(buf, sizeof buf, "%s(%.6g, %.6g, %.6g; m=%.6g)", kTypes[static_cast<int>(s.type)], s.key[0],
-                  s.key[1], s.key[2], s.key[3]);
-    return buf;
+BodyId GenContext::freshBody() const {
+    std::uint64_t top = 0;
+    for (const auto& [id, shape] : state.bodies) top = std::max(top, id.value());
+    for (BodyId b : bodies) top = std::max(top, b.value());
+    return BodyId{std::max<std::uint64_t>(top, 9) + 1};
+}
+
+std::optional<std::uint32_t> PredictContext::indexOf(BodyId body, const naming::ElementName& name) const {
+    auto n = in.namings.find(body);
+    if (n == in.namings.end()) return std::nullopt;
+    const auto exact = n->second.indicesOf(name);
+    if (exact.size() == 1) return exact.front();
+    if (!resolve) return std::nullopt;
+    auto r = resolve(naming::ElementRef{FeatureId{}, name.type, name}, n->second);
+    if (!r || r->index >= n->second.size(name.type)) return std::nullopt;
+    return r->index;
+}
+
+std::optional<GeomSig> PredictContext::lookup(BodyId body, const naming::ElementName& name) const {
+    auto b = in.bodies.find(body);
+    if (b == in.bodies.end()) return std::nullopt;
+    auto idx = indexOf(body, name);
+    if (!idx) return std::nullopt;
+    return readSig(b->second, name.type, *idx);
 }
 
 void GeneratorRegistry::add(std::shared_ptr<const FeatureGenerator> generator) {
@@ -45,6 +62,12 @@ std::vector<const FeatureGenerator*> GeneratorRegistry::all() const {
 GeneratorRegistry GeneratorRegistry::defaults() {
     GeneratorRegistry reg;
     reg.add(makeExtrudeGenerator());
+    reg.add(makeRevolveGenerator());
+    reg.add(makeAxisGenerator());
+    reg.add(makeFilletGenerator());
+    reg.add(makeChamferGenerator());
+    reg.add(makeHoleGenerator());
+    reg.add(makeMoveGenerator());
     return reg;
 }
 

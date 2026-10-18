@@ -70,6 +70,7 @@ std::optional<SolverConstraintKind> mapConstraintKind(ConstraintKind k) {
     case ConstraintKind::Collinear: return SolverConstraintKind::Collinear;
     case ConstraintKind::Symmetric: return SolverConstraintKind::Symmetric;
     case ConstraintKind::Fix: return SolverConstraintKind::Fix;
+    case ConstraintKind::PointOnObject: return SolverConstraintKind::PointOnObject;
     }
     return std::nullopt;
 }

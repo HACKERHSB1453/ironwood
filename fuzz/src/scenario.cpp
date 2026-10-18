@@ -4,17 +4,11 @@
 #include <algorithm>
 #include <set>
 
+#include "recompute/evaluator.hpp"
 #include "recompute/feature.hpp"
 
 namespace iw::fuzz {
 namespace {
-
-std::vector<BodyId> bodiesOf(const recompute::Timeline& t) {
-    std::set<BodyId> s;
-    for (std::size_t i = 0; i < t.size(); ++i)
-        for (BodyId b : t.at(i)->writesBodies()) s.insert(b);
-    return {s.begin(), s.end()};
-}
 
 std::vector<FeatureId> idsOf(const recompute::Timeline& t) {
     std::vector<FeatureId> ids;
@@ -22,14 +16,38 @@ std::vector<FeatureId> idsOf(const recompute::Timeline& t) {
     return ids;
 }
 
-/// A feature from a random registered generator, id `id`; tries every generator from a random start.
+/// A feature from a random registered generator (weighted), id `id`, for insertion at `position`. The generator sees
+/// the model state at that position, so it can name elements (edges to fillet, faces to drill) that exist there.
 std::shared_ptr<const recompute::Feature> makeFeature(Rng& rng, FeatureId id, const recompute::Timeline& t,
-                                                      const std::vector<const FeatureGenerator*>& gens) {
+                                                      std::size_t position, const std::vector<const FeatureGenerator*>& gens,
+                                                      recompute::Evaluator& ev, std::string_view prefer = {}) {
     if (gens.empty()) return nullptr;
-    const GenContext ctx{t, bodiesOf(t)};
-    const std::size_t start = rng.below(gens.size());
-    for (std::size_t k = 0; k < gens.size(); ++k)
-        if (auto f = gens[(start + k) % gens.size()]->generate(rng, id, ctx)) return f;
+    recompute::Timeline prefix = t;
+    prefix.setRollbackMarker(std::min(position, t.size()));
+    ModelState state;
+    if (auto r = ev.evaluate(prefix)) state = ModelState::from(*r);
+    std::vector<BodyId> bodies;
+    for (const auto& [b, shape] : state.bodies) bodies.push_back(b);
+    const GenContext ctx{t, std::move(bodies), state};
+
+    if (!prefer.empty()) {
+        for (const auto* g : gens)
+            if (g->kind() == prefer)
+                if (auto f = g->generate(rng, id, ctx)) return f;
+    }
+    std::vector<const FeatureGenerator*> left = gens;
+    while (!left.empty()) {
+        int total = 0;
+        for (const auto* g : left) total += std::max(1, g->weight());
+        int roll = rng.intIn(0, total - 1);
+        std::size_t chosen = 0;
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            roll -= std::max(1, left[i]->weight());
+            if (roll < 0) { chosen = i; break; }
+        }
+        if (auto f = left[chosen]->generate(rng, id, ctx)) return f;
+        left.erase(left.begin() + static_cast<std::ptrdiff_t>(chosen));
+    }
     return nullptr;
 }
 
@@ -62,10 +80,14 @@ Scenario generateScenario(std::uint64_t seed, const GeneratorRegistry& registry,
     const int maxFeatures = std::max(1, config.maxFeatures);
 
     recompute::Timeline tl;
+    recompute::Evaluator ev;
     std::uint64_t nextId = 1;
-    const int nBase = rng.intIn(1, maxFeatures);
+    const int nBase = config.holeFocus ? std::max(3, rng.intIn(3, maxFeatures)) : rng.intIn(1, maxFeatures);
+    static const char* kFocus[] = {"extrude", "hole", "fillet"};
     for (int i = 0; i < nBase; ++i) {
-        auto f = makeFeature(rng, FeatureId{nextId}, tl, gens);
+        std::string_view prefer;
+        if (config.holeFocus && i < 3) prefer = kFocus[i];
+        auto f = makeFeature(rng, FeatureId{nextId}, tl, tl.size(), gens, ev, prefer);
         if (!f) break;
         ++nextId;
         tl.append(f);
@@ -79,13 +101,13 @@ Scenario generateScenario(std::uint64_t seed, const GeneratorRegistry& registry,
             const std::size_t size = tl.size();
             const std::uint64_t roll = rng.below(100);
             if (size == 0) break;
-            if (roll < 30) {
+            if (roll < 38) {
                 if (size >= static_cast<std::size_t>(maxFeatures)) continue;
                 st.kind = StepKind::Insert;
                 st.position = rng.below(size + 1);
-                st.feature = makeFeature(rng, FeatureId{nextId}, tl, gens);
+                st.feature = makeFeature(rng, FeatureId{nextId}, tl, st.position, gens, ev, rng.chance(0.5) ? "extrude" : "");
                 if (!st.feature) continue;
-            } else if (roll < 50) {
+            } else if (roll < 56) {
                 st.kind = StepKind::EditDimension;
                 const auto& f = tl.at(rng.below(size));
                 const FeatureGenerator* g = registry.find(f->kind());
@@ -93,17 +115,17 @@ Scenario generateScenario(std::uint64_t seed, const GeneratorRegistry& registry,
                 st.feature = g->editDimension(rng, *f);
                 if (!st.feature) continue;
                 st.target = f->id();
-            } else if (roll < 62) {
+            } else if (roll < 66) {
                 st.kind = StepKind::Remove;
                 st.target = tl.at(rng.below(size))->id();
-            } else if (roll < 72) {
+            } else if (roll < 74) {
                 std::vector<FeatureId> cand;
                 for (FeatureId id : idsOf(tl))
                     if (!tl.isSuppressed(id)) cand.push_back(id);
                 if (cand.empty()) continue;
                 st.kind = StepKind::Suppress;
                 st.target = cand[rng.below(cand.size())];
-            } else if (roll < 82) {
+            } else if (roll < 84) {
                 std::vector<FeatureId> cand;
                 for (FeatureId id : idsOf(tl))
                     if (tl.isSuppressed(id)) cand.push_back(id);

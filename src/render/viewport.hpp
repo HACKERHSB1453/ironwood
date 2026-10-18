@@ -28,6 +28,25 @@ struct SceneBody {
     std::array<float, 3> color{0.68f, 0.72f, 0.78f}; ///< Linear RGB surface colour (default light grey).
 };
 
+/// Section (cut) plane. Render-local mirror of kernel `section::RenderRequest` (same fields, same meaning), so the
+/// render module stays free of OCCT. The UI converts one to the other field by field.
+/// Fragments with `clipPlane` (nx,ny,nz,d) dot p + d < 0 are discarded (kept side n·p + d >= 0, mm). When
+/// `enabled` is false nothing is clipped. With the section on, the cut solids get a flat cap in `capColour`.
+struct SectionRequest {
+    bool enabled = false;
+    std::array<double, 4> clipPlane{0, 0, 1, 0};
+    std::array<float, 4> capColour{1.0f, 0.55f, 0.1f, 1.0f}; ///< RGBA 0..1
+    friend bool operator==(const SectionRequest&, const SectionRequest&) = default;
+};
+
+/// A translucent flat overlay drawn after the opaque bodies (depth-tested, not depth-written), e.g. a sketch
+/// profile tint. `triangles` holds 3 world-space vertices (mm) per triangle.
+struct OverlayFace {
+    std::vector<Vec3> triangles;
+    std::array<float, 4> rgba{0.2f, 0.5f, 1.0f, 0.35f}; ///< RGBA 0..1, straight alpha.
+    friend bool operator==(const OverlayFace&, const OverlayFace&) = default;
+};
+
 /// Result of a pick. Indices follow the B-rep sub-shape ordering of the picked body's Shape
 /// (== MeshData::faceRanges / edgePolylines indices). `bodyIndex` indexes the vector passed to setScene.
 struct PickResult {
@@ -35,6 +54,9 @@ struct PickResult {
     std::optional<std::uint32_t> faceIndex;
     std::optional<std::uint32_t> edgeIndex; ///< Edges take priority over faces within a screen radius.
     std::optional<Vec3> point;              ///< World-space hit point (mm), when something was hit.
+    /// Index into the list given to setOverlayFaces. Set alone (no body/face/edge) when an overlay is hit: an
+    /// overlay that is visible at the pick point wins over the bodies and edges behind it.
+    std::optional<std::uint32_t> overlayIndex;
 };
 
 /// 3D viewport on QRhi (Vulkan preferred, see createVulkanInstance). UI-thread object; every method must be
@@ -80,6 +102,16 @@ public:
     void viewFromDirection(const Vec3& eyeDir, int ms = 250);
     void animateTo(const CameraState& s, int ms = 250);
     bool isAnimating() const noexcept;
+
+    /// Section analysis: clips every body (and its edges) to the kept side and draws a cap on the cut. Picking
+    /// ignores the clipped half. Triggers a repaint.
+    void setSectionRequest(const SectionRequest& r);
+    SectionRequest sectionRequest() const noexcept;
+
+    /// Translucent overlays (sketch profile shading). Replaces the whole list; index = position in `faces`.
+    /// Drawn after the opaque geometry; pickable through PickResult::overlayIndex.
+    void setOverlayFaces(std::vector<OverlayFace> faces);
+    const std::vector<OverlayFace>& overlayFaces() const noexcept;
 
     void setSelection(const PickResult& r);
     PickResult selection() const noexcept;

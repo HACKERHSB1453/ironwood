@@ -116,6 +116,8 @@ enum class ConstraintKind : std::uint8_t {
     Collinear,
     Symmetric,
     Fix,
+    /// refs: [point, curve]. The point (entity point or sub-point) lies on the line, circle or arc (whole entity).
+    PointOnObject,
 };
 
 struct SketchConstraint {
@@ -132,6 +134,9 @@ struct SketchDimension {
     std::vector<SketchRef> refs;
     /// Unit-aware expression (A1 grammar), e.g. "2 in + 5 mm" or "d1 * 2". Evaluated by the owner, not here.
     std::string expression;
+    /// Reference (driven) dimension: measured from the solved geometry, never solved for. Its expression is kept but
+    /// ignored by the solver, so a driven dimension can never conflict or change the geometry.
+    bool driven = false;
 };
 
 /// Editable 2D sketch on a plane. Ids are allocated by the sketch and never reused. All mutators validate their
@@ -165,10 +170,18 @@ public:
     // ---- records ----
     /// Validates every ref (entity exists, role valid for its kind). Errors: NotFound, InvalidArgument.
     Result<SketchConstraintId> addConstraint(ConstraintKind kind, std::vector<SketchRef> refs);
-    Result<SketchDimensionId> addDimension(DimensionKind kind, std::vector<SketchRef> refs, std::string expression);
+    Result<SketchDimensionId> addDimension(DimensionKind kind, std::vector<SketchRef> refs, std::string expression,
+                                           bool driven = false);
     Result<void> removeConstraint(SketchConstraintId id);
     Result<void> removeDimension(SketchDimensionId id);
     Result<void> setDimensionExpression(SketchDimensionId id, std::string expression);
+    /// Turns a dimension into a driven (reference) dimension or back. Errors: NotFound.
+    Result<void> setDimensionDriven(SketchDimensionId id, bool driven);
+    /// Measured value of a dimension on the current geometry: mm for Distance / DistanceX / DistanceY / Radius /
+    /// Diameter, radians for Angle (the unsigned angle between the two line directions, in [0, pi]).
+    /// Errors: NotFound (dimension), InvalidArgument (references do not describe a measurable quantity, e.g. a
+    /// zero-length line).
+    Result<double> measureDimension(SketchDimensionId id) const;
 
     const std::map<SketchConstraintId, SketchConstraint>& constraints() const noexcept { return constraints_; }
 
@@ -185,7 +198,7 @@ public:
     Result<void> restoreConstraint(SketchConstraintId id, ConstraintKind kind, std::vector<SketchRef> refs);
     /// Restores a dimension record. Same errors as restoreConstraint.
     Result<void> restoreDimension(SketchDimensionId id, DimensionKind kind, std::vector<SketchRef> refs,
-                                  std::string expression);
+                                  std::string expression, bool driven = false);
     /// Sets the id counter. Errors: InvalidArgument if `next` is not greater than every live id, or would lower the
     /// counter (that would allow reuse of retired ids).
     Result<void> restoreNextId(std::uint64_t next);

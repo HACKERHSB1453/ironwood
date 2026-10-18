@@ -8,7 +8,9 @@
 #include <QColor>
 
 #include <QFont>
+#include <QFontMetricsF>
 
+#include <algorithm>
 #include <cmath>
 #include <numbers>
 #include <optional>
@@ -126,28 +128,64 @@ void paintProfiles(QPainter& p, const Projector& proj, const SketchSession& sess
     }
 }
 
-void paintConstraints(QPainter& p, const Projector& proj, const sketch::Sketch& s) {
-    for (const auto& [id, c] : s.constraints()) {
-        if (c.kind == sketch::ConstraintKind::Horizontal || c.kind == sketch::ConstraintKind::Vertical) {
-            if (c.refs.size() != 1) continue;
-            const sketch::SketchEntity* e = s.findEntity(c.refs[0].entity);
-            if (!e || e->kind() != sketch::EntityKind::Line) continue;
-            const auto& line = std::get<sketch::LineGeom>(e->geometry);
-            const auto a = proj(line.start), b = proj(line.end);
-            if (!a || !b) continue;
-            const QPointF mid((a->x() + b->x()) / 2, (a->y() + b->y()) / 2);
-            p.setPen(QPen(kCurve, 1));
-            p.drawText(mid + QPointF(-4, -6),
-                       c.kind == sketch::ConstraintKind::Horizontal ? QStringLiteral("H") : QStringLiteral("V"));
-        } else if (c.kind == sketch::ConstraintKind::Coincident && c.refs.size() == 2) {
-            const auto pt = s.pointOf(c.refs[0]);
-            if (!pt) continue;
-            if (auto sc = proj(*pt)) {
-                p.setPen(QPen(kCurve, 1));
-                p.setBrush(Qt::NoBrush);
-                p.drawEllipse(*sc, 4.0, 4.0);
-            }
+const QColor kDimension{190, 200, 215};     // dimension lines and text
+const QColor kDimensionLight{50, 62, 84};   // dimension lines and text on a light theme
+const QColor kDriven{150, 158, 172};        // driven (reference) dimensions
+const QColor kConflict{235, 64, 52};        // conflicting / redundant constraints and dimensions
+
+QPolygonF arrowHead(QPointF tip, QPointF dirToTip) {
+    const double len = std::hypot(dirToTip.x(), dirToTip.y());
+    if (len < 1e-9) return {};
+    const QPointF u(dirToTip.x() / len, dirToTip.y() / len), n(-u.y(), u.x());
+    const QPointF base = tip - u * 9.0;
+    return QPolygonF{tip, base + n * 3.0, base - n * 3.0};
+}
+
+void paintGlyphs(QPainter& p, const render::Camera& cam, double w, double h, const SketchSession& session) {
+    const auto sel = session.selectedConstraint();
+    QFont f = p.font();
+    f.setPixelSize(11);
+    f.setBold(true);
+    p.setFont(f);
+    for (const ConstraintGlyph& g : session.glyphs()) {
+        const auto at = glyphScreenPos(cam, w, h, session.plane(), g);
+        if (!at) continue;
+        QColor col = g.conflicting ? kConflict : kCurve;
+        if (sel && *sel == g.id) col = kSelected;
+        p.setPen(QPen(col, 1.3));
+        p.setBrush(Qt::NoBrush);
+        if (g.label.empty()) {
+            p.drawEllipse(*at, 4.5, 4.5);
+        } else {
+            const QString text = QString::fromStdString(g.label);
+            const QRectF box(at->x() - 8, at->y() - 8, 16 + 4.0 * (text.size() - 1), 16);
+            p.setBrush(QColor(20, 24, 32, 150));
+            p.drawRoundedRect(box, 3, 3);
+            p.drawText(box, Qt::AlignCenter, text);
         }
+    }
+}
+
+void paintDimensions(QPainter& p, const render::Camera& cam, double w, double h, const SketchSession& session,
+                     bool dark) {
+    const auto sel = session.selectedDimension();
+    QFont f = p.font();
+    f.setPixelSize(12);
+    f.setBold(false);
+    p.setFont(f);
+    for (const DimensionView& d : session.dimensionViews()) {
+        const auto lay = layoutDimension(cam, w, h, session, d);
+        if (!lay) continue;
+        QColor col = d.driven ? kDriven : (dark ? kDimension : kDimensionLight);
+        if (d.conflicting) col = kConflict;
+        if (sel && sel->id == d.id && sel->driven == d.driven) col = kSelected;
+        p.setPen(QPen(col, 1.0, d.driven ? Qt::DashLine : Qt::SolidLine));
+        for (const QLineF& l : lay->lines) p.drawLine(l);
+        p.setPen(QPen(col, 1.0));
+        p.setBrush(col);
+        for (const QPolygonF& a : lay->arrows) p.drawPolygon(a);
+        p.setBrush(Qt::NoBrush);
+        p.drawText(lay->textRect, Qt::AlignCenter, lay->text);
     }
 }
 
@@ -221,9 +259,10 @@ void paintSession(QPainter& p, const render::Camera& cam, double w, double h, co
         }
     }
 
-    const QColor base = active ? kCurve : kFinished;
+    const QColor base = active ? sketchCurveColor(session.constraintState(), opts.dark) : kFinished;
     for (const auto& [id, e] : s.entities()) {
-        const bool selected = active && session.selected() == id;
+        const bool selected = active && std::any_of(session.selection().begin(), session.selection().end(),
+                                                    [&](const sketch::SketchRef& r) { return r.entity == id && !r.role; });
         QColor col = e.construction ? kConstruction : base;
         if (selected) col = kSelected;
         QPen pen(col, selected ? 2.5 : 2.0);
@@ -250,10 +289,30 @@ void paintSession(QPainter& p, const render::Camera& cam, double w, double h, co
         }
     }
 
-    if (opts.constraints) {
-        p.setPen(QPen(kCurve, 1));
-        paintConstraints(p, proj, s);
+    if (active) {
+        // Selected points and the Dimension tool's picks.
+        p.setPen(QPen(kSelected, 2.0));
+        p.setBrush(Qt::NoBrush);
+        auto ring = [&](const sketch::SketchRef& r) {
+            if (!r.role && s.findEntity(r.entity) && s.findEntity(r.entity)->kind() != sketch::EntityKind::Point) return;
+            if (const auto q = s.pointOf(r)) {
+                if (auto sc = proj(*q)) p.drawEllipse(*sc, 6.0, 6.0);
+            }
+        };
+        for (const sketch::SketchRef& r : session.selection()) ring(r);
+        for (const sketch::SketchRef& r : session.dimensionPicks()) ring(r);
+        // Whole entities picked for a dimension are highlighted like a selection.
+        for (const sketch::SketchRef& r : session.dimensionPicks()) {
+            const sketch::SketchEntity* e = s.findEntity(r.entity);
+            if (e && !r.role && e->kind() != sketch::EntityKind::Point) {
+                p.setPen(QPen(kSelected, 2.5));
+                strokeCurve(p, proj, e->geometry);
+            }
+        }
     }
+
+    if (opts.constraints && active) paintGlyphs(p, cam, w, h, session);
+    if (opts.dimensions) paintDimensions(p, cam, w, h, session, opts.dark);
 
     if (active) {
         p.setPen(QPen(kPreview, 1.5, Qt::DashLine));
@@ -263,6 +322,155 @@ void paintSession(QPainter& p, const render::Camera& cam, double w, double h, co
 }
 
 } // namespace
+
+QColor sketchCurveColor(ConstraintState state, bool dark) {
+    if (state == ConstraintState::Fully) return dark ? QColor(245, 245, 245) : QColor(20, 20, 20);
+    return kCurve;
+}
+
+std::optional<QPointF> glyphScreenPos(const render::Camera& cam, double width, double height,
+                                      const sketch::SketchPlane& plane, const ConstraintGlyph& g) {
+    const auto s = planeToScreen(cam, width, height, plane, g.anchor);
+    if (!s) return std::nullopt;
+    const bool ring = g.label.empty();
+    return QPointF(s->x + 14.0 * g.slot + (ring ? 0.0 : 10.0), s->y - (ring ? 0.0 : 12.0));
+}
+
+std::optional<DimensionLayout> layoutDimension(const render::Camera& cam, double width, double height,
+                                               const SketchSession& session, const DimensionView& dim) {
+    using DK = sketch::DimensionKind;
+    const sketch::Sketch& sk = session.sketch();
+    const sketch::SketchPlane& plane = sk.plane();
+    auto scr = [&](Point2 q) -> std::optional<QPointF> {
+        const auto s = planeToScreen(cam, width, height, plane, q);
+        if (!s) return std::nullopt;
+        return QPointF(s->x, s->y);
+    };
+    DimensionLayout out;
+    out.text = QString::fromStdString(dim.text);
+    QPointF textAt;
+    constexpr double kOff = 28.0;
+    auto addDimLine = [&](QPointF a, QPointF b) {
+        out.lines.emplace_back(a, b);
+        out.arrows.push_back(arrowHead(a, a - b));
+        out.arrows.push_back(arrowHead(b, b - a));
+    };
+
+    switch (dim.kind) {
+    case DK::Distance:
+    case DK::DistanceX:
+    case DK::DistanceY: {
+        if (dim.refs.size() != 2) return std::nullopt;
+        const auto pa = sk.pointOf(dim.refs[0]), pb = sk.pointOf(dim.refs[1]);
+        if (!pa || !pb) return std::nullopt;
+        const auto a = scr(*pa), b = scr(*pb);
+        if (!a || !b) return std::nullopt;
+        if (dim.kind == DK::Distance) {
+            const QPointF d = *b - *a;
+            const double len = std::hypot(d.x(), d.y());
+            if (len < 1e-6) return std::nullopt;
+            const QPointF n(-d.y() / len, d.x() / len);
+            const QPointF a2 = *a + n * kOff, b2 = *b + n * kOff;
+            out.lines.emplace_back(*a, a2 + n * 4.0);
+            out.lines.emplace_back(*b, b2 + n * 4.0);
+            addDimLine(a2, b2);
+            textAt = (a2 + b2) / 2.0 + n * 10.0;
+        } else if (dim.kind == DK::DistanceX) {
+            const double y = std::min(a->y(), b->y()) - kOff;
+            out.lines.emplace_back(*a, QPointF(a->x(), y - 4.0));
+            out.lines.emplace_back(*b, QPointF(b->x(), y - 4.0));
+            addDimLine(QPointF(a->x(), y), QPointF(b->x(), y));
+            textAt = QPointF((a->x() + b->x()) / 2.0, y - 10.0);
+        } else {
+            const double x = std::max(a->x(), b->x()) + kOff;
+            out.lines.emplace_back(*a, QPointF(x + 4.0, a->y()));
+            out.lines.emplace_back(*b, QPointF(x + 4.0, b->y()));
+            addDimLine(QPointF(x, a->y()), QPointF(x, b->y()));
+            textAt = QPointF(x + 12.0, (a->y() + b->y()) / 2.0);
+        }
+        break;
+    }
+    case DK::Radius:
+    case DK::Diameter: {
+        if (dim.refs.size() != 1) return std::nullopt;
+        const sketch::SketchEntity* e = sk.findEntity(dim.refs[0].entity);
+        if (!e) return std::nullopt;
+        Point2 c{};
+        double r = 0;
+        if (const auto* circ = std::get_if<sketch::CircleGeom>(&e->geometry)) {
+            c = circ->center;
+            r = circ->radius;
+        } else if (const auto* arc = std::get_if<sketch::ArcGeom>(&e->geometry)) {
+            c = arc->center;
+            r = arc->radius;
+        } else {
+            return std::nullopt;
+        }
+        const double ang = std::numbers::pi / 4;
+        const Point2 rim{c.x + r * std::cos(ang), c.y + r * std::sin(ang)};
+        const auto sc = scr(c), sr = scr(rim);
+        if (!sc || !sr) return std::nullopt;
+        const QPointF d = *sr - *sc;
+        const double len = std::hypot(d.x(), d.y());
+        if (len < 1e-6) return std::nullopt;
+        const QPointF u = d / len;
+        if (dim.kind == DK::Radius) {
+            out.lines.emplace_back(*sc, *sr);
+            out.arrows.push_back(arrowHead(*sr, u));
+            textAt = *sr + u * 18.0;
+        } else {
+            const QPointF opp = *sc - d;
+            out.lines.emplace_back(opp, *sr);
+            out.arrows.push_back(arrowHead(*sr, u));
+            out.arrows.push_back(arrowHead(opp, -u));
+            textAt = *sr + u * 18.0;
+        }
+        break;
+    }
+    case DK::Angle: {
+        if (dim.refs.size() != 2) return std::nullopt;
+        const sketch::SketchEntity* ea = sk.findEntity(dim.refs[0].entity);
+        const sketch::SketchEntity* eb = sk.findEntity(dim.refs[1].entity);
+        if (!ea || !eb) return std::nullopt;
+        const auto* la = std::get_if<sketch::LineGeom>(&ea->geometry);
+        const auto* lb = std::get_if<sketch::LineGeom>(&eb->geometry);
+        if (!la || !lb) return std::nullopt;
+        const Point2 d1 = la->end - la->start, d2 = lb->end - lb->start;
+        const double den = d1.x * d2.y - d1.y * d2.x;
+        Point2 x = la->start;
+        if (std::abs(den) > 1e-9) {
+            const Point2 w0 = lb->start - la->start;
+            const double t = (w0.x * d2.y - w0.y * d2.x) / den;
+            x = la->start + d1 * t;
+        }
+        const Point2 ma = (la->start + la->end) * 0.5, mb = (lb->start + lb->end) * 0.5;
+        const auto sx = scr(x), sma = scr(ma), smb = scr(mb);
+        if (!sx || !sma || !smb) return std::nullopt;
+        const QPointF ua = *sma - *sx, ub = *smb - *sx;
+        const double a0 = std::atan2(ua.y(), ua.x());
+        double da = std::atan2(ub.y(), ub.x()) - a0;
+        while (da > std::numbers::pi) da -= 2 * std::numbers::pi;
+        while (da < -std::numbers::pi) da += 2 * std::numbers::pi;
+        constexpr double kR = 44.0;
+        QPointF prev = *sx + QPointF(kR * std::cos(a0), kR * std::sin(a0));
+        for (int k = 1; k <= 16; ++k) {
+            const double a = a0 + da * k / 16.0;
+            const QPointF q = *sx + QPointF(kR * std::cos(a), kR * std::sin(a));
+            out.lines.emplace_back(prev, q);
+            prev = q;
+        }
+        const double am = a0 + da / 2;
+        textAt = *sx + QPointF((kR + 16.0) * std::cos(am), (kR + 16.0) * std::sin(am));
+        break;
+    }
+    }
+    QFont f;
+    f.setPixelSize(12);
+    const QFontMetricsF fm(f);
+    const double tw = fm.horizontalAdvance(out.text) + 8.0, th = fm.height() + 2.0;
+    out.textRect = QRectF(textAt.x() - tw / 2, textAt.y() - th / 2, tw, th);
+    return out;
+}
 
 void paintSketches(QPainter& p, const render::Camera& cam, double width, double height,
                    const std::vector<const SketchSession*>& sessions, const SketchSession* active,

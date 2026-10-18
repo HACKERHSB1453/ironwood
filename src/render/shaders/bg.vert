@@ -5,7 +5,9 @@ layout(std140, binding = 0) uniform Buf {
     mat4 mv;
     vec4 ids;   // x = body id + 1, y = hover face, z = hover edge, w = selected face (-1 = none)
     vec4 ids2;  // x = selected edge (-1 = none), y = +1/-1 clip-space y direction of the backend (background)
-    vec4 color; // rgb = body surface colour (mirrors UboData; used by mesh.frag only)
+    vec4 color; // rgb = body surface colour (overlays / caps: rgba)
+    vec4 clip;  // section plane in object space: xyz = normal, w = offset; kept side is dot >= 0
+    vec4 sec;   // x = 1 when the section clip is active
 } ubuf;
 layout(location = 0) out float vT;   // 0 = top of the screen, 1 = bottom
 

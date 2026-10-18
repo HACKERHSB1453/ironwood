@@ -54,7 +54,8 @@ std::optional<OffscreenFrame> fail(int where) {
 } // namespace
 std::optional<OffscreenFrame> renderOffscreen(const std::vector<SceneBody>& bodies, const Camera& camera, QSize size,
                                               const std::vector<QPoint>& pickPoints, int samples,
-                                              const PickResult& hover, const PickResult& selection) {
+                                              const PickResult& hover, const PickResult& selection,
+                                              const SectionRequest& section, const std::vector<OverlayFace>& overlays) {
     OffscreenFrame out;
     auto rhi = makeRhi(out.vulkan);
     if (!rhi) return fail(1);
@@ -63,6 +64,8 @@ std::optional<OffscreenFrame> renderOffscreen(const std::vector<SceneBody>& bodi
         renderer.setScene(bodies);
         renderer.setHover(hover);
         renderer.setSelection(selection);
+        renderer.setSection(section);
+        renderer.setOverlays(overlays);
 
         std::unique_ptr<QRhiTexture> color(rhi->newTexture(
             QRhiTexture::RGBA8, size, 1, QRhiTexture::RenderTarget | QRhiTexture::UsedAsTransferSource));

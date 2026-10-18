@@ -4,7 +4,7 @@
 #include <QCoreApplication>
 #include <QKeySequence>
 
-#include "ui/doc_state.hpp"
+#include "features/document.hpp"
 #include "ui/main_window.hpp"
 #include "ui/parameters_dialog.hpp"
 
@@ -14,6 +14,23 @@ namespace {
 QString T(const char* text) { return QCoreApplication::translate("Commands", text); }
 
 constexpr const char* kSolid = "SOLID";
+
+MainWindow* winOf(const CommandContext& c) { return qobject_cast<MainWindow*>(c.parent); }
+
+/// Starts a modelling command dialog on the shell (refusals are reported in the status bar).
+void startFeature(CommandContext& ctx, const char* kind) {
+    if (MainWindow* win = winOf(ctx)) (void)win->startFeature(kind);
+}
+
+/// Enabled when a document is open.
+bool docOpen(const CommandContext& c) { return c.doc != nullptr; }
+
+/// Short ribbon labels (Command::shortLabel) of the commands whose full label is long.
+const char* shortLabelOf(const std::string& id) {
+    if (id == "parameters") return "Parameters";
+    if (id == "axis") return "Axis";
+    return "";
+}
 
 } // namespace
 
@@ -36,58 +53,74 @@ Result<void> registerDefaultCommands(CommandRegistry& registry) {
         if (*shortcut) c.shortcut = QKeySequence(QString::fromLatin1(shortcut));
         c.inToolbar = inToolbar;
         c.repeatable = repeatable;
+        c.shortLabel = T(shortLabelOf(c.id));
         c.start = std::move(start);
         c.enabled = std::move(enabled);
         if (auto r = registry.add(std::move(c)); !r && status) status = std::unexpected(r.error());
     };
     auto hasDoc = [](const CommandContext& c) { return c.doc != nullptr; };
-    auto canUndo = [](const CommandContext& c) { return c.doc && c.doc->undo.canUndo(); };
-    auto canRedo = [](const CommandContext& c) { return c.doc && c.doc->undo.canRedo(); };
+    // One undo stack: the document's. Feature edits, rollback, sketches and parameter edits are all on it.
+    auto canUndo = [](const CommandContext& c) { return c.doc && c.doc->canUndo(); };
+    auto canRedo = [](const CommandContext& c) { return c.doc && c.doc->canRedo(); };
 
     // CREATE
-    put("sketch", "Create Sketch", kSolid, "CREATE", "", "document-edit",
+    put("sketch", "Create Sketch", kSolid, "CREATE", "", "sketch",
         [](CommandContext& ctx) {
             if (auto* win = qobject_cast<MainWindow*>(ctx.parent)) win->chooseSketchPlane();
         }, hasDoc);
-    put("extrude", "Extrude", kSolid, "CREATE", "E", "");
-    put("revolve", "Revolve", kSolid, "CREATE", "", "");
-    put("hole", "Hole", kSolid, "CREATE", "H", "");
+    put("extrude", "Extrude", kSolid, "CREATE", "E", "extrude",
+        [](CommandContext& ctx) { startFeature(ctx, "extrude"); }, docOpen);
+    put("revolve", "Revolve", kSolid, "CREATE", "", "revolve",
+        [](CommandContext& ctx) { startFeature(ctx, "revolve"); }, docOpen);
+    put("hole", "Hole", kSolid, "CREATE", "H", "hole",
+        [](CommandContext& ctx) { startFeature(ctx, "hole"); }, docOpen);
     // MODIFY
-    put("press_pull", "Press Pull", kSolid, "MODIFY", "Q", "");
-    put("fillet", "Fillet", kSolid, "MODIFY", "F", "");
-    put("chamfer", "Chamfer", kSolid, "MODIFY", "", "");
-    put("move", "Move/Copy", kSolid, "MODIFY", "M", "");
-    put("delete", "Delete", kSolid, "MODIFY", "Del", "edit-delete");
-    put("parameters", "Change Parameters...", kSolid, "MODIFY", "", "document-properties",
-        [](CommandContext& ctx) { (new ParametersDialog(*ctx.doc, ctx.parent))->show(); }, hasDoc);
+    put("press_pull", "Press Pull", kSolid, "MODIFY", "Q", "press_pull");
+    put("fillet", "Fillet", kSolid, "MODIFY", "F", "fillet",
+        [](CommandContext& ctx) { startFeature(ctx, "fillet"); }, docOpen);
+    put("chamfer", "Chamfer", kSolid, "MODIFY", "", "chamfer",
+        [](CommandContext& ctx) { startFeature(ctx, "chamfer"); }, docOpen);
+    put("move", "Move/Copy", kSolid, "MODIFY", "M", "move",
+        [](CommandContext& ctx) { startFeature(ctx, "move"); }, docOpen);
+    put("delete", "Delete", kSolid, "MODIFY", "Del", "delete");
+    put("parameters", "Change Parameters...", kSolid, "MODIFY", "", "parameters",
+        [](CommandContext& ctx) {
+            if (ctx.doc) (new ParametersDialog(*ctx.doc, ctx.parent))->show();
+        }, hasDoc);
     // ASSEMBLE
-    put("new_component", "New Component", kSolid, "ASSEMBLE", "", "");
-    put("joint", "Joint", kSolid, "ASSEMBLE", "", "");
+    put("new_component", "New Component", kSolid, "ASSEMBLE", "", "new_component");
+    put("joint", "Joint", kSolid, "ASSEMBLE", "", "joint");
     // CONSTRUCT
-    put("plane", "Offset Plane", kSolid, "CONSTRUCT", "", "");
-    put("axis", "Axis Through...", kSolid, "CONSTRUCT", "", "");
-    put("point", "Point", kSolid, "CONSTRUCT", "", "");
-    // INSPECT
-    put("measure", "Measure", kSolid, "INSPECT", "I", "");
+    put("plane", "Offset Plane", kSolid, "CONSTRUCT", "", "offset_plane",
+        [](CommandContext& ctx) { startFeature(ctx, "plane"); }, docOpen);
+    put("axis", "Axis Through...", kSolid, "CONSTRUCT", "", "axis",
+        [](CommandContext& ctx) { startFeature(ctx, "axis"); }, docOpen);
+    put("point", "Point", kSolid, "CONSTRUCT", "", "construction_point",
+        [](CommandContext& ctx) { startFeature(ctx, "point"); }, docOpen);
+    // INSPECT: Measure, Properties and Section Analysis are registered by inspect::registerCommands (MainWindow).
     // INSERT
-    put("import", "Import...", kSolid, "INSERT", "", "document-import",
+    put("import", "Import...", kSolid, "INSERT", "", "import",
         [](CommandContext& ctx) {
             if (ctx.importFile) ctx.importFile();
         });
     // SELECT
-    put("select", "Select", kSolid, "SELECT", "", "");
+    put("select", "Select", kSolid, "SELECT", "", "select");
     // Quick access (Fusion puts undo/redo at the top left); not repeatable.
-    put("undo", "Undo", "", "", "Ctrl+Z", "edit-undo",
-        [](CommandContext& ctx) { (void)ctx.doc->undo.undo(); }, canUndo, true, false);
-    put("redo", "Redo", "", "", "Ctrl+Y", "edit-redo",
-        [](CommandContext& ctx) { (void)ctx.doc->undo.redo(); }, canRedo, true, false);
+    put("undo", "Undo", "", "", "Ctrl+Z", "undo",
+        [](CommandContext& ctx) {
+            if (ctx.doc) (void)ctx.doc->undo();
+        }, canUndo, true, false);
+    put("redo", "Redo", "", "", "Ctrl+Y", "redo",
+        [](CommandContext& ctx) {
+            if (ctx.doc) (void)ctx.doc->redo();
+        }, canRedo, true, false);
     // Hidden from the toolbar: S-box and Repeat Last.
-    put("sbox", "Search Commands", "", "", "S", "system-search",
+    put("sbox", "Search Commands", "", "", "S", "search",
         [](CommandContext& ctx) {
             if (ctx.openCommandSearch) ctx.openCommandSearch();
         },
         {}, false, false);
-    put("repeat_last", "Repeat Last", "", "", "", "view-refresh",
+    put("repeat_last", "Repeat Last", "", "", "", "repeat",
         [reg](CommandContext& ctx) {
             const std::string last = reg->lastRun();
             if (!last.empty()) (void)reg->run(last, ctx);

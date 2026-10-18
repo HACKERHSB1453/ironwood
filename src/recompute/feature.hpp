@@ -92,6 +92,12 @@ class Feature {
 public:
     virtual ~Feature() = default;
 
+    /// User-visible display name ("Extrude 1"). Not part of paramHash() or geometry: renaming never invalidates
+    /// cached results. Empty until the owner (features::Document) assigns one. Features are otherwise immutable; the
+    /// owner sets the name only on a freshly created instance, before it is shared.
+    const std::string& name() const noexcept { return name_; }
+    void setName(std::string name) { name_ = std::move(name); }
+
     virtual FeatureId id() const = 0;
     /// Stable machine tag used for (de)serialisation and the registry, e.g. "extrude".
     virtual std::string_view kind() const = 0;
@@ -112,6 +118,9 @@ public:
     /// Errors: any ErrorCode; ErrorCode::Cancelled if ctx.cancel fired. A failing feature leaves the
     /// timeline state unchanged for features after it (they are evaluated against the previous state, marked broken).
     virtual Result<FeatureResult> compute(const EvalContext& ctx) const = 0;
+
+private:
+    std::string name_;
 };
 
 /// Creates features by kind (used by io::loadDocument). Not thread-safe for registration; register at start-up.

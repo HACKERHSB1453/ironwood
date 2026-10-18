@@ -2,7 +2,8 @@
 # Naming fuzzer (P1a gate, A6): library iw_fuzz_naming (generators, scenarios, oracle, shrinker, JSON report) and
 # the CLI ironwood-fuzz-naming. The ctest smoke run lives in tests/test_fuzz_smoke.cpp (tests/fuzz_smoke.cmake).
 iw_add_module(fuzz_naming
-    SOURCES src/rng.cpp src/generator.cpp src/extrude_generator.cpp src/scenario.cpp src/runner.cpp
+    SOURCES src/rng.cpp src/geom.cpp src/generator.cpp src/extrude_generator.cpp src/revolve_generator.cpp
+            src/edge_generators.cpp src/hole_generator.cpp src/move_generator.cpp src/scenario.cpp src/runner.cpp
     PUBLIC_LIBS iw_core iw_kernel iw_naming iw_recompute iw_features)
 target_include_directories(iw_fuzz_naming PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 # Vendored nlohmann/json (MIT, third_party/nlohmann) for the JSON report only. SYSTEM silences its headers.

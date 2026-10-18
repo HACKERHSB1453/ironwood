@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# Ironwood native document format - v0 (UNSTABLE)
+# Ironwood native document format - v2 (UNSTABLE)
 
-**Status: v1, unstable. No compatibility or migration promise until a stable version.** v1 added `parameters`; v0 manifests still load (empty parameter table). Later versions will be a single
+**Status: v2, unstable. No compatibility or migration promise until a stable version.** v1 added `parameters`; v2 added feature `name`s and `nameCounters`. v0 manifests still load (empty parameter table), and v0/v1 manifests load with every feature named by default ("Extrude 1", ...). Later versions will be a single
 zip container with the same logical layout ("directory-in-zip").
 
 ## Layout (a directory, suffix `.ironwood`)
@@ -17,18 +17,19 @@ mydoc.ironwood/
 ```json
 {
   "format": "ironwood-document",
-  "version": 1,
+  "version": 2,
   "name": "Part1",
   "displayUnit": "mm",
   "nextId": 12,
   "parameters": [
     { "name": "d1", "expression": "2 in + 5 mm", "unit": "mm", "comment": "wall", "favourite": true }
   ],
+  "nameCounters": { "extrude": 3 },
   "timeline": {
     "rollbackMarker": null,
     "suppressed": [3],
     "features": [
-      { "id": 1, "kind": "extrude", "params": { "...": "feature-defined" } }
+      { "id": 1, "kind": "extrude", "name": "Extrude 1", "params": { "...": "feature-defined" } }
     ]
   },
   "blobs": [ { "id": 7, "file": "blobs/7.brep", "sha256": "..." } ]
@@ -56,3 +57,8 @@ Rules:
 * v0 writers do not emit `blobs`; readers ignore unknown top-level keys.
 * Manifests are UTF-8 JSON, 2-space indented, with a trailing newline. Saving replaces an existing document
   directory via a staging directory and rename; a failed save leaves the previous directory in place.
+* `features[].name` (v2, optional) is the feature's display name; omitted when empty. Loaders of v0/v1 files see no names.
+* `nameCounters` (v2, optional, default `{}`) maps a feature kind to the last default-name number used for it, so a
+  deleted feature's number is never handed out again. Keys are feature kinds, values unsigned integers.
+* Sketch dimensions (inside a sketch's `dimensions[]`) carry an optional `"driven": true` (absent = false): a reference
+  dimension that is measured, never solved for.

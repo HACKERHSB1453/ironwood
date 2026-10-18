@@ -2,15 +2,87 @@
 #include "features/document.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <functional>
 #include <memory>
+#include <string_view>
 #include <utility>
 
+#include <nlohmann/json.hpp>
+
+#include "core/expr.hpp"
 #include "features/extrude_feature.hpp"
+#include "features/feature_common.hpp"
 
 namespace iw::features {
 
 using recompute::Feature;
 using recompute::FeatureStatus;
+using json = nlohmann::json;
+
+namespace {
+
+/// JSON keys whose string values are expressions (or arrays of them) in the feature and sketch serialisations. A
+/// rename rewrites only these, so names, kinds and references are never touched.
+bool isExpressionKey(std::string_view key) {
+    static constexpr std::string_view kKeys[] = {
+        "distance", "distance2", "taper", "angle", "angle2", "radius", "u", "v", "diameter", "depth", "drill_angle",
+        "cb_depth", "cb_diameter", "cs_angle", "cs_diameter", "expression", "translate", "points", "a", "b"};
+    return std::find(std::begin(kKeys), std::end(kKeys), key) != std::end(kKeys);
+}
+
+/// Rewrites every expression string under `node` with `fn`. `changed` is set when any string differs.
+Result<void> rewriteExpressions(json& node, bool underExpressionKey, bool& changed,
+                                const std::function<Result<std::string>(const std::string&)>& fn) {
+    if (node.is_string()) {
+        if (!underExpressionKey) return {};
+        const std::string text = node.get<std::string>();
+        auto next = fn(text);
+        if (!next) return std::unexpected(next.error());
+        if (*next != text) {
+            node = *next;
+            changed = true;
+        }
+        return {};
+    }
+    if (node.is_array()) {
+        for (json& v : node)
+            if (auto r = rewriteExpressions(v, underExpressionKey, changed, fn); !r) return r;
+    } else if (node.is_object()) {
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            const bool expr = underExpressionKey || isExpressionKey(it.key());
+            if (auto r = rewriteExpressions(it.value(), expr, changed, fn); !r) return r;
+        }
+    }
+    return {};
+}
+
+/// Default display label for a feature kind ("extrude" -> "Extrude").
+std::string labelOf(std::string_view kind) {
+    static const std::pair<std::string_view, std::string_view> kLabels[] = {
+        {"extrude", "Extrude"}, {"revolve", "Revolve"}, {"fillet", "Fillet"}, {"chamfer", "Chamfer"}, {"hole", "Hole"},
+        {"move", "Move"}, {"sketch", "Sketch"}, {"plane", "Plane"}, {"axis", "Axis"}, {"point", "Point"}};
+    for (const auto& [k, label] : kLabels)
+        if (k == kind) return std::string(label);
+    std::string out(kind);
+    if (!out.empty()) out[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(out[0])));
+    return out;
+}
+
+/// The n of a name of the form "<label> <n>" (n decimal, no sign), or 0.
+std::uint64_t numberOfDefaultName(const std::string& name, const std::string& label) {
+    const std::string prefix = label + " ";
+    if (name.size() <= prefix.size() || name.compare(0, prefix.size(), prefix) != 0) return 0;
+    std::uint64_t n = 0;
+    for (std::size_t i = prefix.size(); i < name.size(); ++i) {
+        const char c = name[i];
+        if (c < '0' || c > '9' || n > (std::uint64_t{1} << 50)) return 0;
+        n = n * 10 + static_cast<std::uint64_t>(c - '0');
+    }
+    return n;
+}
+
+} // namespace
 
 /// Undoable commands. They are nested in Ops so they can reach the private state of Document (Ops is a friend).
 /// Each command captures what it needs on execute(), so redo re-captures a correct "before" state.
@@ -155,10 +227,110 @@ struct Document::Ops {
         Document& d_;
         std::string name_, expr_, prev_;
     };
+
+    /// One undoable change to the parameter table and/or a set of features (replaced by id). Used by every parameter
+    /// and feature-rewrite command, so an edit that touches both is a single undo step. The "before" state is captured
+    /// on execute(), so redo captures a correct one again.
+    class ApplyChange final : public Command {
+    public:
+        ApplyChange(Document& d, std::optional<ParameterTable> params, std::vector<std::shared_ptr<const Feature>> features,
+                    std::string text)
+            : d_(d), params_(std::move(params)), features_(std::move(features)), text_(std::move(text)) {}
+        Result<void> execute() override {
+            auto& tl = d_.data_.timeline;
+            for (const auto& f : features_)
+                if (!tl.indexOf(f->id())) return makeError(ErrorCode::NotFound, "feature not on the timeline");
+            beforeFeatures_.clear();
+            for (const auto& f : features_) beforeFeatures_.push_back(tl.at(*tl.indexOf(f->id())));
+            if (params_) {
+                beforeParams_ = d_.data_.parameters;
+                d_.data_.parameters = *params_;
+            }
+            for (const auto& f : features_)
+                if (auto r = tl.replace(f); !r) return r;
+            return {};
+        }
+        void undo() override {
+            auto& tl = d_.data_.timeline;
+            for (const auto& f : beforeFeatures_) (void)tl.replace(f);
+            if (params_) d_.data_.parameters = beforeParams_;
+        }
+        std::string text() const override { return text_; }
+
+    private:
+        Document& d_;
+        std::optional<ParameterTable> params_;
+        std::vector<std::shared_ptr<const Feature>> features_;
+        std::string text_;
+        std::vector<std::shared_ptr<const Feature>> beforeFeatures_;
+        ParameterTable beforeParams_;
+    };
 };
 
 Document::Document() {
     registerFeatures(registry_);
+}
+
+Result<std::shared_ptr<const Feature>> Document::withName(const Feature& f, std::string name) const {
+    auto made = registry_.create(std::string(f.kind()), f.id(), f.paramsJson());
+    if (!made) return std::unexpected(made.error());
+    (*made)->setName(std::move(name));
+    return std::shared_ptr<const Feature>(std::move(*made));
+}
+
+Result<std::shared_ptr<const Feature>> Document::renamedReferences(const Feature& f, const std::string& from,
+                                                                   const std::string& to) const {
+    json j = json::parse(f.paramsJson(), nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return makeError(ErrorCode::Internal, "feature params are not a JSON object");
+    bool changed = false;
+    auto rewrite = [&](const std::string& text) -> Result<std::string> {
+        const auto refs = common::referencesOf(text);
+        if (std::find(refs.begin(), refs.end(), from) == refs.end()) return text;
+        return renameIdentifier(text, from, to);
+    };
+    if (auto r = rewriteExpressions(j, false, changed, rewrite); !r) return std::unexpected(r.error());
+    if (!changed) return std::shared_ptr<const Feature>{};
+    auto made = registry_.create(std::string(f.kind()), f.id(), j.dump());
+    if (!made) return std::unexpected(made.error());
+    (*made)->setName(f.name());
+    return std::shared_ptr<const Feature>(std::move(*made));
+}
+
+std::shared_ptr<const Feature> Document::featureById(FeatureId id) const {
+    auto idx = data_.timeline.indexOf(id);
+    return idx ? data_.timeline.at(*idx) : nullptr;
+}
+
+std::vector<std::string> Document::featureUsers(const std::string& name) const {
+    std::vector<std::string> out;
+    for (std::size_t k = 0; k < data_.timeline.size(); ++k) {
+        const auto& f = data_.timeline.at(k);
+        const auto refs = f->parameterReferences();
+        if (std::find(refs.begin(), refs.end(), name) == refs.end()) continue;
+        out.push_back(f->name().empty() ? std::string(f->kind()) + " " + std::to_string(f->id().value()) : f->name());
+    }
+    return out;
+}
+
+void Document::completeNames() {
+    auto& tl = data_.timeline;
+    // Raise every counter past the numbers already in use, so a loaded file never hands out a duplicate name.
+    for (std::size_t k = 0; k < tl.size(); ++k) {
+        const auto& f = tl.at(k);
+        const std::string label = labelOf(f->kind());
+        const std::uint64_t n = numberOfDefaultName(f->name(), label);
+        auto& counter = data_.nameCounters[std::string(f->kind())];
+        counter = std::max(counter, n);
+    }
+    for (std::size_t k = 0; k < tl.size(); ++k) {
+        const auto f = tl.at(k);
+        if (!f->name().empty()) continue;
+        auto& counter = data_.nameCounters[std::string(f->kind())];
+        auto named = withName(*f, labelOf(f->kind()) + " " + std::to_string(counter + 1));
+        if (!named) continue; // unreachable for registered kinds; the feature keeps its (empty) name
+        ++counter;
+        (void)tl.replace(*named);
+    }
 }
 
 Document::~Document() = default;
@@ -174,8 +346,19 @@ BodyId Document::allocateBodyId() { return BodyId{data_.nextId++}; }
 Result<void> Document::addFeature(std::shared_ptr<const Feature> feature, std::optional<std::size_t> position) {
     if (!feature) return makeError(ErrorCode::InvalidArgument, "null feature");
     const std::size_t pos = position.value_or(data_.timeline.size());
+    // An unnamed feature gets the next default name of its kind. The counter advances only if the add succeeds.
+    const std::string kind(feature->kind());
+    const bool needsName = feature->name().empty();
+    if (needsName) {
+        auto named = withName(*feature, labelOf(kind) + " " + std::to_string(data_.nameCounters[kind] + 1));
+        if (!named) return std::unexpected(named.error());
+        feature = std::move(*named);
+    }
     auto r = undo_.push(std::make_unique<Ops::AddFeature>(*this, std::move(feature), pos));
-    if (r) notify();
+    if (r) {
+        if (needsName) ++data_.nameCounters[kind];
+        notify();
+    }
     return r;
 }
 
@@ -212,6 +395,141 @@ Result<void> Document::addParameter(std::string name, std::string expression, st
 
 Result<void> Document::setParameterExpression(const std::string& name, std::string expression) {
     auto r = undo_.push(std::make_unique<Ops::SetParameter>(*this, name, std::move(expression)));
+    if (r) notify();
+    return r;
+}
+
+Result<void> Document::renameFeature(FeatureId id, std::string name) {
+    if (name.find_first_not_of(" \t") == std::string::npos) return makeError(ErrorCode::InvalidArgument, "feature name is empty");
+    auto f = featureById(id);
+    if (!f) return makeError(ErrorCode::NotFound, "feature not on the timeline");
+    auto named = withName(*f, std::move(name));
+    if (!named) return std::unexpected(named.error());
+    auto r = undo_.push(std::make_unique<Ops::ApplyChange>(*this, std::nullopt, std::vector{*named}, "Rename Feature"));
+    if (r) notify();
+    return r;
+}
+
+Result<void> Document::setParameterUnit(const std::string& name, std::string unit) {
+    ParameterTable next = data_.parameters;
+    if (auto r = next.setUnit(name, std::move(unit)); !r) return std::unexpected(r.error());
+    auto r = undo_.push(std::make_unique<Ops::ApplyChange>(*this, std::move(next), std::vector<std::shared_ptr<const Feature>>{}, "Edit Parameter Unit"));
+    if (r) notify();
+    return r;
+}
+
+Result<void> Document::setParameterComment(const std::string& name, std::string comment) {
+    ParameterTable next = data_.parameters;
+    if (auto r = next.setComment(name, std::move(comment)); !r) return std::unexpected(r.error());
+    auto r = undo_.push(std::make_unique<Ops::ApplyChange>(*this, std::move(next), std::vector<std::shared_ptr<const Feature>>{}, "Edit Parameter Comment"));
+    if (r) notify();
+    return r;
+}
+
+Result<void> Document::setParameterFavourite(const std::string& name, bool favourite) {
+    ParameterTable next = data_.parameters;
+    if (auto r = next.setFavourite(name, favourite); !r) return std::unexpected(r.error());
+    auto r = undo_.push(std::make_unique<Ops::ApplyChange>(*this, std::move(next), std::vector<std::shared_ptr<const Feature>>{}, favourite ? "Favourite Parameter" : "Unfavourite Parameter"));
+    if (r) notify();
+    return r;
+}
+
+Result<void> Document::renameParameter(const std::string& from, const std::string& to) {
+    if (from == to) {
+        if (!data_.parameters.find(from)) return makeError(ErrorCode::NotFound, "unknown parameter '" + from + "'");
+        return {};
+    }
+    ParameterTable next = data_.parameters;
+    if (auto r = next.rename(from, to); !r) return std::unexpected(r.error());
+    // Feature parameters and sketch dimensions that reference `from` are rewritten in the same step.
+    std::vector<std::shared_ptr<const Feature>> changed;
+    for (std::size_t k = 0; k < data_.timeline.size(); ++k) {
+        const auto& f = data_.timeline.at(k);
+        const auto refs = f->parameterReferences();
+        if (std::find(refs.begin(), refs.end(), from) == refs.end()) continue;
+        auto nf = renamedReferences(*f, from, to);
+        if (!nf) return std::unexpected(nf.error());
+        if (*nf) changed.push_back(std::move(*nf));
+    }
+    auto r = undo_.push(std::make_unique<Ops::ApplyChange>(*this, std::move(next), std::move(changed), "Rename Parameter"));
+    if (r) notify();
+    return r;
+}
+
+Result<void> Document::removeParameter(const std::string& name) {
+    if (!data_.parameters.find(name)) return makeError(ErrorCode::NotFound, "unknown parameter '" + name + "'");
+    std::vector<std::string> users = data_.parameters.dependents(name);
+    for (std::string& u : users) u = "parameter " + u;
+    for (std::string& u : featureUsers(name)) users.push_back(u);
+    if (!users.empty()) {
+        std::string list;
+        for (const std::string& u : users) list += (list.empty() ? "" : ", ") + u;
+        return makeError(ErrorCode::InvalidArgument, "parameter '" + name + "' is used by: " + list);
+    }
+    ParameterTable next = data_.parameters;
+    if (auto r = next.remove(name); !r) return std::unexpected(r.error());
+    auto r = undo_.push(std::make_unique<Ops::ApplyChange>(*this, std::move(next), std::vector<std::shared_ptr<const Feature>>{}, "Delete Parameter"));
+    if (r) notify();
+    return r;
+}
+
+Result<void> Document::replaceAllParameters(ParameterTable table) {
+    auto r = undo_.push(std::make_unique<Ops::ApplyChange>(*this, std::move(table), std::vector<std::shared_ptr<const Feature>>{}, "Edit Parameters"));
+    if (r) notify();
+    return r;
+}
+
+Result<void> Document::editConstructionPlane(FeatureId id, ConstructionPlaneParams params) {
+    auto old = featureById(id);
+    if (!old) return makeError(ErrorCode::NotFound, "feature not on the timeline");
+    if (!dynamic_cast<const ConstructionPlaneFeature*>(old.get())) return makeError(ErrorCode::InvalidArgument, "feature is not a plane");
+    auto nf = std::make_shared<ConstructionPlaneFeature>(id, std::move(params));
+    nf->setName(old->name());
+    auto r = undo_.push(std::make_unique<Ops::ApplyChange>(*this, std::nullopt, std::vector<std::shared_ptr<const Feature>>{nf}, "Edit Plane"));
+    if (r) notify();
+    return r;
+}
+
+Result<void> Document::editConstructionAxis(FeatureId id, ConstructionAxisParams params) {
+    auto old = featureById(id);
+    if (!old) return makeError(ErrorCode::NotFound, "feature not on the timeline");
+    if (!dynamic_cast<const ConstructionAxisFeature*>(old.get())) return makeError(ErrorCode::InvalidArgument, "feature is not an axis");
+    auto nf = std::make_shared<ConstructionAxisFeature>(id, std::move(params));
+    nf->setName(old->name());
+    auto r = undo_.push(std::make_unique<Ops::ApplyChange>(*this, std::nullopt, std::vector<std::shared_ptr<const Feature>>{nf}, "Edit Axis"));
+    if (r) notify();
+    return r;
+}
+
+Result<void> Document::editConstructionPoint(FeatureId id, ConstructionPointParams params) {
+    auto old = featureById(id);
+    if (!old) return makeError(ErrorCode::NotFound, "feature not on the timeline");
+    if (!dynamic_cast<const ConstructionPointFeature*>(old.get())) return makeError(ErrorCode::InvalidArgument, "feature is not a point");
+    auto nf = std::make_shared<ConstructionPointFeature>(id, std::move(params));
+    nf->setName(old->name());
+    auto r = undo_.push(std::make_unique<Ops::ApplyChange>(*this, std::nullopt, std::vector<std::shared_ptr<const Feature>>{nf}, "Edit Point"));
+    if (r) notify();
+    return r;
+}
+
+Result<sketch::Sketch> Document::sketchForEdit(FeatureId id) const {
+    auto f = featureById(id);
+    if (!f) return makeError(ErrorCode::NotFound, "feature not on the timeline");
+    const auto* sf = dynamic_cast<const SketchFeature*>(f.get());
+    if (!sf) return makeError(ErrorCode::InvalidArgument, "feature is not a sketch");
+    return sf->params().sketch;
+}
+
+Result<void> Document::replaceSketch(FeatureId id, sketch::Sketch sk) {
+    auto f = featureById(id);
+    if (!f) return makeError(ErrorCode::NotFound, "feature not on the timeline");
+    const auto* sf = dynamic_cast<const SketchFeature*>(f.get());
+    if (!sf) return makeError(ErrorCode::InvalidArgument, "feature is not a sketch");
+    SketchFeatureParams p = sf->params();
+    p.sketch = std::move(sk);
+    auto nf = std::make_shared<SketchFeature>(id, std::move(p));
+    nf->setName(f->name());
+    auto r = undo_.push(std::make_unique<Ops::ApplyChange>(*this, std::nullopt, std::vector<std::shared_ptr<const Feature>>{nf}, "Edit Sketch"));
     if (r) notify();
     return r;
 }
@@ -310,6 +628,7 @@ Result<void> Document::load(const std::filesystem::path& path) {
     undo_.clear();
     undo_.setClean();
     evaluator_.clearCache();
+    completeNames(); // files before format v2 have no feature names
     notify();
     return {};
 }

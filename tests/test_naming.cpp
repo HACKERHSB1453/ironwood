@@ -11,6 +11,7 @@
 #include <unordered_set>
 
 #include "kernel/internal/profile_support.hpp"
+#include "kernel/naming_support.hpp"
 #include "kernel/ops.hpp"
 #include "naming/detail.hpp"
 #include "naming/resolve.hpp"
@@ -492,4 +493,100 @@ TEST(NamingIntegration, SlotSplittingAFaceMakesOldReferenceAmbiguous) {
     auto ok = resolve(ElementRef{FeatureId{1}, ElementType::Face, bottom}, *m);
     ASSERT_TRUE(ok) << ok.error().message;
     EXPECT_EQ(ok->quality, ResolveQuality::Exact);
+}
+
+// ---- N1 / F27: frame-relative sibling ordinals, degenerate edge keys, hole tool ---------------------------------------
+
+TEST(NamingIntegration, SiblingOrdinalsInAFrameAreInvariantToRotationOfTheOwner) {
+    // The fuse of FuseSplitOrdinals..., rotated by 90 degrees about z. World-coordinate ranking reverses the pieces; ranking in
+    // the (rotated) owner frame keeps ordinal 0 on the same physical piece.
+    const Shape a = boxShape({0, 0, 0}, 10, 10, 10);
+    const Shape b = boxShape({-5, 4, 5}, 20, 2, 10);
+    Transform rot;
+    rot.m = {0, -1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}; // (x, y, z) -> (-y, x, z)
+    auto tra = kernel::transform(a, rot);
+    auto trb = kernel::transform(b, rot);
+    ASSERT_TRUE(tra && trb);
+    const Shape ra = tra->shape, rb = trb->shape;
+
+    // Local y centroid (in the unrotated frame) of the top-face piece named with ordinal `ord`.
+    auto pieceLocalY = [&](const Shape& sa, const Shape& sb, const SiblingFrame* frame, std::uint32_t ord, bool rotated) {
+        const NamingMap na = boxNames(1, sa);
+        const NamingMap nb = boxNames(2, sb);
+        auto r = kernel::fuse(sa, sb);
+        EXPECT_TRUE(r);
+        auto m = deriveNamingMap(FeatureId{3}, "fuse", r->shape, {&na, &nb}, r->history, frame);
+        EXPECT_TRUE(m);
+        // The top face of A is the face of A at z = 10 with area 100.
+        const auto topName = *na.nameOf(ElementType::Face, faceAt(sa, 10, 100));
+        for (std::uint32_t i = 0; i < m->size(ElementType::Face); ++i) {
+            auto n = m->nameOf(ElementType::Face, i);
+            if (!n || n->op != "fuse.split" || n->sources != std::vector<ElementName>{topName} || n->ordinal != ord) continue;
+            const auto k = r->shape.subShapeKey(SubShapeKind::Face, i);
+            return rotated ? k[0] * 1.0 : k[1]; // rotated: world x = -local y  (sign handled by the caller)
+        }
+        ADD_FAILURE() << "piece not found";
+        return 0.0;
+    };
+    // Unrotated, no frame: ordinal 0 is the piece with local y = 2.
+    EXPECT_NEAR(pieceLocalY(a, b, nullptr, 0, false), 2.0, 1e-6);
+    // Rotated, no frame: world x = -y, so world-lexicographic ranking puts the piece with local y = 8 (x = -8) first.
+    EXPECT_NEAR(pieceLocalY(ra, rb, nullptr, 0, true), -8.0, 1e-6);
+    // Rotated, ranked in the owner frame (local x = world y, local y = -world x): ordinal 0 is again local y = 2 (world x = -2).
+    SiblingFrame frame;
+    frame.xAxis = {0, 1, 0};
+    frame.yAxis = {-1, 0, 0};
+    frame.zAxis = {0, 0, 1};
+    EXPECT_NEAR(pieceLocalY(ra, rb, &frame, 0, true), -2.0, 1e-6);
+}
+
+TEST(NamingKernelSupport, DegenerateEdgesGetAPositionNotTheOrigin) {
+    const Shape box = boxShape({20, 20, 20}, 10, 10, 10); // far from the origin on purpose
+    kernel::HoleSpec spec;
+    spec.diameter = 4;
+    spec.depth = 6;
+    auto d = kernel::holeWithTool(box, kernel::Axis{{25, 25, 30}, {0, 0, -1}}, spec);
+    ASSERT_TRUE(d) << d.error().message;
+    // The tool is a revolved profile whose apex produces a zero-length edge somewhere in tool or result.
+    int degenerate = 0;
+    for (const Shape* s : {&d->result.shape, &d->tool.shape})
+        for (std::uint32_t i = 0; i < s->subShapeCount(SubShapeKind::Edge); ++i) {
+            const auto raw = s->subShapeKey(SubShapeKind::Edge, i);
+            if (raw[3] > 1e-9) {
+                EXPECT_EQ(kernel::stableSubShapeKey(*s, SubShapeKind::Edge, i), raw); // regular edges are untouched
+                continue;
+            }
+            ++degenerate;
+            const auto k = kernel::stableSubShapeKey(*s, SubShapeKind::Edge, i);
+            EXPECT_EQ(k[3], 0.0);
+            // The apex lies on the drill axis at x = y = 25; never the (0,0,0) origin.
+            EXPECT_NEAR(k[0], 25.0, 1e-6);
+            EXPECT_NEAR(k[1], 25.0, 1e-6);
+        }
+    EXPECT_GT(degenerate, 0) << "a drill point must produce a degenerate edge in the tool";
+}
+
+TEST(NamingKernelSupport, HoleWithToolMatchesKernelHoleAndKeepsToolHistory) {
+    const Shape box = boxShape({0, 0, 0}, 20, 20, 10);
+    kernel::HoleSpec spec;
+    spec.kind = kernel::HoleKind::Counterbore;
+    spec.diameter = 4;
+    spec.depth = 8;
+    spec.counterboreDiameter = 8;
+    spec.counterboreDepth = 3;
+    const kernel::Axis axis{{10, 10, 10}, {0, 0, -1}};
+    auto plain = kernel::hole(box, axis, spec);
+    auto detail = kernel::holeWithTool(box, axis, spec);
+    ASSERT_TRUE(plain && detail);
+    EXPECT_EQ(plain->shape.subShapeCount(SubShapeKind::Face), detail->result.shape.subShapeCount(SubShapeKind::Face));
+    EXPECT_EQ(plain->shape.subShapeCount(SubShapeKind::Edge), detail->result.shape.subShapeCount(SubShapeKind::Edge));
+    // Roles are unique and cover the profile.
+    std::set<std::string> roles(detail->profile.segmentRoles.begin(), detail->profile.segmentRoles.end());
+    EXPECT_EQ(roles.size(), detail->profile.segmentRoles.size());
+    for (const char* r : {"top", "cbore_wall", "cbore_floor", "wall", "drill_cone", "axis"}) EXPECT_TRUE(roles.count(r)) << r;
+    // Operand 1 (the tool) has history entries.
+    bool anyTool = false;
+    for (const auto& [in, out] : detail->result.history.modified) anyTool = anyTool || in.operand == 1;
+    for (const auto& [in, out] : detail->result.history.unchanged) anyTool = anyTool || in.operand == 1;
+    EXPECT_TRUE(anyTool);
 }

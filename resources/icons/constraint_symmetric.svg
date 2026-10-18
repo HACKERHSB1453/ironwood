@@ -1,0 +1,4 @@
+<!-- Ironwood icon constraint_symmetric: original artwork, GPL-3.0-or-later (see LICENSE) -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <path stroke="#7b61ff" d="M12 3 V21" stroke-dasharray="2 2.2"/><circle cx="6" cy="9" r="2.2"/><circle cx="18" cy="9" r="2.2"/><path d="M6 15 L9.5 19 H2.5 Z M18 15 L21.5 19 H14.5 Z"/>
+</svg>

@@ -16,6 +16,8 @@ docs/P0_FOLLOWUPS.md (rows referenced by your task), and the existing headers yo
   `ctest --test-dir build/<TASK> -R <your tests> --output-on-failure`. Before finishing also build+test with
   clang: `CXX=clang++ cmake --preset debug-clang -B build/<TASK>-clang`. If the full build fails only because of
   another task's in-progress files, build just your targets and say so.
+- **CPU courtesy (user request):** always build with `-j 6` (e.g. `cmake --build build/<TASK> -j 6 --target ...`) and run ctest with `-j 4` at most — several agents build in parallel on the user's desktop machine.
+- **Never** copy anything from ~/AI_Assistants/aviary, any `.env` file, or any API key/token into this repo.
 - Zero warnings (-Werror). SPDX `// SPDX-License-Identifier: GPL-3.0-or-later` on new files. No Autodesk
   code/names/icons. No git commits.
 - GUI tests: `QT_QPA_PLATFORM=offscreen` ONLY — never open windows on the user's desktop. Never `pkill -f`

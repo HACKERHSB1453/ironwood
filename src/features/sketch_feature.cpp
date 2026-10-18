@@ -78,6 +78,22 @@ Result<sketch::Sketch> rebase(const sketch::Sketch& src, const sketch::SketchPla
     return out;
 }
 
+/// Copy of `geometry` (entities, with their current coordinates) carrying the constraint and dimension records of
+/// `records`. Driven (reference) dimensions are included only when `withDriven`: the solver never sees them.
+Result<sketch::Sketch> buildSketch(const sketch::Sketch& geometry, const sketch::Sketch& records, bool withDriven) {
+    sketch::Sketch out(records.plane());
+    for (const auto& [id, e] : geometry.entities())
+        if (auto r = out.restoreEntity(id, e.geometry, e.construction); !r) return std::unexpected(r.error());
+    for (const auto& [id, c] : records.constraints())
+        if (auto r = out.restoreConstraint(id, c.kind, c.refs); !r) return std::unexpected(r.error());
+    for (const auto& [id, d] : records.dimensions()) {
+        if (d.driven && !withDriven) continue;
+        if (auto r = out.restoreDimension(id, d.kind, d.refs, d.expression, d.driven); !r) return std::unexpected(r.error());
+    }
+    if (auto r = out.restoreNextId(records.nextId()); !r) return std::unexpected(r.error());
+    return out;
+}
+
 std::string joinIds(const std::vector<std::uint64_t>& ids) {
     std::string out;
     for (std::uint64_t v : ids) {
@@ -162,21 +178,35 @@ Result<SketchSolution> SketchFeature::solve(const EvalContext& ctx) const {
     if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "sketch cancelled");
     std::vector<Diagnostic> diags;
 
-    Result<sketch::Sketch> work = makeError(ErrorCode::Internal, "sketch not built");
-    if (params_.attach) {
+    // Built by a lambda (not default-initialised to an error and re-assigned): gcc's release flow analysis cannot see through
+    // the expected<> re-assignment and reports maybe-uninitialized (F40).
+    auto work = [&]() -> Result<sketch::Sketch> {
+        if (!params_.attach) return params_.sketch; // copy: the solver writes back into the working sketch only
         auto plane = resolvePlane(ctx, *params_.attach, diags);
         if (!plane) return std::unexpected(plane.error());
-        work = rebase(params_.sketch, *plane);
-    } else {
-        work = params_.sketch; // copy: the solver writes back into the working sketch only
-    }
+        return rebase(params_.sketch, *plane);
+    }();
     if (!work) return std::unexpected(work.error());
 
-    const sketch::SketchSolveReport rep = sketch::solveSketch(*work, ctx.params);
+    // Driven (reference) dimensions are measured, never solved: the solver works on a copy without them, and the
+    // solved geometry is then combined with the full record set again.
+    auto driving = buildSketch(*work, *work, false);
+    if (!driving) return std::unexpected(driving.error());
+    const sketch::SketchSolveReport rep = sketch::solveSketch(*driving, ctx.params);
     if (rep.status == sketch::SolverStatus::InvalidInput)
         return makeError(ErrorCode::InvalidArgument, "sketch: " + rep.message);
     if (rep.status == sketch::SolverStatus::Failed) return makeError(ErrorCode::InvalidArgument, failureMessage(rep));
     if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "sketch cancelled");
+    auto solvedWork = buildSketch(*driving, *work, true);
+    if (!solvedWork) return std::unexpected(solvedWork.error());
+    *work = std::move(*solvedWork);
+    std::map<sketch::SketchDimensionId, double> driven;
+    for (const auto& [id, d] : work->dimensions()) {
+        if (!d.driven) continue;
+        auto m = work->measureDimension(id);
+        if (m) driven.emplace(id, *m);
+        else diags.push_back({Diagnostic::Severity::Warning, "driven dimension " + std::to_string(id.value()) + " cannot be measured: " + m.error().message, std::nullopt});
+    }
 
     for (auto c : rep.redundantConstraints)
         diags.push_back({Diagnostic::Severity::Warning, "constraint " + std::to_string(c.value()) + " is redundant", std::nullopt});
@@ -185,7 +215,7 @@ Result<SketchSolution> SketchFeature::solve(const EvalContext& ctx) const {
 
     auto profiles = sketch::detectProfiles(*work);
     if (!profiles) return std::unexpected(profiles.error());
-    return SketchSolution{std::move(*work), std::move(*profiles), rep, std::move(diags)};
+    return SketchSolution{std::move(*work), std::move(*profiles), rep, std::move(diags), std::move(driven)};
 }
 
 Result<FeatureResult> SketchFeature::compute(const EvalContext& ctx) const {
@@ -195,6 +225,7 @@ Result<FeatureResult> SketchFeature::compute(const EvalContext& ctx) const {
     out.diagnostics = std::move(sol->diagnostics);
     out.attributes["dof"] = std::to_string(sol->report.dof);
     out.attributes["profiles"] = std::to_string(sol->profiles.size());
+    for (const auto& [id, value] : sol->drivenValues) out.attributes["driven." + std::to_string(id.value())] = std::to_string(value);
     return out;
 }
 

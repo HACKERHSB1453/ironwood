@@ -341,23 +341,27 @@ Result<recompute::FeatureResult> applyBodyOp(FeatureId feature, BodyOp op, BodyI
 
 Result<recompute::FeatureResult> modifyBody(FeatureId feature, BodyId body, const recompute::EvalContext& ctx,
                                             const kernel::ShapeResult& result, std::string_view opTag,
-                                            std::vector<Diagnostic> diags) {
+                                            std::vector<Diagnostic> diags, const naming::NamingMap* toolNaming,
+                                            const naming::SiblingFrame* frame) {
     const kernel::Shape* input = ctx.body(body);
     const naming::NamingMap* inputNaming = ctx.naming(body);
     if (!input || !inputNaming) return makeError(ErrorCode::NotFound, "body " + std::to_string(body.value()) + " does not exist at this position");
     if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "feature cancelled");
-    // Only the target body is an input here: history entries about other operands (e.g. the hole tool) carry names
-    // of their own, so they are dropped rather than rejected by deriveNamingMap.
+    // Without a tool naming only the target body is an input: history entries about other operands carry names of their
+    // own, so they are dropped rather than rejected by deriveNamingMap.
+    const std::uint32_t operands = toolNaming ? 2 : 1;
     kernel::ShapeHistory own;
     for (const auto& [in, out] : result.history.generated)
-        if (in.operand == 0) own.generated.insert({in, out});
+        if (in.operand < operands) own.generated.insert({in, out});
     for (const auto& [in, out] : result.history.modified)
-        if (in.operand == 0) own.modified.insert({in, out});
+        if (in.operand < operands) own.modified.insert({in, out});
     for (const auto& [in, out] : result.history.unchanged)
-        if (in.operand == 0) own.unchanged.insert({in, out});
+        if (in.operand < operands) own.unchanged.insert({in, out});
     for (const auto& in : result.history.deleted)
-        if (in.operand == 0) own.deleted.insert(in);
-    auto names = naming::deriveNamingMap(feature, opTag, result.shape, {inputNaming}, own);
+        if (in.operand < operands) own.deleted.insert(in);
+    std::vector<const naming::NamingMap*> inputs{inputNaming};
+    if (toolNaming) inputs.push_back(toolNaming);
+    auto names = naming::deriveNamingMap(feature, opTag, result.shape, inputs, own, frame, toolNaming ? 1u : UINT32_MAX);
     if (!names) return std::unexpected(names.error());
     recompute::FeatureResult out;
     out.diagnostics = std::move(diags);

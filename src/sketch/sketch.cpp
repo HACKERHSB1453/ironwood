@@ -168,12 +168,12 @@ Result<void> Sketch::restoreConstraint(SketchConstraintId id, ConstraintKind kin
 }
 
 Result<void> Sketch::restoreDimension(SketchDimensionId id, DimensionKind kind, std::vector<SketchRef> refs,
-                                      std::string expression) {
+                                      std::string expression, bool driven) {
     if (!id.valid()) return invalid("restored dimension id must be non-zero");
     if (idInUse(id.value())) return invalid("restored dimension id is already in use");
     for (const SketchRef& r : refs)
         if (auto ok = checkRef(r); !ok) return std::unexpected(ok.error());
-    dimensions_.emplace(id, SketchDimension{id, kind, std::move(refs), std::move(expression)});
+    dimensions_.emplace(id, SketchDimension{id, kind, std::move(refs), std::move(expression), driven});
     nextId_ = std::max(nextId_, id.value() + 1);
     return {};
 }
@@ -266,11 +266,11 @@ Result<SketchConstraintId> Sketch::addConstraint(ConstraintKind kind, std::vecto
 }
 
 Result<SketchDimensionId> Sketch::addDimension(DimensionKind kind, std::vector<SketchRef> refs,
-                                               std::string expression) {
+                                               std::string expression, bool driven) {
     for (const SketchRef& r : refs)
         if (auto ok = checkRef(r); !ok) return std::unexpected(ok.error());
     const SketchDimensionId id{allocateId()};
-    dimensions_.emplace(id, SketchDimension{id, kind, std::move(refs), std::move(expression)});
+    dimensions_.emplace(id, SketchDimension{id, kind, std::move(refs), std::move(expression), driven});
     return id;
 }
 
@@ -289,6 +289,62 @@ Result<void> Sketch::setDimensionExpression(SketchDimensionId id, std::string ex
     if (it == dimensions_.end()) return makeError(ErrorCode::NotFound, "sketch: no such dimension");
     it->second.expression = std::move(expression);
     return {};
+}
+
+Result<void> Sketch::setDimensionDriven(SketchDimensionId id, bool driven) {
+    auto it = dimensions_.find(id);
+    if (it == dimensions_.end()) return makeError(ErrorCode::NotFound, "sketch: no such dimension");
+    it->second.driven = driven;
+    return {};
+}
+
+Result<double> Sketch::measureDimension(SketchDimensionId id) const {
+    auto it = dimensions_.find(id);
+    if (it == dimensions_.end()) return makeError(ErrorCode::NotFound, "sketch: no such dimension");
+    const SketchDimension& d = it->second;
+    auto bad = [&](const char* what) { return makeError(ErrorCode::InvalidArgument, std::string("dimension ") + std::to_string(id.value()) + ": " + what); };
+    switch (d.kind) {
+    case DimensionKind::Distance:
+    case DimensionKind::DistanceX:
+    case DimensionKind::DistanceY: {
+        if (d.refs.size() != 2) return bad("needs two points");
+        auto a = pointOf(d.refs[0]);
+        auto b = pointOf(d.refs[1]);
+        if (!a) return std::unexpected(a.error());
+        if (!b) return std::unexpected(b.error());
+        const double dx = b->x - a->x, dy = b->y - a->y;
+        if (d.kind == DimensionKind::DistanceX) return std::abs(dx);
+        if (d.kind == DimensionKind::DistanceY) return std::abs(dy);
+        return std::hypot(dx, dy);
+    }
+    case DimensionKind::Radius:
+    case DimensionKind::Diameter: {
+        if (d.refs.size() != 1) return bad("needs one arc or circle");
+        const SketchEntity* e = findEntity(d.refs[0].entity);
+        if (!e) return makeError(ErrorCode::NotFound, "dimension references a missing entity");
+        double r = 0;
+        if (const auto* c = std::get_if<CircleGeom>(&e->geometry)) r = c->radius;
+        else if (const auto* a = std::get_if<ArcGeom>(&e->geometry)) r = a->radius;
+        else return bad("needs an arc or circle");
+        return d.kind == DimensionKind::Radius ? r : 2 * r;
+    }
+    case DimensionKind::Angle: {
+        if (d.refs.size() != 2) return bad("needs two lines");
+        Point2 dirs[2];
+        for (int i = 0; i < 2; ++i) {
+            const SketchEntity* e = findEntity(d.refs[i].entity);
+            if (!e) return makeError(ErrorCode::NotFound, "dimension references a missing entity");
+            const auto* l = std::get_if<LineGeom>(&e->geometry);
+            if (!l) return bad("angle needs two lines");
+            dirs[i] = {l->end.x - l->start.x, l->end.y - l->start.y};
+        }
+        const double n = std::hypot(dirs[0].x, dirs[0].y) * std::hypot(dirs[1].x, dirs[1].y);
+        if (!(n > 1e-12)) return bad("angle of a zero-length line");
+        const double c = std::clamp((dirs[0].x * dirs[1].x + dirs[0].y * dirs[1].y) / n, -1.0, 1.0);
+        return std::acos(c);
+    }
+    }
+    return bad("unknown dimension kind");
 }
 
 } // namespace iw::sketch

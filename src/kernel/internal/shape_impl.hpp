@@ -14,6 +14,8 @@
 // iteration order. Two builds of the same operation on the same inputs therefore give identical orderings,
 // and the tables are immutable after construction (safe for concurrent readers).
 
+#include <atomic>
+#include <limits>
 #include <memory>
 
 #include <TopExp.hxx>
@@ -46,6 +48,17 @@ struct Shape::Impl {
     TopoDS_Shape shape;
     ShapeStamp stamp;
     std::shared_ptr<const SubShapeIndex> index; ///< never null for a non-null shape
+    /// Memoised volume in mm^3 (NaN = not yet computed). Geometry is immutable, so a computed value never changes.
+    mutable std::atomic<double> volumeCache{std::numeric_limits<double>::quiet_NaN()};
+    /// Memoised structural verdict (-1 = not yet checked, 0 = invalid, 1 = valid). Immutable geometry, so a verdict
+    /// never changes. Only ever written by the kernel's validation (kernel/ops.cpp).
+    mutable std::atomic<signed char> validCache{-1};
+
+    Impl() = default;
+    Impl(const Impl& o)
+        : shape(o.shape), stamp(o.stamp), index(o.index), volumeCache(o.volumeCache.load(std::memory_order_relaxed)),
+          validCache(o.validCache.load(std::memory_order_relaxed)) {}
+    Impl& operator=(const Impl&) = delete;
 };
 
 /// Wraps an OCCT shape (builds the index tables). Null OCCT shape -> null Shape.

@@ -427,11 +427,45 @@ TEST_F(IoTest, V1ManifestWithoutParametersIsParseError) {
     EXPECT_EQ(loaded.error().code, ErrorCode::ParseError);
 }
 
-TEST_F(IoTest, SavedManifestIsVersion1WithParametersArray) {
+TEST_F(IoTest, SavedManifestIsVersion2WithParametersNamesAndCounters) {
     iw::io::Document d = makeDocument();
     ASSERT_TRUE(d.parameters.add("p", "5 mm"));
+    d.nameCounters["test.box"] = 4;
     ASSERT_TRUE(iw::io::saveDocument(doc(), d).has_value());
     const std::string text = readFile(manifest());
-    EXPECT_NE(text.find("\"version\": 1"), std::string::npos);
+    EXPECT_NE(text.find("\"version\": 2"), std::string::npos);
     EXPECT_NE(text.find("\"parameters\""), std::string::npos);
+    EXPECT_NE(text.find("\"nameCounters\""), std::string::npos);
+}
+
+TEST_F(IoTest, FeatureNamesAndNameCountersRoundTrip) {
+    iw::io::Document d;
+    d.nextId = 10;
+    auto named = makeFeature(1, "test.box", R"({"h":3,"w":10})");
+    named->setName("Base block");
+    d.timeline.append(named);
+    d.timeline.append(makeFeature(2, "test.box", R"({"h":1,"w":1})"));
+    d.nameCounters["test.box"] = 7;
+    ASSERT_TRUE(iw::io::saveDocument(doc(), d).has_value());
+    auto loaded = iw::io::loadDocument(doc(), makeRegistry());
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->timeline.at(0)->name(), "Base block");
+    EXPECT_EQ(loaded->timeline.at(1)->name(), "") << "unnamed features stay unnamed on disk";
+    ASSERT_EQ(loaded->nameCounters.count("test.box"), 1u);
+    EXPECT_EQ(loaded->nameCounters.at("test.box"), 7u);
+}
+
+TEST_F(IoTest, Version1ManifestLoadsWithoutNames) {
+    iw::io::Document d = makeDocument();
+    ASSERT_TRUE(iw::io::saveDocument(doc(), d).has_value());
+    std::string text = readFile(manifest());
+    const std::string current = "\"version\": 2";
+    const auto pos = text.find(current);
+    ASSERT_NE(pos, std::string::npos);
+    text.replace(pos, current.size(), "\"version\": 1");
+    writeFile(manifest(), text);
+    auto loaded = iw::io::loadDocument(doc(), makeRegistry());
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->timeline.size(), 3u);
+    EXPECT_EQ(loaded->timeline.at(0)->name(), "");
 }

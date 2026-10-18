@@ -10,13 +10,14 @@
 #include <QVBoxLayout>
 
 #include "core/expr.hpp"
+#include "features/document.hpp"
 
 namespace iw::ui {
 namespace {
 constexpr const char* kErrorStyle = "color: #c0392b;";
 } // namespace
 
-ParametersDialog::ParametersDialog(DocumentState& doc, QWidget* parent) : QWidget(parent), doc_(doc) {
+ParametersDialog::ParametersDialog(features::Document& doc, QWidget* parent) : QWidget(parent), doc_(&doc) {
     setObjectName("parametersDialog");
     setWindowFlag(Qt::Window);   // a floating dialog even when parented to the main window
     setWindowTitle(tr("Parameters"));
@@ -51,17 +52,30 @@ ParametersDialog::ParametersDialog(DocumentState& doc, QWidget* parent) : QWidge
     connect(add, &QPushButton::clicked, this, [this] { showResult(addParameter(freshName(), "10 mm")); });
     connect(del, &QPushButton::clicked, this, [this] {
         const int row = table_->currentRow();
-        if (row < 0 || row >= static_cast<int>(doc_.params.size())) {
+        if (!doc_ || row < 0 || row >= static_cast<int>(doc_->parameters().size())) {
             showResult(makeError(ErrorCode::InvalidArgument, tr("Select a parameter to delete").toStdString()));
             return;
         }
-        showResult(deleteParameter(doc_.params.parameters()[static_cast<std::size_t>(row)].name));
+        showResult(deleteParameter(doc_->parameters().parameters()[static_cast<std::size_t>(row)].name));
     });
 
     connect(table_, &QTableWidget::itemChanged, this, [this](QTableWidgetItem* item) {
         onItemChanged(item->row(), item->column());
     });
+    // Undo, redo and every other document change keep the table in step with the document.
+    listener_ = doc_->addListener([this] {
+        if (!editing_) refresh();
+    });
     refresh();
+}
+
+ParametersDialog::~ParametersDialog() { detach(); }
+
+void ParametersDialog::detach() {
+    if (doc_ && listener_ != 0) doc_->removeListener(listener_);
+    listener_ = 0;
+    doc_ = nullptr;
+    if (table_) refresh();
 }
 
 QString ParametersDialog::errorText() const { return error_->text(); }
@@ -74,56 +88,60 @@ void ParametersDialog::showResult(const Result<void>& r) {
 std::string ParametersDialog::freshName() const {
     for (int i = 1;; ++i) {
         std::string name = "d" + std::to_string(i);
-        if (!doc_.params.find(name)) return name;
+        if (!doc_ || !doc_->parameters().find(name)) return name;
     }
 }
 
 Result<void> ParametersDialog::addParameter(const std::string& name, const std::string& expression,
                                             const std::string& unit, const std::string& comment) {
-    auto r = editParameters(doc_, "Add parameter " + name, [&](ParameterTable& t) {
-        return t.add(name, expression, unit, comment);
-    });
+    if (!doc_) return makeError(ErrorCode::InvalidArgument, tr("No document is open").toStdString());
+    editing_ = true;
+    auto r = doc_->addParameter(name, expression, unit, comment);
+    editing_ = false;
     showResult(r);
     return r;
 }
 
 Result<void> ParametersDialog::deleteParameter(const std::string& name) {
-    auto r = editParameters(doc_, "Delete parameter " + name, [&](ParameterTable& t) { return t.remove(name); });
+    if (!doc_) return makeError(ErrorCode::InvalidArgument, tr("No document is open").toStdString());
+    editing_ = true;
+    auto r = doc_->removeParameter(name);
+    editing_ = false;
     showResult(r);
     return r;
 }
 
 Result<void> ParametersDialog::editCell(int row, int column, const QString& text) {
-    if (row < 0 || row >= static_cast<int>(doc_.params.size()))
+    if (!doc_) return makeError(ErrorCode::InvalidArgument, tr("No document is open").toStdString());
+    const auto& params = doc_->parameters().parameters();
+    if (row < 0 || row >= static_cast<int>(params.size()))
         return makeError(ErrorCode::NotFound, "no parameter in row " + std::to_string(row));
-    const std::string name = doc_.params.parameters()[static_cast<std::size_t>(row)].name;
+    const std::string name = params[static_cast<std::size_t>(row)].name;
     const std::string value = text.trimmed().toStdString();
 
+    editing_ = true;
     Result<void> r;
     switch (column) {
     case Name:
-        r = editParameters(doc_, "Rename parameter", [&](ParameterTable& t) { return t.rename(name, value); });
+        r = doc_->renameParameter(name, value);
         break;
     case Unit:
-        r = editParameters(doc_, "Change unit", [&](ParameterTable& t) { return t.setUnit(name, value); });
+        r = doc_->setParameterUnit(name, value);
         break;
     case Expression:
-        r = editParameters(doc_, "Edit parameter " + name, [&](ParameterTable& t) {
-            return t.setExpression(name, value);
-        });
+        r = doc_->setParameterExpression(name, value);
         break;
     case Comment:
-        r = editParameters(doc_, "Edit comment", [&](ParameterTable& t) { return t.setComment(name, value); });
+        r = doc_->setParameterComment(name, value);
         break;
-    case Favourite: {
-        const bool on = value == "1" || value == "true";
-        r = editParameters(doc_, "Favourite", [&](ParameterTable& t) { return t.setFavourite(name, on); });
+    case Favourite:
+        r = doc_->setParameterFavourite(name, value == "1" || value == "true");
         break;
-    }
     default:
         r = makeError(ErrorCode::InvalidArgument, "the value is computed; edit the expression instead");
         break;
     }
+    editing_ = false;
     showResult(r);
     return r;
 }
@@ -143,7 +161,8 @@ void ParametersDialog::onItemChanged(int row, int column) {
 void ParametersDialog::refresh() {
     const QSignalBlocker block(table_);
     table_->setRowCount(0);
-    const auto& params = doc_.params.parameters();
+    if (!doc_) return;
+    const auto& params = doc_->parameters().parameters();
     table_->setRowCount(static_cast<int>(params.size()));
     for (int row = 0; row < static_cast<int>(params.size()); ++row) {
         const Parameter& p = params[static_cast<std::size_t>(row)];
@@ -153,7 +172,7 @@ void ParametersDialog::refresh() {
 
         auto* value = new QTableWidgetItem;
         value->setFlags(value->flags() & ~Qt::ItemIsEditable);
-        if (auto q = doc_.params.evaluate(p.name)) {
+        if (auto q = doc_->parameters().evaluate(p.name)) {
             value->setText(QString::fromStdString(formatQuantity(*q)));
         } else {
             value->setText(QStringLiteral("error: ") + QString::fromStdString(q.error().message));

@@ -8,3 +8,10 @@ compile_commands.json
 __pycache__/
 *.o
 *.a
+
+# Never commit secrets or local tool config
+.env
+.env.*
+*.key
+*.pem
+secrets/

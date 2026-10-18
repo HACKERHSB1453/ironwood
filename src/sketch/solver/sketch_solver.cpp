@@ -348,10 +348,16 @@ void Model::addConstraint(const SolverConstraint& c, std::size_t index, int tag)
             GCS::Point b = pointOf(r[1]);
             const Entity& axis = find(r[2].entity);
             if (axis.kind == Entity::Kind::Line) {
-                keep(sys.addConstraintP2PSymmetric(a, b, *axis.line, tag));
+                // planegcs adds TWO constraints (perpendicular + midpoint-on-line) and returns only the last index.
+                // Both must be registered: updateModel() rescales every registered constraint at the real
+                // coordinates, and one left at its construction-time scale (all parameters 0 then) breaks the solve.
+                keep(sys.addConstraintPerpendicular(a, b, axis.line->p1, axis.line->p2, tag));
+                keep(sys.addConstraintMidpointOnLine(a, b, axis.line->p1, axis.line->p2, tag));
             } else if (axis.kind == Entity::Kind::Point) {
                 GCS::Point m = axis.point;
-                keep(sys.addConstraintP2PSymmetric(a, b, m, tag));
+                // Same two-constraint pitfall as the line mirror above.
+                keep(sys.addConstraintPointOnPerpBisector(m, a, b, tag));
+                keep(sys.addConstraintPointOnLine(m, a, b, tag));
             } else {
                 invalid("constraint " + std::to_string(c.id) + ": symmetry axis must be a line or a point");
             }
@@ -361,6 +367,25 @@ void Model::addConstraint(const SolverConstraint& c, std::size_t index, int tag)
             need(1);
             addFix(c, tag);
             break;
+        case K::PointOnObject: {
+            need(2);
+            GCS::Point p = pointOf(r[0]);
+            const Entity& e = find(r[1].entity);
+            switch (e.kind) {
+                case Entity::Kind::Line:
+                    keep(sys.addConstraintPointOnLine(p, *e.line, tag));
+                    break;
+                case Entity::Kind::Circle:
+                    keep(sys.addConstraintPointOnCircle(p, *e.circle, tag));
+                    break;
+                case Entity::Kind::Arc:
+                    keep(sys.addConstraintPointOnArc(p, *e.arc, tag));
+                    break;
+                default:
+                    invalid("constraint " + std::to_string(c.id) + ": point-on-object needs a line, circle or arc");
+            }
+            break;
+        }
         case K::Distance: {
             need(2);
             GCS::Point a = pointOf(r[0]);

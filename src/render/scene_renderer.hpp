@@ -31,6 +31,10 @@ public:
     void setScene(std::vector<SceneBody> bodies);
     void setHover(const PickResult& r);
     void setSelection(const PickResult& r);
+    /// Section clip + cap (applies to bodies, edges and picks). Does not invalidate pending picks.
+    void setSection(const SectionRequest& s);
+    /// Translucent overlays; index = position in `faces`. Does not invalidate pending picks.
+    void setOverlays(std::vector<OverlayFace> faces);
 
     /// Draws gradient background + shaded faces + edge lines into `rt` (must be inside a frame, outside a pass).
     /// `pixelSize` is the render target size in device pixels; the camera aspect is taken from it.
@@ -59,7 +63,7 @@ struct PickDecode {
     float depth = 0;  ///< Distance along the camera forward axis at the chosen texel.
 };
 /// Decodes a pick window (RGBA32F, window^2 texels, top row first; centre texel = the picked pixel).
-/// Edges within `edgeRadius` texels beat faces. Exposed for tests.
+/// Overlays within `edgeRadius` texels beat everything; then edges beat faces. Exposed for tests.
 PickDecode decodePickWindow(const float* rgba, int window, double edgeRadius);
 
 } // namespace iw::render

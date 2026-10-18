@@ -8,6 +8,7 @@
 #include <optional>
 #include <set>
 
+#include "kernel/naming_support.hpp"
 #include "naming/detail.hpp"
 
 namespace iw::naming {
@@ -55,6 +56,7 @@ struct Origin {
     Cls cls;
     kernel::SubShapeKind inKind;
     bool split; // modified, and the input fans out to >1 outputs of this output kind
+    std::uint32_t operand;
 };
 
 ElementType toElementType(kernel::SubShapeKind k) noexcept {
@@ -81,7 +83,8 @@ const char* roleOf(kernel::SubShapeKind in, ElementType out) noexcept {
 Result<NamingMap> deriveFromCounts(FeatureId feature, std::string_view opTag,
                                    const std::array<std::uint32_t, 3>& counts,
                                    const std::vector<const NamingMap*>& inputs,
-                                   const kernel::ShapeHistory& history, const SiblingKeyFn& keyFn) {
+                                   const kernel::ShapeHistory& history, const SiblingKeyFn& keyFn,
+                                   std::uint32_t partOperandFrom) {
     if (!feature.valid()) return makeError(ErrorCode::InvalidArgument, "deriveNamingMap: invalid feature id");
     if (opTag.empty()) return makeError(ErrorCode::InvalidArgument, "deriveNamingMap: empty op tag");
 
@@ -108,7 +111,7 @@ Result<NamingMap> deriveFromCounts(FeatureId feature, std::string_view opTag,
         auto nm = inputName(in);
         if (!err) return std::unexpected(err.error());
         if (!nm || !outRange(out)) { if (!err) return std::unexpected(err.error()); continue; }
-        origins[static_cast<int>(out.kind)][out.index].push_back({*nm, Cls::Unchanged, in.kind, false});
+        origins[static_cast<int>(out.kind)][out.index].push_back({*nm, Cls::Unchanged, in.kind, false, in.operand});
     }
     auto addMap = [&](const std::map<kernel::InputSubShape, std::vector<kernel::OutputSubShape>>& m, Cls cls)
         -> Result<void> {
@@ -121,7 +124,7 @@ Result<NamingMap> deriveFromCounts(FeatureId feature, std::string_view opTag,
                 std::size_t sameKind = 0;
                 for (const auto& o2 : outs) sameKind += (o2.kind == o.kind);
                 origins[static_cast<int>(o.kind)][o.index].push_back(
-                    {*nm, cls, in.kind, cls == Cls::Modified && sameKind > 1});
+                    {*nm, cls, in.kind, cls == Cls::Modified && sameKind > 1, in.operand});
             }
         }
         return {};
@@ -171,7 +174,8 @@ Result<NamingMap> deriveFromCounts(FeatureId feature, std::string_view opTag,
                 n = srcs.front();
                 pending[t].push_back({i, std::move(n), true});
             } else if (anyKept) { // 1:N split
-                n.op = op + ".split";
+                const bool toolOnly = std::all_of(os.begin(), os.end(), [&](const Origin& o) { return o.operand >= partOperandFrom; });
+                n.op = toolOnly ? srcs.front().op + ".part" : op + ".split";
                 n.sources = std::move(srcs);
                 pending[t].push_back({i, std::move(n), false});
             } else { // generated
@@ -204,7 +208,15 @@ Result<NamingMap> deriveFromCounts(FeatureId feature, std::string_view opTag,
                     keyed.push_back({k ? *k : std::array<double, 4>{}, idx});
                 }
                 if (allKeyed)
-                    std::sort(keyed.begin(), keyed.end());
+                    std::sort(keyed.begin(), keyed.end(), [](const auto& a, const auto& b) {
+                        // Lexicographic with a tolerance: keys that differ only by floating-point noise (a translated or
+                        // rotated copy of the same geometry) count as equal and fall through to the next component.
+                        for (std::size_t c = 0; c < 4; ++c) {
+                            const double tol = 1e-7 * (1.0 + std::max(std::abs(a.first[c]), std::abs(b.first[c])));
+                            if (std::abs(a.first[c] - b.first[c]) > tol) return a.first[c] < b.first[c];
+                        }
+                        return a.second < b.second;
+                    });
                 else
                     std::sort(keyed.begin(), keyed.end(),
                               [](const auto& a, const auto& b) { return a.second < b.second; });
@@ -227,17 +239,23 @@ Result<NamingMap> deriveFromCounts(FeatureId feature, std::string_view opTag,
 
 Result<NamingMap> deriveNamingMap(FeatureId feature, std::string_view opTag, const kernel::Shape& output,
                                   const std::vector<const NamingMap*>& inputs,
-                                  const kernel::ShapeHistory& history) {
+                                  const kernel::ShapeHistory& history, const SiblingFrame* frame,
+                                  std::uint32_t partOperandFrom) {
     if (output.isNull()) return makeError(ErrorCode::InvalidArgument, "deriveNamingMap: null output shape");
     const std::array<std::uint32_t, 3> counts{output.subShapeCount(kernel::SubShapeKind::Face),
                                               output.subShapeCount(kernel::SubShapeKind::Edge),
                                               output.subShapeCount(kernel::SubShapeKind::Vertex)};
     // Sibling ordinals come from the output's geometry (centroid x,y,z then measure), never from kernel index
     // alone. Geometry is read ONLY here, for sibling tie-breaks; everything else comes from the history.
-    const detail::SiblingKeyFn keyFn = [&output](ElementType t, std::uint32_t i) {
-        return std::optional<std::array<double, 4>>(output.subShapeKey(toSubShapeKind(t), i));
+    const detail::SiblingKeyFn keyFn = [&output, frame](ElementType t, std::uint32_t i) {
+        auto k = kernel::stableSubShapeKey(output, toSubShapeKind(t), i);
+        if (frame) {
+            const Vec3 rel = Vec3{k[0], k[1], k[2]} - frame->origin;
+            k = {dot(rel, frame->xAxis), dot(rel, frame->yAxis), dot(rel, frame->zAxis), k[3]};
+        }
+        return std::optional<std::array<double, 4>>(k);
     };
-    return detail::deriveFromCounts(feature, opTag, counts, inputs, history, keyFn);
+    return detail::deriveFromCounts(feature, opTag, counts, inputs, history, keyFn, partOperandFrom);
 }
 
 } // namespace iw::naming

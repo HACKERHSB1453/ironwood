@@ -28,7 +28,7 @@
 #include "ui/command_actions.hpp"
 #include "ui/command_dialog.hpp"
 #include "ui/default_commands.hpp"
-#include "ui/doc_state.hpp"
+#include "features/document.hpp"
 #include "ui/fuzzy.hpp"
 #include "ui/manipulators.hpp"
 #include "ui/marking_menu.hpp"
@@ -100,15 +100,16 @@ TEST(UiShellRegistry, DefaultCommandsExistWithTheirImplementationState) {
         ASSERT_NE(reg.find(id), nullptr) << id;
         EXPECT_TRUE(reg.find(id)->implemented()) << id;
     }
-    for (const char* id : {"measure", "extrude", "revolve", "fillet", "chamfer", "hole", "plane", "axis",
-                           "point", "move"}) {
+    // Axis and point have dialogs (ui/timeline); Measure is registered by the inspect module, not by the defaults.
+    for (const char* id : {"axis", "point"}) {
         const iw::ui::Command* c = reg.find(id);
         if (!c) {
             ADD_FAILURE() << "missing command " << id;
             continue;
         }
-        EXPECT_FALSE(c->implemented()) << id << " should be a disabled placeholder";
+        EXPECT_TRUE(c->implemented()) << id;
     }
+    EXPECT_EQ(reg.find("measure"), nullptr);
     CommandContext ctx;
     EXPECT_FALSE(reg.find("extrude")->isEnabled(ctx));
     EXPECT_EQ(reg.run("extrude", ctx).error().code, ErrorCode::InvalidArgument);
@@ -125,8 +126,9 @@ TEST(UiShellRegistry, DefaultRegistryHasNoShortcutConflicts) {
 
 TEST(UiShellRegistry, GroupLayoutOfTheSolidTab) {
     CommandRegistry reg = defaultRegistry();
+    // INSPECT is added by inspect::registerCommands (MainWindow), not by the defaults.
     EXPECT_EQ(reg.groups("DESIGN", "SOLID"),
-              (std::vector<std::string>{"CREATE", "MODIFY", "ASSEMBLE", "CONSTRUCT", "INSPECT", "INSERT", "SELECT"}));
+              (std::vector<std::string>{"CREATE", "MODIFY", "ASSEMBLE", "CONSTRUCT", "INSERT", "SELECT"}));
     EXPECT_TRUE(reg.groups("DESIGN", "SURFACE").empty()); // listed in the ribbon as "coming soon"
 }
 
@@ -198,7 +200,7 @@ TEST(UiShellRegistry, ShortcutOverridesRoundTripThroughSettings) {
 
 TEST(UiShellRegistry, ImportRunsItsHookAndRepeatLastRepeatsIt) {
     CommandRegistry reg = defaultRegistry();
-    DocumentState doc;
+    features::Document doc;
     int imports = 0;
     CommandContext ctx;
     ctx.doc = &doc;
@@ -217,19 +219,19 @@ TEST(UiShellRegistry, ImportRunsItsHookAndRepeatLastRepeatsIt) {
 
 TEST(UiShellRegistry, UndoAndRedoFollowTheUndoStack) {
     CommandRegistry reg = defaultRegistry();
-    DocumentState doc;
+    features::Document doc;
     CommandContext ctx;
     ctx.doc = &doc;
     EXPECT_FALSE(reg.find("undo")->isEnabled(ctx));
     EXPECT_FALSE(reg.find("redo")->isEnabled(ctx));
 
-    ASSERT_TRUE(editParameters(doc, "Add d1", [](ParameterTable& t) { return t.add("d1", "5 mm"); }));
+    ASSERT_TRUE(doc.addParameter("d1", "5 mm"));
     EXPECT_TRUE(reg.find("undo")->isEnabled(ctx));
     ASSERT_TRUE(reg.run("undo", ctx));
-    EXPECT_EQ(doc.params.find("d1"), nullptr);
+    EXPECT_EQ(doc.parameters().find("d1"), nullptr);
     EXPECT_TRUE(reg.find("redo")->isEnabled(ctx));
     ASSERT_TRUE(reg.run("redo", ctx));
-    EXPECT_NE(doc.params.find("d1"), nullptr);
+    EXPECT_NE(doc.parameters().find("d1"), nullptr);
 }
 
 // ---- S-box fuzzy ranking -----------------------------------------------------------------------------------
@@ -281,13 +283,13 @@ TEST(UiShellSbox, PaletteRunsImplementedCommandsAndPinsPlaceholders) {
         pinned.push_back(id.toStdString());
     });
 
-    palette.setQuery("hol");
+    palette.setQuery("joint");   // a placeholder in the defaults (not implemented yet)
     ASSERT_FALSE(palette.results().empty());
-    EXPECT_EQ(palette.results().front(), "hole");
+    EXPECT_EQ(palette.results().front(), "joint");
     EXPECT_FALSE(palette.chooseCurrent()) << "placeholder must not run";
     EXPECT_TRUE(chosen.empty());
     EXPECT_TRUE(palette.pinCurrent());
-    EXPECT_EQ(pinned, (std::vector<std::string>{"hole"}));
+    EXPECT_EQ(pinned, (std::vector<std::string>{"joint"}));
 
     palette.setQuery("import");
     EXPECT_TRUE(palette.chooseCurrent());
@@ -546,7 +548,7 @@ TEST(UiShellMarkingMenu, SlotsMapToCompassDirections) {
 
 TEST(UiShellMarkingMenu, SlotsRunEnabledCommandsOnly) {
     CommandRegistry reg = defaultRegistry();
-    DocumentState doc;
+    features::Document doc;
     int imports = 0;
     CommandContext ctx;
     ctx.doc = &doc;
@@ -559,10 +561,10 @@ TEST(UiShellMarkingMenu, SlotsRunEnabledCommandsOnly) {
     EXPECT_EQ(menu.slotLabel(3).toStdString(), "Undo");
     EXPECT_FALSE(menu.slotEnabled(3)) << "nothing to undo";
     EXPECT_FALSE(menu.chooseSlot(3));
-    EXPECT_FALSE(menu.slotEnabled(6)) << "hole is a placeholder";
+    EXPECT_TRUE(menu.slotEnabled(6)) << "hole is implemented and a document is open";
     EXPECT_FALSE(menu.chooseSlot(0)) << "no last command to repeat";
 
-    ASSERT_TRUE(editParameters(doc, "Add d1", [](ParameterTable& t) { return t.add("d1", "5 mm"); }));
+    ASSERT_TRUE(doc.addParameter("d1", "5 mm"));
     EXPECT_TRUE(menu.slotEnabled(3));
     EXPECT_TRUE(menu.chooseSlot(3));
     EXPECT_EQ(chosen, (std::vector<std::string>{"undo"}));
@@ -577,7 +579,7 @@ TEST(UiShellMarkingMenu, SlotsRunEnabledCommandsOnly) {
 
 TEST(UiShellMarkingMenu, OverflowListHoldsEveryOtherCommand) {
     CommandRegistry reg = defaultRegistry();
-    DocumentState doc;
+    features::Document doc;
     CommandContext ctx;
     ctx.doc = &doc;
     MarkingMenu menu(reg, ctx);
@@ -592,7 +594,7 @@ TEST(UiShellMarkingMenu, OverflowListHoldsEveryOtherCommand) {
 // ---- parameters dialog --------------------------------------------------------------------------------------------
 
 TEST(UiShellParameters, AddEditAndCycleErrorsAreShownInlineAndLeaveTheTableIntact) {
-    DocumentState doc;
+    features::Document doc;
     ParametersDialog dialog(doc);
 
     ASSERT_TRUE(dialog.addParameter("a", "5 mm"));
@@ -606,12 +608,12 @@ TEST(UiShellParameters, AddEditAndCycleErrorsAreShownInlineAndLeaveTheTableIntac
     ASSERT_FALSE(cycle);
     EXPECT_EQ(cycle.error().code, ErrorCode::InvalidArgument);
     EXPECT_NE(dialog.errorText().toStdString().find("cyclic"), std::string::npos) << dialog.errorText().toStdString();
-    EXPECT_EQ(doc.params.find("a")->expression.source(), "5 mm");
+    EXPECT_EQ(doc.parameters().find("a")->expression.source(), "5 mm");
 
     // Parse error keeps the old expression.
     EXPECT_FALSE(dialog.editCell(0, ParametersDialog::Expression, QStringLiteral("5 mm *")));
     EXPECT_FALSE(dialog.errorText().isEmpty());
-    EXPECT_EQ(doc.params.find("a")->expression.source(), "5 mm");
+    EXPECT_EQ(doc.parameters().find("a")->expression.source(), "5 mm");
 
     // A valid edit clears the error and updates dependents.
     ASSERT_TRUE(dialog.editCell(0, ParametersDialog::Expression, QStringLiteral("7 mm")));
@@ -620,7 +622,7 @@ TEST(UiShellParameters, AddEditAndCycleErrorsAreShownInlineAndLeaveTheTableIntac
 
     // Editing a cell through the table (what the user does) goes through the same path.
     dialog.table()->item(1, ParametersDialog::Expression)->setText(QStringLiteral("a*3"));
-    EXPECT_NEAR(doc.params.evaluate("b")->value, 21.0, 1e-12);
+    EXPECT_NEAR(doc.parameters().evaluate("b")->value, 21.0, 1e-12);
 
     // Duplicate name is refused.
     EXPECT_FALSE(dialog.addParameter("a", "1 mm"));
@@ -628,32 +630,32 @@ TEST(UiShellParameters, AddEditAndCycleErrorsAreShownInlineAndLeaveTheTableIntac
 }
 
 TEST(UiShellParameters, RenameDeleteAndUndoAreRecorded) {
-    DocumentState doc;
+    features::Document doc;
     ParametersDialog dialog(doc);
     ASSERT_TRUE(dialog.addParameter("a", "5 mm"));
     ASSERT_TRUE(dialog.addParameter("b", "a*2"));
 
     ASSERT_TRUE(dialog.editCell(0, ParametersDialog::Name, QStringLiteral("x")));
-    EXPECT_EQ(doc.params.find("b")->expression.source(), "x*2") << "rename rewrites references";
+    EXPECT_EQ(doc.parameters().find("b")->expression.source(), "x*2") << "rename rewrites references";
 
     // Deleting a referenced parameter is refused while the reference exists.
     EXPECT_FALSE(dialog.deleteParameter("x"));
-    EXPECT_NE(doc.params.find("x"), nullptr);
+    EXPECT_NE(doc.parameters().find("x"), nullptr);
 
     // Undo steps back through the edits.
-    ASSERT_TRUE(doc.undo.undo());
-    EXPECT_NE(doc.params.find("a"), nullptr);
-    EXPECT_EQ(doc.params.find("b")->expression.source(), "a*2");
+    ASSERT_TRUE(doc.undo());
+    EXPECT_NE(doc.parameters().find("a"), nullptr);
+    EXPECT_EQ(doc.parameters().find("b")->expression.source(), "a*2");
 
     ASSERT_TRUE(dialog.deleteParameter("b"));
-    EXPECT_EQ(doc.params.find("b"), nullptr);
+    EXPECT_EQ(doc.parameters().find("b"), nullptr);
     EXPECT_EQ(dialog.table()->rowCount(), 1);
-    ASSERT_TRUE(doc.undo.undo());
-    EXPECT_NE(doc.params.find("b"), nullptr);
+    ASSERT_TRUE(doc.undo());
+    EXPECT_NE(doc.parameters().find("b"), nullptr);
 }
 
 TEST(UiShellParameters, RowsStayInTableOrderAndOutOfRangeEditsAreRejected) {
-    DocumentState doc;
+    features::Document doc;
     ParametersDialog dialog(doc);
     ASSERT_TRUE(dialog.addParameter("p", "1 mm"));
     EXPECT_FALSE(dialog.editCell(5, ParametersDialog::Expression, QStringLiteral("2 mm")));
@@ -675,8 +677,11 @@ TEST(UiShellWindow, RibbonShowsTabsGroupsAndDisabledPlaceholders) {
     EXPECT_FALSE(ribbon->workspaceBox()->model()->index(1, 0).flags().testFlag(Qt::ItemIsEnabled));
 
     ASSERT_NE(win.actions()->action("extrude"), nullptr);
-    EXPECT_FALSE(win.actions()->action("extrude")->isEnabled());
-    EXPECT_NE(win.actions()->action("extrude")->toolTip().toStdString().find("coming soon"), std::string::npos);
+    EXPECT_TRUE(win.actions()->action("extrude")->isEnabled()) << "a document is open";
+    EXPECT_EQ(win.actions()->action("extrude")->toolTip().toStdString().find("coming soon"), std::string::npos);
+    ASSERT_NE(win.actions()->action("measure"), nullptr);
+    EXPECT_TRUE(win.actions()->action("measure")->isEnabled()) << "Measure is implemented (inspect module)";
+    EXPECT_EQ(win.actions()->action("measure")->toolTip().toStdString().find("coming soon"), std::string::npos);
     EXPECT_TRUE(win.actions()->action("import")->isEnabled());
     EXPECT_FALSE(win.actions()->action("undo")->isEnabled());
     EXPECT_EQ(ribbon->quickAccessIds(), (std::vector<std::string>{"undo", "redo"}));
@@ -684,11 +689,11 @@ TEST(UiShellWindow, RibbonShowsTabsGroupsAndDisabledPlaceholders) {
 
 TEST(UiShellWindow, UndoActionFollowsTheDocumentAndEditMenuRuns) {
     MainWindow win;
-    ASSERT_TRUE(editParameters(win.document(), "Add d1", [](ParameterTable& t) { return t.add("d1", "5 mm"); }));
+    ASSERT_TRUE((*win.model()).addParameter("d1", "5 mm"));
     win.actions()->refresh();
     EXPECT_TRUE(win.actions()->action("undo")->isEnabled());
     win.actions()->action("undo")->trigger();
-    EXPECT_EQ(win.document().params.find("d1"), nullptr);
+    EXPECT_EQ(win.model()->parameters().find("d1"), nullptr);
     win.actions()->refresh();
     EXPECT_TRUE(win.actions()->action("redo")->isEnabled());
 }

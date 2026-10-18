@@ -19,14 +19,16 @@ namespace iw {
 class JobSystem;
 }
 
-namespace iw::ui {
+namespace iw::features {
+class Document;
+}
 
-struct DocumentState;
+namespace iw::ui {
 
 /// What a command can reach when it starts: the document and a few shell hooks. The shell fills it in.
 struct CommandContext {
     QWidget* parent = nullptr;
-    DocumentState* doc = nullptr;
+    features::Document* doc = nullptr;            ///< The open document (nullptr: none). Owns the undo stack.
     JobSystem* jobs = nullptr;                    ///< Background work for previews.
     std::function<void()> importFile;             ///< Insert > Import: opens the file dialog.
     std::function<void(QWidget*)> showPanel;      ///< Docks a command dialog on the right (takes ownership).
@@ -38,6 +40,7 @@ struct CommandContext {
 struct Command {
     std::string id;                   ///< Stable key, e.g. "extrude". Never shown to the user.
     QString label;                    ///< Translated display name.
+    QString shortLabel;               ///< Short ribbon label ("Parameters"); empty = use label.
     QString tooltip;                  ///< Optional extra text.
     std::string icon;                 ///< Freedesktop theme icon name (may be missing -> text only).
     QKeySequence shortcut;            ///< Default shortcut; the user may remap it (see CommandRegistry).

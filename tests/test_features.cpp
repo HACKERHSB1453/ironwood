@@ -4,6 +4,7 @@
 // polygon format, the registry and io round trips.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -920,6 +921,150 @@ TEST(FeaturesHole, BadThreadDesignationFails) {
     auto r = ev.evaluate(tl);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->statuses[1].state, FeatureStatus::State::Failed);
+}
+
+namespace {
+
+/// 20 x 20 x `height` box (feature 1) with a counterbore hole in its top face (feature 2).
+struct CbHole {
+    std::shared_ptr<Feature> box;
+    HoleParams hp;
+};
+
+CbHole makeCbHole(double height = 10, double u = 10, double v = 10) {
+    CbHole c;
+    c.box = feat(1, boxParams(0, 0, 20, 20, height, kB1));
+    Timeline tl;
+    tl.append(c.box);
+    EvalResult base = evalAllOk(tl);
+    const std::uint32_t top = faceIndexOf(base, kB1, {0, 0, 1}, height);
+    c.hp.body = kB1;
+    c.hp.face = *boxFace(base, kB1, {0, 0, 1}, height);
+    auto [pu, pv] = faceUV(base.bodies.at(kB1), top, {u, v, height});
+    c.hp.u = mm(pu);
+    c.hp.v = mm(pv);
+    c.hp.kind = kernel::HoleKind::Counterbore;
+    c.hp.diameter = "4 mm";
+    c.hp.depth = "8 mm";
+    c.hp.counterboreDiameter = "8 mm";
+    c.hp.counterboreDepth = "3 mm";
+    return c;
+}
+
+double parseFloat(const std::string& text) { return std::stod(text); }
+
+/// Every name owned by feature `f` in body 1's naming map, as text.
+std::set<std::string> namesOwnedBy(const EvalResult& r, std::uint64_t f) {
+    std::set<std::string> out;
+    const auto& m = r.namings.at(kB1);
+    for (auto t : {ElementType::Face, ElementType::Edge, ElementType::Vertex})
+        for (std::uint32_t i = 0; i < m.size(t); ++i)
+            if (auto n = m.nameOf(t, i); n && n->feature.value() == f) out.insert(n->toString());
+    return out;
+}
+
+/// The rim edge of the counterbore on the top face: a circle of radius 4 at z = `top`.
+std::optional<ElementRef> counterboreRim(const EvalResult& r, double top) {
+    return refWhere(r, kB1, ElementType::Edge, [&](const std::array<double, 4>& k) {
+        return near(k[2], top) && near(k[3], 2.0 * kPi * 4.0, 1e-6);
+    });
+}
+
+EvalResult evalCbHole(const CbHole& c, const HoleParams& hp, const std::shared_ptr<Feature>& box = nullptr) {
+    Timeline tl;
+    tl.append(box ? box : c.box);
+    tl.append(std::make_shared<HoleFeature>(FeatureId{2}, hp));
+    return evalAllOk(tl);
+}
+
+} // namespace
+
+TEST(FeaturesHole, ElementsAreNamedByRoleAndEveryRoleIsPresent) {
+    const CbHole c = makeCbHole();
+    const EvalResult r = evalCbHole(c, c.hp);
+    const auto names = namesOwnedBy(r, 2);
+    auto has = [&](const std::string& part) {
+        return std::any_of(names.begin(), names.end(), [&](const std::string& n) { return n.find(part) != std::string::npos; });
+    };
+    for (const char* role : {"holetool.wall", "holetool.cbore_wall", "holetool.cbore_floor", "holetool.drill_cone"})
+        EXPECT_TRUE(has(role)) << role;
+    // The names carry no geometric ordinals: every hole face / edge of this simple hole has ordinal 0.
+    const auto& m = r.namings.at(kB1);
+    for (auto t : {ElementType::Face, ElementType::Edge})
+        for (std::uint32_t i = 0; i < m.size(t); ++i) {
+            auto n = m.nameOf(t, i);
+            if (n && n->feature.value() == 2 && n->op.rfind("holetool", 0) == 0) {
+                EXPECT_EQ(n->ordinal, 0u) << n->toString();
+            }
+        }
+}
+
+TEST(FeaturesHole, NamesAreStableUnderDiameterPositionDepthAndUpstreamEdits) {
+    const CbHole c = makeCbHole();
+    const EvalResult base = evalCbHole(c, c.hp);
+    const auto baseNames = namesOwnedBy(base, 2);
+    ASSERT_GT(baseNames.size(), 8u);
+
+    HoleParams dia = c.hp;
+    dia.diameter = "5 mm";
+    EXPECT_EQ(namesOwnedBy(evalCbHole(c, dia), 2), baseNames) << "diameter edit";
+
+    HoleParams pos = c.hp;
+    pos.u = mm(parseFloat(pos.u) + 2.0);
+    pos.v = mm(parseFloat(pos.v) - 3.0);
+    EXPECT_EQ(namesOwnedBy(evalCbHole(c, pos), 2), baseNames) << "position edit";
+
+    HoleParams depth = c.hp;
+    depth.depth = "8.5 mm";
+    EXPECT_EQ(namesOwnedBy(evalCbHole(c, depth), 2), baseNames) << "depth edit";
+
+    HoleParams cb = c.hp;
+    cb.counterboreDiameter = "9 mm";
+    cb.counterboreDepth = "2 mm";
+    EXPECT_EQ(namesOwnedBy(evalCbHole(c, cb), 2), baseNames) << "counterbore edit";
+
+    // Upstream: a taller box moves the top face; the hole keeps its (u, v) on it.
+    const CbHole tall = makeCbHole(14);
+    EXPECT_EQ(namesOwnedBy(evalCbHole(c, c.hp, feat(1, boxParams(0, 0, 20, 20, 14, kB1))), 2), baseNames) << "box height";
+    (void)tall;
+}
+
+TEST(FeaturesHole, FilletOfTheRimSurvivesHoleAndUpstreamEdits) {
+    const CbHole c = makeCbHole();
+    const EvalResult base = evalCbHole(c, c.hp);
+    auto rim = counterboreRim(base, 10);
+    ASSERT_TRUE(rim.has_value());
+    EXPECT_EQ(rim->name.op, "hole.edge");
+
+    auto withFillet = [&](const HoleParams& hp, double height) {
+        Timeline tl;
+        tl.append(feat(1, boxParams(0, 0, 20, 20, height, kB1)));
+        tl.append(std::make_shared<HoleFeature>(FeatureId{2}, hp));
+        tl.append(fillet(3, *rim, "0.5 mm"));
+        Evaluator ev;
+        auto r = ev.evaluate(tl);
+        EXPECT_TRUE(r.has_value());
+        return r ? r->statuses[2] : FeatureStatus{};
+    };
+    EXPECT_EQ(withFillet(c.hp, 10).state, FeatureStatus::State::Ok);
+
+    HoleParams dia = c.hp;
+    dia.diameter = "5 mm";
+    dia.counterboreDiameter = "9 mm"; // the rim is the counterbore circle: it must still exist under the same name
+    EXPECT_EQ(withFillet(dia, 10).state, FeatureStatus::State::Ok) << withFillet(dia, 10).error.message;
+
+    HoleParams pos = c.hp;
+    pos.u = mm(parseFloat(pos.u) + 2.0);
+    pos.v = mm(parseFloat(pos.v) - 3.0);
+    EXPECT_EQ(withFillet(pos, 10).state, FeatureStatus::State::Ok) << withFillet(pos, 10).error.message;
+
+    HoleParams depth = c.hp;
+    depth.depth = "8.5 mm";
+    EXPECT_EQ(withFillet(depth, 10).state, FeatureStatus::State::Ok) << withFillet(depth, 10).error.message;
+
+    // A taller box: the hole is placed on the (moved) top face with the same u, v.
+    HoleParams tallHole = c.hp;
+    EXPECT_EQ(withFillet(tallHole, 14).state, FeatureStatus::State::Ok) << withFillet(tallHole, 14).error.message;
 }
 
 TEST(FeaturesMove, MoveTranslatesAndRotatesTheBody) {

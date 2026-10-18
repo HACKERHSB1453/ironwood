@@ -35,8 +35,10 @@ struct Scenario {
 };
 
 struct ScenarioConfig {
-    int maxFeatures = 4; ///< Upper bound on timeline length at any point of a scenario.
+    int maxFeatures = 6; ///< Upper bound on timeline length at any point of a scenario.
     int maxSteps = 6;    ///< Upper bound on the number of edits per scenario.
+    /// F27 probe: the base timeline starts with a body, a hole in it and a fillet/chamfer of the hole's edges.
+    bool holeFocus = false;
 };
 
 /// Builds a scenario deterministically from `seed`. Generators are chosen uniformly among those registered.

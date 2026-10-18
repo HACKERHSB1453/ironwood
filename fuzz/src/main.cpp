@@ -21,6 +21,7 @@ void usage(std::FILE* f) {
     std::fprintf(f,
                  "usage: ironwood-fuzz-naming [--seed N] [--scenarios N] [--max-features N] [--max-steps N]\n"
                  "                            [--time-budget SECONDS] [--nightly] [--replay-seed S] [--json PATH]\n"
+                 "                            [--trace] [--no-isolate] [--f27] [--explain]  (with --replay-seed: dump names, geometry and predictions)\n"
                  "  --seed N           master seed (default 1); scenario i uses deriveSeed(N, i)\n"
                  "  --scenarios N      number of scenarios (default 200; --nightly sets 5000)\n"
                  "  --max-features N   timeline length bound (default 4)\n"
@@ -52,7 +53,9 @@ bool parseDouble(const char* s, double& out) {
 
 int main(int argc, char** argv) {
     iw::fuzz::FuzzConfig cfg;
+    cfg.isolate = true;
     const char* jsonPath = nullptr;
+    bool explain = false;
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -78,6 +81,14 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(a, "--replay-seed") == 0) {
             if (!parseU64(next(), cfg.replaySeed)) return usage(stderr), 2;
             cfg.replaySingle = true;
+        } else if (std::strcmp(a, "--f27") == 0) {
+            cfg.scenario.holeFocus = true;
+        } else if (std::strcmp(a, "--no-isolate") == 0) {
+            cfg.isolate = false;
+        } else if (std::strcmp(a, "--trace") == 0) {
+            cfg.trace = true;
+        } else if (std::strcmp(a, "--explain") == 0) {
+            explain = true;
         } else if (std::strcmp(a, "--json") == 0) {
             jsonPath = next();
             if (!jsonPath) return usage(stderr), 2;
@@ -92,6 +103,13 @@ int main(int argc, char** argv) {
     }
 
     const auto registry = iw::fuzz::GeneratorRegistry::defaults();
+    if (explain) {
+        const auto sc = iw::fuzz::generateScenario(cfg.replaySeed, registry, cfg.scenario);
+        std::printf("%s", iw::fuzz::describe(sc).c_str());
+        std::fflush(stdout);
+        std::printf("%s", iw::fuzz::explainScenario(sc, registry).c_str());
+        return 0;
+    }
     const auto summary = iw::fuzz::runFuzz(cfg, registry);
     const std::string json = iw::fuzz::toJson(cfg, summary);
 

@@ -76,6 +76,7 @@ const char* constraintName(ConstraintKind k) {
     case ConstraintKind::Collinear: return "collinear";
     case ConstraintKind::Symmetric: return "symmetric";
     case ConstraintKind::Fix: return "fix";
+    case ConstraintKind::PointOnObject: return "point_on_object";
     }
     return "coincident";
 }
@@ -84,7 +85,8 @@ Result<ConstraintKind> constraintFrom(const std::string& s) {
     static const ConstraintKind all[] = {ConstraintKind::Coincident, ConstraintKind::Horizontal, ConstraintKind::Vertical,
                                          ConstraintKind::Parallel,   ConstraintKind::Perpendicular, ConstraintKind::Tangent,
                                          ConstraintKind::Equal,      ConstraintKind::Concentric, ConstraintKind::Midpoint,
-                                         ConstraintKind::Collinear,  ConstraintKind::Symmetric,  ConstraintKind::Fix};
+                                         ConstraintKind::Collinear,  ConstraintKind::Symmetric,  ConstraintKind::Fix,
+                                         ConstraintKind::PointOnObject};
     for (ConstraintKind k : all)
         if (s == constraintName(k)) return k;
     return makeError(ErrorCode::ParseError, "sketch: unknown constraint kind '" + s + "'");
@@ -201,6 +203,8 @@ Result<json> toJson(const sketch::Sketch& sk) {
         j["kind"] = dimensionName(d.kind);
         j["refs"] = refsToJson(d.refs);
         j["expression"] = d.expression;
+        // Written only when set, so sketches without reference dimensions keep their exact previous form.
+        if (d.driven) j["driven"] = true;
         dimensions.push_back(std::move(j));
     }
     out["dimensions"] = std::move(dimensions);
@@ -289,8 +293,14 @@ Result<Sketch> fromJson(const json& j) {
         if (!kind) return std::unexpected(kind.error());
         auto refs = refsFromJson(d["refs"]);
         if (!refs) return std::unexpected(refs.error());
+        // "driven" is optional (absent = false), so sketches written before reference dimensions load unchanged.
+        bool driven = false;
+        if (auto it = d.find("driven"); it != d.end()) {
+            if (!it->is_boolean()) return makeError(ErrorCode::ParseError, "sketch: dimension 'driven' must be a boolean");
+            driven = it->get<bool>();
+        }
         auto restored = sk.restoreDimension(sketch::SketchDimensionId{d["id"].get<std::uint64_t>()}, *kind, *refs,
-                                            d["expression"].get<std::string>());
+                                            d["expression"].get<std::string>(), driven);
         if (!restored) return makeError(ErrorCode::ParseError, "sketch: " + restored.error().message);
     }
 

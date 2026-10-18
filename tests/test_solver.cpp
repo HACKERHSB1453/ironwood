@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <numbers>
 #include <vector>
 
 #include "sketch/solver/sketch_solver.hpp"
@@ -326,6 +327,293 @@ TEST(SketchSolver, LargeGridSolvesAfterSingleDimensionEdit)
 #endif
     EXPECT_NEAR(pointById(solver.sketch(), pid(0, 1)).x, 12.0, 1e-5);
     EXPECT_NEAR(pointById(solver.sketch(), pid(0, kN - 1)).x, 12.0 + 10.0 * (kN - 2), 1e-4);
+}
+
+// ---- F20: solver-level tests for the constraint kinds the UI exercises, plus PointOnObject (F29) ----
+
+TEST(SketchSolver, CoincidentMovesSecondPointOntoFirst)
+{
+    constexpr SolverId kA = 501, kB = 502;
+    SolverSketch s;
+    s.points = {{kA, 5.0, 5.0}, {kB, 1.0, 2.0}};
+    s.constraints = {
+        con(10, SolverConstraintKind::Fix, {ref(kA)}),
+        con(11, SolverConstraintKind::Coincident, {ref(kA), ref(kB)}),
+    };
+    SketchSolver solver(s);
+    EXPECT_EQ(solver.dof(), 0);
+    const SolverResult r = solver.solve();
+    ASSERT_EQ(r.status, SolverStatus::Solved) << r.message;
+    EXPECT_NEAR(pointById(solver.sketch(), kB).x, 5.0, kTol);
+    EXPECT_NEAR(pointById(solver.sketch(), kB).y, 5.0, kTol);
+}
+
+TEST(SketchSolver, ParallelMakesSecondLineMatchFirstDirection)
+{
+    constexpr SolverId kA = 511, kB = 512, kC = 513, kD = 514, kL1 = 515, kL2 = 516;
+    SolverSketch s;
+    s.points = {{kA, 0.0, 0.0}, {kB, 10.0, 0.0}, {kC, 1.0, 5.0}, {kD, 8.0, 9.0}};
+    s.lines = {{kL1, kA, kB}, {kL2, kC, kD}};
+    s.constraints = {
+        con(20, SolverConstraintKind::Fix, {ref(kA)}),
+        con(21, SolverConstraintKind::Fix, {ref(kB)}),
+        con(22, SolverConstraintKind::Fix, {ref(kC)}),
+        con(23, SolverConstraintKind::Parallel, {ref(kL1), ref(kL2)}),
+    };
+    SketchSolver solver(s);
+    const SolverResult r = solver.solve();
+    ASSERT_EQ(r.status, SolverStatus::Solved) << r.message;
+    // Line 2 keeps its start; its end moves onto the horizontal direction of line 1.
+    EXPECT_NEAR(pointById(solver.sketch(), kD).y, 5.0, kTol);
+}
+
+TEST(SketchSolver, EqualLengthLinesAndEqualRadiiCircles)
+{
+    constexpr SolverId kA = 521, kB = 522, kC = 523, kD = 524, kL1 = 525, kL2 = 526;
+    constexpr SolverId kCenter1 = 527, kCenter2 = 528, kCirc1 = 529, kCirc2 = 530;
+    SolverSketch s;
+    s.points = {{kA, 0.0, 0.0}, {kB, 10.0, 0.0}, {kC, 0.0, 5.0}, {kD, 3.0, 5.5},
+                {kCenter1, 0.0, 0.0}, {kCenter2, 20.0, 0.0}};
+    s.lines = {{kL1, kA, kB}, {kL2, kC, kD}};
+    s.circles = {{kCirc1, kCenter1, 4.0}, {kCirc2, kCenter2, 7.0}};
+    s.constraints = {
+        con(30, SolverConstraintKind::Fix, {ref(kA)}),
+        con(31, SolverConstraintKind::Fix, {ref(kB)}),
+        con(32, SolverConstraintKind::Fix, {ref(kC)}),
+        con(33, SolverConstraintKind::Equal, {ref(kL1), ref(kL2)}),
+        con(34, SolverConstraintKind::Fix, {ref(kCenter1)}),
+        con(35, SolverConstraintKind::Fix, {ref(kCenter2)}),
+        con(36, SolverConstraintKind::Equal, {ref(kCirc1), ref(kCirc2)}),
+        con(37, SolverConstraintKind::Radius, {ref(kCirc1)}, 4.0),
+    };
+    SketchSolver solver(s);
+    const SolverResult r = solver.solve();
+    ASSERT_EQ(r.status, SolverStatus::Solved) << r.message;
+    const SolverSketch& out = solver.sketch();
+    const SolverPoint& c = pointById(out, kC);
+    const SolverPoint& d = pointById(out, kD);
+    EXPECT_NEAR(std::hypot(d.x - c.x, d.y - c.y), 10.0, 1e-5);
+    EXPECT_NEAR(out.circles[1].radius, 4.0, 1e-5);
+}
+
+TEST(SketchSolver, ConcentricCirclesShareCentre)
+{
+    constexpr SolverId kCen1 = 543, kCen2 = 544, kCirc1 = 545, kCirc2 = 546;
+    SolverSketch s;
+    s.points = {{kCen1, 0.0, 0.0}, {kCen2, 2.0, 3.0}};
+    s.circles = {{kCirc1, kCen1, 5.0}, {kCirc2, kCen2, 2.0}};
+    s.constraints = {
+        con(40, SolverConstraintKind::Fix, {ref(kCen1)}),
+        con(41, SolverConstraintKind::Concentric, {ref(kCirc1), ref(kCirc2)}),
+        con(42, SolverConstraintKind::Radius, {ref(kCirc2)}, 2.0),
+        con(43, SolverConstraintKind::Radius, {ref(kCirc1)}, 5.0),
+    };
+    SketchSolver solver(s);
+    const SolverResult r = solver.solve();
+    ASSERT_EQ(r.status, SolverStatus::Solved) << r.message;
+    EXPECT_NEAR(pointById(solver.sketch(), kCen2).x, 0.0, kTol);
+    EXPECT_NEAR(pointById(solver.sketch(), kCen2).y, 0.0, kTol);
+}
+
+TEST(SketchSolver, CollinearPullsBothEndsOntoReferenceLine)
+{
+    constexpr SolverId kA = 551, kB = 552, kC = 553, kD = 554, kL1 = 555, kL2 = 556;
+    SolverSketch s;
+    s.points = {{kA, 0.0, 0.0}, {kB, 10.0, 0.0}, {kC, 2.0, 1.0}, {kD, 7.0, 4.0}};
+    s.lines = {{kL1, kA, kB}, {kL2, kC, kD}};
+    s.constraints = {
+        con(50, SolverConstraintKind::Fix, {ref(kA)}),
+        con(51, SolverConstraintKind::Fix, {ref(kB)}),
+        con(52, SolverConstraintKind::Collinear, {ref(kL2), ref(kL1)}),
+        con(53, SolverConstraintKind::DistanceX, {ref(kC), ref(kD)}, 5.0),
+    };
+    SketchSolver solver(s);
+    const SolverResult r = solver.solve();
+    ASSERT_EQ(r.status, SolverStatus::Solved) << r.message;
+    EXPECT_NEAR(pointById(solver.sketch(), kC).y, 0.0, kTol);
+    EXPECT_NEAR(pointById(solver.sketch(), kD).y, 0.0, kTol);
+    EXPECT_NEAR(pointById(solver.sketch(), kD).x - pointById(solver.sketch(), kC).x, 5.0, kTol);
+}
+
+TEST(SketchSolver, SymmetricAboutLineAndAboutPoint)
+{
+    constexpr SolverId kA = 561, kB = 562, kAx0 = 563, kAx1 = 564, kAxis = 565;
+    constexpr SolverId kM = 566, kP = 567, kQ = 568;
+    SolverSketch s;
+    s.points = {{kA, 3.0, 4.0}, {kB, -2.0, 6.0}, {kAx0, 0.0, -10.0}, {kAx1, 0.0, 10.0},
+                {kM, 1.0, 1.0}, {kP, 0.5, -0.5}, {kQ, 9.0, 9.0}};
+    s.lines = {{kAxis, kAx0, kAx1}};
+    s.constraints = {
+        con(60, SolverConstraintKind::Fix, {ref(kA)}),
+        con(61, SolverConstraintKind::Fix, {ref(kAx0)}),
+        con(62, SolverConstraintKind::Fix, {ref(kAx1)}),
+        con(63, SolverConstraintKind::Symmetric, {ref(kA), ref(kB), ref(kAxis)}),
+    };
+    SketchSolver solver(s);
+    const SolverResult r = solver.solve();
+    ASSERT_EQ(r.status, SolverStatus::Solved) << r.message;
+    EXPECT_TRUE(r.diagnostics.conflicting.empty());
+    EXPECT_EQ(r.diagnostics.dof, 6);   // only the three loose points M, P, Q remain free
+    const SolverSketch& out = solver.sketch();
+    EXPECT_NEAR(pointById(out, kB).x, -3.0, kTol);  // mirror of (3, 4) across the y axis
+    EXPECT_NEAR(pointById(out, kB).y, 4.0, kTol);
+}
+
+TEST(SketchSolver, SymmetricAboutPoint)
+{
+    constexpr SolverId kM = 566, kP = 567, kQ = 568;
+    SolverSketch s;
+    s.points = {{kM, 1.0, 1.0}, {kP, 0.5, -0.5}, {kQ, 9.0, 9.0}};
+    s.constraints = {
+        con(64, SolverConstraintKind::Fix, {ref(kP)}),
+        con(65, SolverConstraintKind::Fix, {ref(kM)}),
+        con(66, SolverConstraintKind::Symmetric, {ref(kP), ref(kQ), ref(kM)}),
+    };
+    SketchSolver solver(s);
+    const SolverResult r = solver.solve();
+    ASSERT_EQ(r.status, SolverStatus::Solved) << r.message;
+    // Q is the reflection of P through M.
+    EXPECT_NEAR(pointById(solver.sketch(), kQ).x, 1.5, kTol);
+    EXPECT_NEAR(pointById(solver.sketch(), kQ).y, 2.5, kTol);
+}
+
+TEST(SketchSolver, AngleBetweenLinesIsEnforced)
+{
+    constexpr SolverId kA = 571, kB = 572, kC = 573, kD = 574, kL1 = 575, kL2 = 576;
+    SolverSketch s;
+    s.points = {{kA, 0.0, 0.0}, {kB, 10.0, 0.0}, {kC, 0.0, 0.0}, {kD, 3.0, 3.0}};
+    s.lines = {{kL1, kA, kB}, {kL2, kC, kD}};
+    s.constraints = {
+        con(70, SolverConstraintKind::Fix, {ref(kA)}),
+        con(71, SolverConstraintKind::Fix, {ref(kB)}),
+        con(72, SolverConstraintKind::Fix, {ref(kC)}),
+        con(73, SolverConstraintKind::Distance, {ref(kC), ref(kD)}, 5.0),
+        con(74, SolverConstraintKind::Angle, {ref(kL1), ref(kL2)}, 30.0),
+    };
+    SketchSolver solver(s);
+    const SolverResult r = solver.solve();
+    ASSERT_EQ(r.status, SolverStatus::Solved) << r.message;
+    const SolverPoint& d = pointById(solver.sketch(), kD);
+    EXPECT_NEAR(std::atan2(d.y, d.x) * 180.0 / std::numbers::pi, 30.0, 1e-5);
+    EXPECT_NEAR(std::hypot(d.x, d.y), 5.0, 1e-5);
+}
+
+TEST(SketchSolver, DiameterSetsCircleRadiusHalfOfValue)
+{
+    constexpr SolverId kCen = 581, kCirc = 582;
+    SolverSketch s;
+    s.points = {{kCen, 1.0, 1.0}};
+    s.circles = {{kCirc, kCen, 3.0}};
+    s.constraints = {
+        con(80, SolverConstraintKind::Fix, {ref(kCen)}),
+        con(81, SolverConstraintKind::Diameter, {ref(kCirc)}, 12.0),
+    };
+    SketchSolver solver(s);
+    EXPECT_EQ(solver.dof(), 0);
+    const SolverResult r = solver.solve();
+    ASSERT_EQ(r.status, SolverStatus::Solved) << r.message;
+    EXPECT_NEAR(solver.sketch().circles[0].radius, 6.0, kTol);
+}
+
+TEST(SketchSolver, PointOnLineCircleAndArc)
+{
+    constexpr SolverId kLA = 591, kLB = 592, kLine = 593;
+    constexpr SolverId kP1 = 594, kP2 = 595, kP3 = 596;
+    constexpr SolverId kCen = 597, kCirc = 598, kArcCen = 599, kArc = 600;
+    constexpr SolverId kArcStart = 601, kArcEnd = 602;
+    SolverSketch s;
+    s.points = {{kLA, 0.0, 0.0},     {kLB, 10.0, 0.0},    {kP1, 3.0, 2.0},     {kP2, 3.0, 4.0},
+                {kP3, 6.0, 1.0},     {kCen, 0.0, 0.0},    {kArcCen, 20.0, 0.0}, {kArcStart, 22.0, 0.5},
+                {kArcEnd, 19.5, 2.2}};
+    s.lines = {{kLine, kLA, kLB}};
+    s.circles = {{kCirc, kCen, 5.0}};
+    s.arcs = {{kArc, kArcCen, kArcStart, kArcEnd}};
+    s.constraints = {
+        con(90, SolverConstraintKind::Fix, {ref(kLA)}),
+        con(91, SolverConstraintKind::Fix, {ref(kLB)}),
+        con(92, SolverConstraintKind::Fix, {ref(kCen)}),
+        con(93, SolverConstraintKind::Radius, {ref(kCirc)}, 5.0),
+        con(94, SolverConstraintKind::PointOnObject, {ref(kP1), ref(kLine)}),
+        con(95, SolverConstraintKind::PointOnObject, {ref(kP2), ref(kCirc)}),
+        con(96, SolverConstraintKind::PointOnObject, {ref(kP3), ref(kArc)}),
+        con(97, SolverConstraintKind::Fix, {ref(kArcCen)}),
+        con(98, SolverConstraintKind::Radius, {ref(kArc)}, 2.0),
+    };
+    SketchSolver solver(s);
+    const SolverResult r = solver.solve();
+    ASSERT_EQ(r.status, SolverStatus::Solved) << r.message;
+    const SolverSketch& out = solver.sketch();
+    EXPECT_NEAR(pointById(out, kP1).y, 0.0, kTol);  // on the line (the x axis)
+    EXPECT_NEAR(std::hypot(pointById(out, kP2).x, pointById(out, kP2).y), 5.0, 1e-5);  // on the circle
+    const SolverPoint& p3 = pointById(out, kP3);
+    EXPECT_NEAR(std::hypot(p3.x - 20.0, p3.y), 2.0, 1e-5);  // on the arc's circle
+}
+
+TEST(SketchSolver, PointOnObjectRejectsPointAsCurve)
+{
+    SolverSketch s = rectangle();
+    s.constraints = {con(1, SolverConstraintKind::PointOnObject, {ref(kP0), ref(kP1)})};
+    EXPECT_EQ(SketchSolver(s).solve().status, SolverStatus::InvalidInput);
+}
+
+// Drag timing (F29 / B3b): a 200-entity sketch (100 points + 100 lines) on a 10x10 grid with horizontal rows,
+// vertical first-column edges, one diagonal line, and a fixed origin. Each drag step must stay under 16 ms in
+// release builds. The first drag step builds the drag model and is not part of the budget.
+TEST(SketchSolver, DragStepUnder16msFor200EntitySketch)
+{
+    constexpr int kN = 10;
+    SolverSketch s;
+    auto pid = [](int i, int j) { return static_cast<SolverId>(1000 + i * kN + j); };
+    auto lid = [](int k) { return static_cast<SolverId>(100000 + k); };
+    for (int i = 0; i < kN; ++i) {
+        for (int j = 0; j < kN; ++j) {
+            const double jitter = 0.03 * std::sin(2.0 * i + 5.0 * j);
+            s.points.push_back({pid(i, j), 10.0 * j + jitter, 10.0 * i - jitter});
+        }
+    }
+    SolverId cid = 1;
+    int lineCount = 0;
+    for (int i = 0; i < kN; ++i) {  // 90 horizontal edges
+        for (int j = 0; j + 1 < kN; ++j) {
+            s.lines.push_back({lid(lineCount), pid(i, j), pid(i, j + 1)});
+            s.constraints.push_back(con(cid++, SolverConstraintKind::Horizontal, {ref(lid(lineCount))}));
+            ++lineCount;
+        }
+    }
+    for (int i = 0; i + 1 < kN; ++i) {  // 9 vertical edges in the first column
+        s.lines.push_back({lid(lineCount), pid(i, 0), pid(i + 1, 0)});
+        s.constraints.push_back(con(cid++, SolverConstraintKind::Vertical, {ref(lid(lineCount))}));
+        ++lineCount;
+    }
+    // One diagonal line (unconstrained) brings the entity count to 200.
+    s.lines.push_back({lid(lineCount), pid(0, 0), pid(1, 1)});
+    ++lineCount;
+    s.constraints.push_back(con(cid++, SolverConstraintKind::Fix, {ref(pid(0, 0))}));
+    ASSERT_EQ(s.points.size() + s.lines.size(), 200u);
+
+    SketchSolver solver(s);
+    ASSERT_EQ(solver.solve().status, SolverStatus::Solved);
+
+    const SolverRef corner = ref(pid(kN - 1, kN - 1));
+    ASSERT_EQ(solver.dragPoint(corner, 95.0, 92.0).status, SolverStatus::Solved);
+    double worstMs = 0.0;
+    for (int step = 1; step <= 60; ++step) {
+        const double t = step / 60.0;
+        const double x = 95.0 + 5.0 * std::sin(6.0 * t);
+        const double y = 92.0 + 3.0 * t;
+        const auto t0 = std::chrono::steady_clock::now();
+        const SolverResult r = solver.dragPoint(corner, x, y);
+        const auto t1 = std::chrono::steady_clock::now();
+        ASSERT_EQ(r.status, SolverStatus::Solved) << r.message;
+        worstMs = std::max(worstMs, std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    RecordProperty("drag_worst_ms", std::to_string(worstMs));
+    // Acceptance budget is for release builds only; the debug build still checks the result.
+#ifdef NDEBUG
+    EXPECT_LT(worstMs, 16.0);
+#endif
+    // Horizontal rows stay horizontal after the drag.
+    EXPECT_NEAR(pointById(solver.sketch(), pid(kN - 1, 0)).y, pointById(solver.sketch(), pid(kN - 1, 9)).y, 1e-6);
 }
 
 }  // namespace iw::sketch

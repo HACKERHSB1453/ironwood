@@ -2,7 +2,10 @@
 #include "ui/command_actions.hpp"
 
 #include <QAction>
-#include <QIcon>
+#include <QGuiApplication>
+#include <QPalette>
+
+#include "ui/icons.hpp"
 
 namespace iw::ui {
 
@@ -11,7 +14,8 @@ CommandActions::CommandActions(CommandRegistry& registry, CommandContext& ctx, Q
     for (const Command& c : registry_.all()) {
         auto* a = new QAction(c.label, this);
         a->setObjectName(QString::fromStdString("cmd_" + c.id));
-        if (!c.icon.empty()) a->setIcon(QIcon::fromTheme(QString::fromStdString(c.icon)));
+        // Ironwood's own icon set (ui::icon), drawn for the current palette; the ribbon re-sets it at ribbon size.
+        if (!c.icon.empty()) a->setIcon(icon(c.icon, 24, iconThemeFor(QGuiApplication::palette())));
         actions_[c.id] = a;
         const std::string id = c.id;
         connect(a, &QAction::triggered, this, [this, id] { run(id); });

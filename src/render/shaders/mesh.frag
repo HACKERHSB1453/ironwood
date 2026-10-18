@@ -3,16 +3,20 @@
 layout(std140, binding = 0) uniform Buf {
     mat4 mvp;
     mat4 mv;
-    vec4 ids;   // x = body id + 1, y = hover face, z = hover edge, w = selected face (-1 = none)
-    vec4 ids2;  // x = selected edge (-1 = none), y = +1/-1 clip-space y direction of the backend, z = body selected
-    vec4 color; // rgb = body surface colour
+    vec4 ids;   // x = body id + 1 (overlays: overlay id + 1), y = hover face, z = hover edge, w = selected face (-1 = none)
+    vec4 ids2;  // x = selected edge (-1 = none), y = +1/-1 clip-space y direction of the backend (background)
+    vec4 color; // rgb = body surface colour (overlays / caps: rgba)
+    vec4 clip;  // section plane in object space: xyz = normal, w = offset; kept side is dot >= 0
+    vec4 sec;   // x = 1 when the section clip is active
 } ubuf;
 layout(location = 0) in vec3 vNormal;
 layout(location = 1) flat in float vFace;
 layout(location = 2) in float vViewZ;
+layout(location = 3) in float vClip;
 layout(location = 0) out vec4 fragColor;
 
 void main() {
+    if (ubuf.sec.x > 0.5 && vClip < 0.0) discard;   // section: clipped half is gone (also for picking)
     vec3 n = normalize(vNormal);
     if (n.z < 0.0) n = -n;   // two-sided shading
     float key = max(dot(n, normalize(vec3(-0.35, 0.55, 0.75))), 0.0);

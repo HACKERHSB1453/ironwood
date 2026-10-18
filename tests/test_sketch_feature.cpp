@@ -13,6 +13,7 @@
 #include "features/edge_features.hpp"
 #include "features/extrude_feature.hpp"
 #include "features/sketch_feature.hpp"
+#include "features/sketch_json.hpp"
 #include "kernel/ops.hpp"
 #include "sketch/profile.hpp"
 #include "sketch/solver/bridge.hpp"
@@ -306,4 +307,58 @@ TEST(SketchFeature, ParametersRoundTripThroughJson) {
     ASSERT_TRUE(again.has_value()) << again.error().message;
     EXPECT_EQ((*again)->paramsJson(), f.paramsJson());
     EXPECT_EQ((*again)->parameterReferences(), (std::vector<std::string>{"h", "w"}));
+}
+
+// ---- W2a: driven (reference) dimensions ----------------------------------------------------------------------------
+
+TEST(SketchFeature, DrivenDimensionIsMeasuredNeverSolved) {
+    // Rect is 40 x 20 on its geometry; DistanceX is a reference of 99 mm, so the solver must not move the width.
+    Rect r = makeRect("99 mm", "20 mm");
+    const sketch::SketchDimensionId dimX = r.sk.dimensions().begin()->first;
+    ASSERT_TRUE(r.sk.setDimensionDriven(dimX, true).has_value());
+
+    Document d;
+    const FeatureId skId = d.allocateFeatureId();
+    mustVoid(d.addFeature(sketchFeature(skId, r.sk)));
+    DocumentEvaluation ev = evalOk(d);
+    const sketch::Sketch& solved = ev.sketches.at(skId).sketch;
+    const auto& bottom = std::get<sketch::LineGeom>(solved.findEntity(r.bottom)->geometry);
+    EXPECT_NEAR(bottom.end.x - bottom.start.x, 40.0, 1e-6) << "the reference dimension must not drive the geometry";
+
+    const FeatureStatus* st = statusOf(ev, skId);
+    ASSERT_NE(st, nullptr);
+    ASSERT_EQ(st->attributes.count("driven." + std::to_string(dimX.value())), 1u);
+    EXPECT_NEAR(std::stod(st->attributes.at("driven." + std::to_string(dimX.value()))), 40.0, 1e-6);
+    EXPECT_EQ(ev.sketches.at(skId).drivenValues.at(dimX), std::stod(st->attributes.at("driven." + std::to_string(dimX.value()))));
+
+    // The stored dimension keeps its flag; a driving dimension of the same sketch still solves.
+    const auto& stored = dynamic_cast<const SketchFeature*>(d.timeline().at(0).get())->params().sketch;
+    EXPECT_TRUE(stored.dimensions().at(dimX).driven);
+}
+
+TEST(SketchFeature, DrivenFlagAndExpressionSurviveSketchJson) {
+    Rect r = makeRect("20 mm", "20 mm");
+    const sketch::SketchDimensionId dimY = std::next(r.sk.dimensions().begin())->first;
+    ASSERT_TRUE(r.sk.setDimensionDriven(dimY, true).has_value());
+    auto text = sketchToJson(r.sk);
+    ASSERT_TRUE(text.has_value());
+    auto back = sketchFromJson(*text);
+    ASSERT_TRUE(back.has_value()) << back.error().message;
+    EXPECT_TRUE(back->dimensions().at(dimY).driven);
+    EXPECT_FALSE(back->dimensions().begin()->second.driven);
+    EXPECT_EQ(back->dimensions().at(dimY).expression, "20 mm");
+
+    // A sketch written before the flag existed (no "driven" key) loads with driving dimensions.
+    std::string old = *text;
+    // nlohmann writes object keys sorted, so "driven" may be followed by a comma or preceded by one.
+    const std::string key = "\"driven\":true";
+    for (std::size_t pos; (pos = old.find(key)) != std::string::npos;) {
+        std::size_t len = key.size();
+        if (pos + len < old.size() && old[pos + len] == ',') ++len;
+        else if (pos > 0 && old[pos - 1] == ',') { --pos; ++len; }
+        old.erase(pos, len);
+    }
+    auto legacy = sketchFromJson(old);
+    ASSERT_TRUE(legacy.has_value()) << legacy.error().message;
+    EXPECT_FALSE(legacy->dimensions().at(dimY).driven);
 }

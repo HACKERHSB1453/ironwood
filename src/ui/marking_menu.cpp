@@ -11,12 +11,15 @@
 #include <numbers>
 #include <string>
 
+#include "ui/icons.hpp"
+
 namespace iw::ui {
 namespace {
 
 constexpr double kDeg = 180.0 / std::numbers::pi;
 constexpr double kSlotRadius = 84.0;   ///< Distance of slot centres from the menu centre (px).
 constexpr double kSlotBadgeRadius = 34.0;
+constexpr int kSlotIconPx = 22;        ///< Command icon drawn in each slot badge.
 
 bool inSlots(std::string_view id) {
     for (std::string_view s : markingSlotCommands())
@@ -102,6 +105,7 @@ QMenu* MarkingMenu::overflowMenu() {
         QString text = c.label;
         if (!c.implemented()) text += QStringLiteral(" (") + tr("coming soon") + QStringLiteral(")");
         QAction* a = overflow_->addAction(text);
+        if (!c.icon.empty()) a->setIcon(icon(c.icon, 16, iconThemeFor(palette())));
         a->setEnabled(c.isEnabled(ctx_));
         const std::string id = c.id;
         connect(a, &QAction::triggered, this, [this, id] { emit commandChosen(QString::fromStdString(id)); });
@@ -124,9 +128,21 @@ void MarkingMenu::paintEvent(QPaintEvent*) {
         p.setPen(QPen(on ? QColor(0x2d, 0x8c, 0xff) : QColor(90, 90, 96), 1));
         p.setBrush(on ? QColor(45, 45, 52) : QColor(36, 36, 40));
         p.drawEllipse(at, kSlotBadgeRadius, kSlotBadgeRadius);
+        // Command icon in the upper part of the badge (ui::icon), the label underneath.
+        const Command* cmd = slotCommand(slot);
+        const bool hasIcon = cmd && !cmd->icon.empty();
+        if (hasIcon) {
+            const QImage glyph = renderIcon(cmd->icon, kSlotIconPx, iconThemeFor(palette()));
+            if (!glyph.isNull()) {
+                p.setOpacity(on ? 1.0 : 0.4);
+                p.drawImage(QPointF(at.x() - kSlotIconPx / 2.0, at.y() - kSlotBadgeRadius + 5), glyph);
+                p.setOpacity(1.0);
+            }
+        }
         p.setPen(on ? QColor(235, 235, 240) : QColor(120, 120, 126));
-        const QRectF text(at.x() - kSlotBadgeRadius + 4, at.y() - kSlotBadgeRadius + 4, 2 * kSlotBadgeRadius - 8,
-                          2 * kSlotBadgeRadius - 8);
+        const double top = hasIcon ? at.y() - kSlotBadgeRadius + 5 + kSlotIconPx : at.y() - kSlotBadgeRadius + 4;
+        const QRectF text(at.x() - kSlotBadgeRadius + 4, top, 2 * kSlotBadgeRadius - 8,
+                          at.y() + kSlotBadgeRadius - 4 - top);
         p.drawText(text, Qt::AlignCenter | Qt::TextWordWrap, slotLabel(slot));
     }
 

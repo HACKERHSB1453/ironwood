@@ -11,11 +11,11 @@
 
 class QAbstractButton;
 class QLabel;
-class QDoubleSpinBox;
 
 namespace iw::ui {
 
-/// Sketch palette (docked while in sketch mode): tool buttons, display toggles, a status line and Finish Sketch.
+/// Sketch palette (docked while in sketch mode): tool buttons, the constraint toolbar, display toggles, DOF and solver
+/// status, and Finish Sketch.
 /// Pure view: it emits requests and never changes the sketch itself.
 class SketchPalette : public QWidget {
     Q_OBJECT
@@ -28,8 +28,9 @@ public:
     void setOptions(const SketchViewOptions& o);
     void setSnapEnabled(bool on);
     bool snapEnabled() const;
-    void setOffsetDistance(double mm);
-    double offsetDistance() const;
+    /// DOF readout, the fully-constrained state and the solver's message (shown red on conflicts).
+    void setConstraintStatus(int dof, ConstraintState state, const QString& message);
+    QString dofText() const;
     void setStatus(const QString& text);
     void setPlaneName(const QString& name);
 
@@ -40,7 +41,10 @@ signals:
     void undoRequested();
     void redoRequested();
     void snapToggled(bool on);
-    void offsetDistanceChanged(double mm);
+    /// Constraint toolbar: apply `kind` to the current selection.
+    void constraintRequested(sketch::ConstraintKind kind);
+    /// Constraint toolbar: Fix / Unfix toggle on the current selection.
+    void fixToggleRequested();
 
 private:
     QAbstractButton* toolButton(SketchTool t) const;
@@ -49,7 +53,7 @@ private:
     QAbstractButton* points_ = nullptr;
     QAbstractButton* constraints_ = nullptr;
     QAbstractButton* snap_ = nullptr;
-    QDoubleSpinBox* offset_ = nullptr;
+    QLabel* dof_ = nullptr;
     QLabel* title_ = nullptr;
     QLabel* status_ = nullptr;
 };

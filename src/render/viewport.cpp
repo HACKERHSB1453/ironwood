@@ -56,6 +56,8 @@ struct Viewport::Impl {
     std::unique_ptr<QRhi> headlessRhi;
     std::unique_ptr<SceneRenderer> headlessRenderer;
     PickResult hover, selection;
+    SectionRequest section;
+    std::vector<OverlayFace> overlays;
 
     /// One pick request. fire() delivers the result exactly once: from the GPU readback, from the watchdog
     /// timeout, or (empty) from teardown.
@@ -286,6 +288,20 @@ void Viewport::viewFromDirection(const Vec3& eyeDir, int ms) {
     animateTo(d_->camera.poseForEyeDirection(eyeDir), ms);
 }
 
+void Viewport::setSectionRequest(const SectionRequest& r) {
+    d_->section = r;
+    if (d_->renderer) d_->renderer->setSection(r);
+    update();
+}
+SectionRequest Viewport::sectionRequest() const noexcept { return d_->section; }
+
+void Viewport::setOverlayFaces(std::vector<OverlayFace> faces) {
+    d_->overlays = std::move(faces);
+    if (d_->renderer) d_->renderer->setOverlays(d_->overlays);
+    update();
+}
+const std::vector<OverlayFace>& Viewport::overlayFaces() const noexcept { return d_->overlays; }
+
 void Viewport::setSelection(const PickResult& r) {
     d_->selection = r;
     if (d_->renderer) d_->renderer->setSelection(r);
@@ -303,6 +319,10 @@ void Viewport::serviceHeadlessPick() {
     if (!d_->headlessRhi) {
         d_->headlessRhi = createHeadlessRhi();
         if (d_->headlessRhi) d_->headlessRenderer = std::make_unique<SceneRenderer>(d_->headlessRhi.get());
+    }
+    if (d_->headlessRenderer) {
+        d_->headlessRenderer->setSection(d_->section);
+        d_->headlessRenderer->setOverlays(d_->overlays);
     }
     auto req = d_->pending;
     d_->pending.reset();
@@ -365,6 +385,8 @@ void Viewport::initialize(QRhiCommandBuffer*) {
     d_->renderer->setScene(d_->scene);
     d_->renderer->setHover(d_->hover);
     d_->renderer->setSelection(d_->selection);
+    d_->renderer->setSection(d_->section);
+    d_->renderer->setOverlays(d_->overlays);
 }
 
 void Viewport::releaseResources() {

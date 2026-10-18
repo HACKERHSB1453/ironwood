@@ -528,3 +528,175 @@ TEST(SketchRestore, RejectsBadInput) {
     ASSERT_TRUE(r.restoreNextId(20).has_value());
     EXPECT_EQ(r.restoreNextId(10).error().code, ErrorCode::InvalidArgument);
 }
+
+// ---- polygonal nesting (F28) ----------------------------------------------------------------------------------
+
+namespace {
+
+/// The profile with exactly `holeCount` holes whose outer area is `area` (strict match, fails on ambiguity).
+const SketchProfile* profileWith(const std::vector<SketchProfile>& ps, std::size_t holeCount, double area) {
+    const SketchProfile* found = nullptr;
+    for (const auto& p : ps) {
+        if (p.holes.size() != holeCount || std::abs(p.area - area) > 1e-9 * std::max(1.0, area)) continue;
+        EXPECT_EQ(found, nullptr) << "more than one profile matches";
+        found = &p;
+    }
+    return found;
+}
+
+/// Adds a rectangle with its corners walked CW (reverse of addRect), to exercise the other orientation.
+void addRectCW(Sketch& s, double x, double y, double w, double h) {
+    const Point2 a{x, y}, b{x + w, y}, c{x + w, y + h}, d{x, y + h};
+    ASSERT_TRUE(s.addLine(a, d).has_value());
+    ASSERT_TRUE(s.addLine(d, c).has_value());
+    ASSERT_TRUE(s.addLine(c, b).has_value());
+    ASSERT_TRUE(s.addLine(b, a).has_value());
+}
+
+} // namespace
+
+TEST(Profiles, RectInRectGivesRingWithHole) {
+    Sketch s = xySketch();
+    addRect(s, 0, 0, 20, 10);
+    addRect(s, 2, 2, 16, 6);
+    const auto ps = detect(s);
+    ASSERT_EQ(ps.size(), 2u);
+    const SketchProfile* ring = profileWith(ps, 1, 200.0 - 96.0);
+    const SketchProfile* inner = profileWith(ps, 0, 96.0);
+    ASSERT_NE(ring, nullptr) << "outer rect must carry the inner rect as its hole";
+    ASSERT_NE(inner, nullptr) << "inner rect must be a plain region";
+    EXPECT_LT(ring->holes[0].area, 0.0);
+    expectRel(-ring->holes[0].area, 96.0);
+    EXPECT_NEAR(ring->centroid.x, 10.0, 1e-9);
+    EXPECT_NEAR(ring->centroid.y, 5.0, 1e-9);
+    EXPECT_NEAR(inner->centroid.x, 10.0, 1e-9);
+    EXPECT_NEAR(inner->centroid.y, 5.0, 1e-9);
+}
+
+TEST(Profiles, RectInRectHoleIsFoundForEitherInsertionOrderAndWinding) {
+    // Regression: the hole container was looked up with a sentinel equal to positive.size(), so a container whose
+    // loop index happened to equal that count was dropped. Depends on insertion order and on loop orientation.
+    for (const bool innerFirst : {false, true})
+        for (const bool innerCW : {false, true}) {
+            Sketch s = xySketch();
+            if (innerFirst) {
+                if (innerCW) addRectCW(s, 2, 2, 16, 6); else addRect(s, 2, 2, 16, 6);
+                addRect(s, 0, 0, 20, 10);
+            } else {
+                addRect(s, 0, 0, 20, 10);
+                if (innerCW) addRectCW(s, 2, 2, 16, 6); else addRect(s, 2, 2, 16, 6);
+            }
+            const auto ps = detect(s);
+            ASSERT_EQ(ps.size(), 2u) << "innerFirst=" << innerFirst << " innerCW=" << innerCW;
+            EXPECT_NE(profileWith(ps, 1, 104.0), nullptr) << "innerFirst=" << innerFirst << " innerCW=" << innerCW;
+            EXPECT_NE(profileWith(ps, 0, 96.0), nullptr) << "innerFirst=" << innerFirst << " innerCW=" << innerCW;
+        }
+}
+
+TEST(Profiles, ThreeNestedRectsGiveThreeRegionsWithCorrectHoles) {
+    Sketch s = xySketch();
+    addRect(s, 0, 0, 30, 20);   // 600
+    addRect(s, 3, 3, 24, 14);   // 336
+    addRect(s, 8, 8, 14, 4);    // 56
+    const auto ps = detect(s);
+    ASSERT_EQ(ps.size(), 3u);
+    const SketchProfile* outerRing = profileWith(ps, 1, 600.0 - 336.0);
+    const SketchProfile* middleRing = profileWith(ps, 1, 336.0 - 56.0);
+    const SketchProfile* core = profileWith(ps, 0, 56.0);
+    ASSERT_NE(outerRing, nullptr);
+    ASSERT_NE(middleRing, nullptr);
+    ASSERT_NE(core, nullptr);
+    expectRel(-outerRing->holes[0].area, 336.0);   // outer ring's hole is the middle rect
+    expectRel(-middleRing->holes[0].area, 56.0);   // middle ring's hole is the core rect
+    expectRel(sortedAreas(ps)[0] + sortedAreas(ps)[1] + sortedAreas(ps)[2], 600.0);
+}
+
+TEST(Profiles, InnerPolygonTouchingOuterBoundaryAtOneVertex) {
+    // A square rotated 45 degrees (diamond) inside a 20 x 10 rect. Its bottom vertex (10,0) lies on the outer
+    // bottom edge; no other vertex or edge touches the outer boundary.
+    Sketch s = xySketch();
+    addRect(s, 0, 0, 20, 10);
+    const Point2 v[4] = {{10, 0}, {14, 4}, {10, 8}, {6, 4}};
+    for (int i = 0; i < 4; ++i) ASSERT_TRUE(s.addLine(v[i], v[(i + 1) % 4]).has_value());
+    const auto ps = detect(s);
+    ASSERT_EQ(ps.size(), 2u);
+    const SketchProfile* ring = profileWith(ps, 1, 200.0 - 32.0);
+    const SketchProfile* diamond = profileWith(ps, 0, 32.0);
+    ASSERT_NE(ring, nullptr) << "outer rect must carry the diamond as its hole";
+    ASSERT_NE(diamond, nullptr);
+}
+
+TEST(Profiles, PolygonWithTwoSeparateHoles) {
+    Sketch s = xySketch();
+    addRect(s, 0, 0, 30, 10);
+    addRect(s, 3, 3, 6, 4);
+    addRect(s, 18, 3, 6, 4);
+    const auto ps = detect(s);
+    ASSERT_EQ(ps.size(), 3u);
+    const SketchProfile* outer = profileWith(ps, 2, 300.0 - 48.0);
+    ASSERT_NE(outer, nullptr) << "one region must carry both holes";
+    for (const auto& h : outer->holes) expectRel(-h.area, 24.0);
+    int plainHoles = 0;   // the two 6 x 4 holes are also regions in their own right
+    for (const auto& p : ps)
+        if (p.holes.empty()) {
+            expectRel(p.area, 24.0);
+            ++plainHoles;
+        }
+    EXPECT_EQ(plainHoles, 2);
+}
+
+TEST(ProfileFace, RectInRectRingFaceHasOuterAndInnerLoops) {
+    Sketch s = xySketch();
+    addRect(s, 0, 0, 20, 10);
+    addRect(s, 2, 2, 16, 6);
+    const auto ps = detect(s);
+    const SketchProfile* ring = profileWith(ps, 1, 200.0 - 96.0);
+    ASSERT_NE(ring, nullptr);
+    auto face = profileFace(s.plane(), *ring);
+    ASSERT_TRUE(face.has_value()) << face.error().message;
+    EXPECT_EQ(face->type(), kernel::ShapeType::Face);
+    // 4 outer + 4 inner edges: both loops are present. (The kernel has no wire API; area below proves the hole.)
+    EXPECT_EQ(face->subShapeCount(kernel::SubShapeKind::Edge), 8u);
+    auto mp = kernel::massProperties(*face);
+    ASSERT_TRUE(mp.has_value());
+    expectRel(mp->surfaceArea, 104.0, 1e-6);
+}
+
+// ---- W2a: driven (reference) dimensions and measurement ----------------------------------------------------------
+
+namespace {
+SketchPlane xyPlane() { return *SketchPlane::make({0, 0, 0}, {0, 0, 1}, {1, 0, 0}); }
+} // namespace
+
+TEST(SketchDimensions, MeasureReportsDistancesRadiiAndAngles) {
+    Sketch sk(xyPlane());
+    auto l1 = *sk.addLine({0, 0}, {30, 40});
+    auto l2 = *sk.addLine({0, 0}, {-40, 30});  // perpendicular to l1
+    auto c = *sk.addCircle({5, 5}, 3.0);
+    auto dist = *sk.addDimension(DimensionKind::Distance, {{l1, PointRole::Start}, {l1, PointRole::End}}, "50 mm");
+    auto dx = *sk.addDimension(DimensionKind::DistanceX, {{l1, PointRole::Start}, {l1, PointRole::End}}, "30 mm");
+    auto dy = *sk.addDimension(DimensionKind::DistanceY, {{l1, PointRole::Start}, {l1, PointRole::End}}, "40 mm");
+    auto rad = *sk.addDimension(DimensionKind::Radius, {{c, std::nullopt}}, "3 mm");
+    auto dia = *sk.addDimension(DimensionKind::Diameter, {{c, std::nullopt}}, "6 mm");
+    auto ang = *sk.addDimension(DimensionKind::Angle, {{l1, std::nullopt}, {l2, std::nullopt}}, "90 deg");
+
+    EXPECT_NEAR(*sk.measureDimension(dist), 50.0, 1e-9);
+    EXPECT_NEAR(*sk.measureDimension(dx), 30.0, 1e-9);
+    EXPECT_NEAR(*sk.measureDimension(dy), 40.0, 1e-9);
+    EXPECT_NEAR(*sk.measureDimension(rad), 3.0, 1e-9);
+    EXPECT_NEAR(*sk.measureDimension(dia), 6.0, 1e-9);
+    EXPECT_NEAR(*sk.measureDimension(ang), std::numbers::pi / 2, 1e-9);
+    EXPECT_FALSE(sk.measureDimension(SketchDimensionId{999}).has_value());
+}
+
+TEST(SketchDimensions, DrivenFlagDefaultsOffAndToggles) {
+    Sketch sk(xyPlane());
+    auto l = *sk.addLine({0, 0}, {10, 0});
+    auto d = *sk.addDimension(DimensionKind::DistanceX, {{l, PointRole::Start}, {l, PointRole::End}}, "10 mm");
+    EXPECT_FALSE(sk.dimensions().at(d).driven);
+    ASSERT_TRUE(sk.setDimensionDriven(d, true).has_value());
+    EXPECT_TRUE(sk.dimensions().at(d).driven);
+    ASSERT_TRUE(sk.setDimensionDriven(d, false).has_value());
+    EXPECT_FALSE(sk.dimensions().at(d).driven);
+    EXPECT_FALSE(sk.setDimensionDriven(SketchDimensionId{999}, true).has_value());
+}

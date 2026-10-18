@@ -541,18 +541,21 @@ Result<std::vector<SketchProfile>> detectProfiles(const Sketch& sketch) {
         Point2 left;
         const Point2 mid = midpointAndLeft(dir[static_cast<std::size_t>(N.halfEdges.front())], left);
         const Point2 probe = mid + left * kProbeOffset;
-        std::size_t best = positive.size();
+        // `best` holds a LOOP index (not a position in `positive`), so the "none" sentinel must be outside the
+        // loop index range. Using positive.size() here silently dropped holes whose container happened to have
+        // loop index == positive.size() (F28: rect-in-rect lost its hole depending on insertion order).
+        std::size_t best = loops.size();
         double bestArea = 0;
         for (const std::size_t pi : positive) {
             int w = 0;
             for (const int hh : loops[pi].halfEdges) w += pieceWinding(dir[static_cast<std::size_t>(hh)], probe);
             if (w == 0) continue;
-            if (best == positive.size() || loops[pi].area < bestArea) {
+            if (best == loops.size() || loops[pi].area < bestArea) {
                 best = pi;
                 bestArea = loops[pi].area;
             }
         }
-        if (best != positive.size()) holesOf[best].push_back(ni);
+        if (best != loops.size()) holesOf[best].push_back(ni);
     }
 
     // 8. Regions. Each piece is named by (entity id, sub index).

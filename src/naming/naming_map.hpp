@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "core/result.hpp"
+#include "core/math.hpp"
 #include "kernel/history.hpp"
 #include "naming/element_name.hpp"
 
@@ -42,8 +43,24 @@ private:
 /// ascending geometric key (centroid x, y, z, then measure; kernel::Shape::subShapeKey). Kernel index is
 /// only the final tie-break for siblings with identical keys. Deriving reads geometry ONLY for these
 /// sibling tie-breaks; which names an element gets is decided by the history alone.
+///
+/// Sibling frame (N1 / F27): sibling keys are expressed in this orthonormal frame (origin + axes) instead of world
+/// coordinates, so that moving or rotating the owning feature's geometry as a whole does not change the ranking.
+/// Without a frame the keys are world coordinates (still translation-invariant, since lexicographic order commutes with a
+/// translation, but not rotation-invariant). Degenerate edges (zero length) are keyed by their vertex position, never by the
+/// origin (kernel::stableSubShapeKey).
+/// `partOperandFrom`: pieces of a 1:N split whose every origin is an operand >= this value (a tool body whose elements are
+/// named by role, e.g. the hole tool) are named "<source op>.part" instead of "<opTag>.split" (default: never).
+struct SiblingFrame {
+    Vec3 origin{0, 0, 0};
+    Vec3 xAxis{1, 0, 0};
+    Vec3 yAxis{0, 1, 0};
+    Vec3 zAxis{0, 0, 1};
+};
+
 Result<NamingMap> deriveNamingMap(FeatureId feature, std::string_view opTag, const kernel::Shape& output,
                                   const std::vector<const NamingMap*>& inputs,
-                                  const kernel::ShapeHistory& history);
+                                  const kernel::ShapeHistory& history, const SiblingFrame* frame = nullptr,
+                                  std::uint32_t partOperandFrom = UINT32_MAX);
 
 } // namespace iw::naming

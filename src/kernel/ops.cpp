@@ -2,12 +2,25 @@
 #include "kernel/ops.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <exception>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
 #include <BOPAlgo_Options.hxx>
+#include <BRepBndLib.hxx>
+#include <BRepCheck_Analyzer.hxx>
+#include <Bnd_Box.hxx>
+#include <OSD.hxx>
+#include <ShapeFix_Shape.hxx>
+#include <Standard_ErrorHandler.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <BRepAlgoAPI_BooleanOperation.hxx>
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
@@ -59,6 +72,7 @@
 
 #include "kernel/internal/profile_support.hpp"
 #include "kernel/internal/progress.hpp"
+#include "kernel/internal/validate.hpp"
 #include "kernel/internal/shape_impl.hpp"
 
 namespace iw::kernel {
@@ -150,11 +164,179 @@ ShapeHistory extractHistory(BRepBuilderAPI_MakeShape& algo, const std::vector<co
     return h;
 }
 
-template <class Op>
-Result<ShapeResult> boolean(const Shape& a, const Shape& b, CancelToken cancel, const char* name) {
-    if (a.isNull() || b.isNull()) return makeError(ErrorCode::InvalidArgument, std::string(name) + ": null operand");
-    if (cancel.cancelled()) return makeError(ErrorCode::Cancelled, std::string(name) + " cancelled");
+// ---------------------------------------------------------------------------------------------------------------
+// Robustness layer (F37 signal conversion, F38 boolean validation, F39 edge-op validation).
+
+/// Installs OCCT's signal handlers once per process so that SIGSEGV/SIGBUS/SIGILL raised inside OCCT algorithms
+/// become Standard_Failure at the nearest OCC_CATCH_SIGNALS. Floating-point traps are deliberately NOT enabled
+/// (SetSignal's second argument = false): enabling them process-wide would turn any NaN from non-OCCT code (solver,
+/// Eigen, Qt) into a crash. Overrides earlier SIGSEGV handlers of the process; the app installs its own first if needed.
+void ensureOcctSignals() {
+    static std::once_flag once;
+    std::call_once(once, [] { OSD::SetSignal(Standard_False); });
+}
+
+/// Evaluates `f` under OCC_CATCH_SIGNALS: a Standard_Failure (or a signal converted inside OCCT) yields `fallback`.
+template <class R, class F>
+R guarded(R fallback, F&& f) {
+    ensureOcctSignals();
     try {
+        OCC_CATCH_SIGNALS
+        return f();
+    } catch (const Standard_Failure&) {
+        return fallback;
+    }
+}
+
+constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+
+double volumeOf(const TopoDS_Shape& s) {
+    GProp_GProps p;
+    BRepGProp::VolumeProperties(s, p);
+    return p.Mass();
+}
+
+std::array<int, 3> topologyCounts(const TopoDS_Shape& s) {
+    TopTools_IndexedMapOfShape f, e, v;
+    TopExp::MapShapes(s, TopAbs_FACE, f);
+    TopExp::MapShapes(s, TopAbs_EDGE, e);
+    TopExp::MapShapes(s, TopAbs_VERTEX, v);
+    return {f.Extent(), e.Extent(), v.Extent()};
+}
+
+/// Closure: every solid is a closed shell (each non-degenerate edge is shared by at least two faces). Cheap relative to
+/// BRepCheck; a false here is final.
+bool solidsClosed(const TopoDS_Shape& s) {
+    for (TopExp_Explorer ex(s, TopAbs_SOLID); ex.More(); ex.Next()) {
+        TopTools_IndexedDataMapOfShapeListOfShape edgeFaces;
+        TopExp::MapShapesAndAncestors(ex.Current(), TopAbs_EDGE, TopAbs_FACE, edgeFaces);
+        for (int i = 1; i <= edgeFaces.Extent(); ++i) {
+            if (BRep_Tool::Degenerated(TopoDS::Edge(edgeFaces.FindKey(i)))) continue;
+            if (edgeFaces.FindFromIndex(i).Extent() < 2) return false;
+        }
+    }
+    return true;
+}
+
+/// Structural validity: a solid is present, the solids are closed, and the whole-shape BRepCheck_Analyzer passes.
+/// Whole-shape BRepCheck is required: a check restricted to the faces an operation touched, or to shell orientation,
+/// accepts boolean results that the whole check rejects (seed 15611207460078702108 / 10974448563000467285 of the naming
+/// fuzzer; see the K1 report). It is serial on purpose: BRepCheck's parallel mode cut its wall time ~34% but used ~9x
+/// the CPU in K2 measurements, which the no-CPU-heavy-work rule rules out. Callers order this after cheaper tests; it is
+/// never skipped for an accepted result.
+bool structurallyValid(const TopoDS_Shape& s) {
+    if (s.IsNull() || !hasSolid(s)) return false;
+    if (!solidsClosed(s)) return false;
+    return BRepCheck_Analyzer(s).IsValid();
+}
+
+/// structurallyValid of a kernel Shape, memoised on it (Shape::Impl::validCache). Shapes are immutable, so the verdict
+/// never changes; only the verdict of an accepted or rejected check is stored.
+bool structurallyValidCached(const Shape& s) {
+    if (s.isNull()) return false;
+    const signed char c = s.impl()->validCache.load(std::memory_order_relaxed);
+    if (c >= 0) return c == 1;
+    const bool ok = guarded(false, [&] { return structurallyValid(occtShape(s)); });
+    s.impl()->validCache.store(ok ? 1 : 0, std::memory_order_relaxed);
+    return ok;
+}
+
+/// Bounding box of an OCCT shape (BRepBndLib, cheap, may be slightly enlarged by tolerance). Void box when empty.
+Box3 boxOf(const TopoDS_Shape& s) {
+    Bnd_Box box;
+    BRepBndLib::Add(s, box, Standard_False);
+    Box3 b;
+    if (box.IsVoid()) return b;
+    double x0, y0, z0, x1, y1, z1;
+    box.Get(x0, y0, z0, x1, y1, z1);
+    b.min = {x0, y0, z0};
+    b.max = {x1, y1, z1};
+    return b;
+}
+
+/// Largest extent of a shape's bounding box in mm (0 for an empty shape).
+double sizeOf(const Shape& s) {
+    const Box3 bb = s.boundingBox();
+    return std::max({bb.max.x - bb.min.x, bb.max.y - bb.min.y, bb.max.z - bb.min.z, 0.0});
+}
+
+/// Memoised volume of a kernel Shape (see Shape::Impl::volumeCache). NaN when OCCT cannot measure it.
+double cachedVolume(const Shape& s) {
+    if (s.isNull()) return kNaN;
+    const double c = s.impl()->volumeCache.load(std::memory_order_relaxed);
+    if (!std::isnan(c)) return c;
+    const double v = guarded(kNaN, [&] { return volumeOf(occtShape(s)); });
+    if (!std::isnan(v)) s.impl()->volumeCache.store(v, std::memory_order_relaxed);
+    return v;
+}
+
+/// Accepts a boolean result when it is structurally valid and its volume is plausible (F38). On acceptance the result's
+/// volume is cached on it.
+bool acceptableBoolean(check::BooleanKind kind, const ShapeResult& r, double va, double vb) {
+    if (r.shape.isNull()) return false;
+    // Cheapest first: the volume integral before the closure test and the whole-shape BRepCheck. A volume that fails
+    // the bounds rejects the result without BRepCheck; a plausible one still must pass every later check.
+    const double vr = guarded(kNaN, [&] { return volumeOf(occtShape(r.shape)); });
+    if (std::isnan(vr) || !check::volumesPlausible(kind, va, vb, vr)) return false;
+    const bool ok = structurallyValidCached(r.shape);
+    if (ok) r.shape.impl()->volumeCache.store(vr, std::memory_order_relaxed);
+    return ok;
+}
+
+/// Re-addresses `h` (outputs of `from`) onto `to`, a repaired copy of `from` made by ShapeFix. Output sub-shapes are
+/// matched by their geometric key (Shape::subShapeKey, unique in both shapes); an output without a unique counterpart
+/// is dropped. Dropping is safe: absent history means "unknown" to the naming layer, while a stale index would address
+/// the wrong sub-shape.
+ShapeHistory remapHistory(const ShapeHistory& h, const Shape& from, const Shape& to) {
+    using Key = std::array<double, 4>;
+    std::array<std::vector<std::optional<std::uint32_t>>, 3> remap; // per SubShapeKind: old index -> new index
+    for (std::size_t k = 0; k < 3; ++k) {
+        const auto kind = static_cast<SubShapeKind>(k);
+        std::map<Key, std::uint32_t> keyToNew;
+        std::set<Key> ambiguous;
+        for (std::uint32_t i = 0; i < to.subShapeCount(kind); ++i) {
+            const Key key = to.subShapeKey(kind, i);
+            if (keyToNew.contains(key)) ambiguous.insert(key);
+            else keyToNew.emplace(key, i);
+        }
+        remap[k].resize(from.subShapeCount(kind));
+        for (std::uint32_t i = 0; i < from.subShapeCount(kind); ++i) {
+            const Key key = from.subShapeKey(kind, i);
+            if (ambiguous.contains(key)) continue;
+            if (const auto it = keyToNew.find(key); it != keyToNew.end()) remap[k][i] = it->second;
+        }
+    }
+    const auto rewrite = [&](const OutputSubShape& o) -> std::optional<OutputSubShape> {
+        const auto& m = remap[static_cast<std::size_t>(o.kind)];
+        if (o.index >= m.size() || !m[o.index]) return std::nullopt;
+        return OutputSubShape{o.kind, *m[o.index]};
+    };
+    ShapeHistory out;
+    out.deleted = h.deleted;
+    for (const auto& [key, outs] : h.generated) {
+        std::vector<OutputSubShape> kept;
+        for (const OutputSubShape& o : outs)
+            if (auto n = rewrite(o)) kept.push_back(*n);
+        if (!kept.empty()) out.generated[key] = std::move(kept);
+    }
+    for (const auto& [key, outs] : h.modified) {
+        std::vector<OutputSubShape> kept;
+        for (const OutputSubShape& o : outs)
+            if (auto n = rewrite(o)) kept.push_back(*n);
+        if (!kept.empty()) out.modified[key] = std::move(kept);
+    }
+    for (const auto& [key, o] : h.unchanged)
+        if (auto n = rewrite(o)) out.unchanged[key] = *n;
+    return out;
+}
+
+/// Runs the BOP once with the given fuzzy value. Errors are KernelFailure / Cancelled / Internal; the result is NOT
+/// validated here.
+template <class Op>
+Result<ShapeResult> runBoolean(const Shape& a, const Shape& b, CancelToken cancel, const char* name, double fuzzy) {
+    ensureOcctSignals();
+    try {
+        OCC_CATCH_SIGNALS
         TopTools_ListOfShape args, tools;
         args.Append(occtShape(a));
         tools.Append(occtShape(b));
@@ -164,7 +346,7 @@ Result<ShapeResult> boolean(const Shape& a, const Shape& b, CancelToken cancel, 
         op.SetRunParallel(false);      // serial: results feed naming/caching and must be bit-for-bit repeatable
         op.SetNonDestructive(true);    // Shape is immutable; BOP must not touch input tolerances
         op.SetToFillHistory(true);
-        op.SetFuzzyValue(0.0);
+        op.SetFuzzyValue(fuzzy);
         Handle(Message_ProgressIndicator) pi = new CancelProgress(cancel);
         op.Build(pi->Start());
         if (cancel.cancelled()) return makeError(ErrorCode::Cancelled, std::string(name) + " cancelled");
@@ -180,6 +362,43 @@ Result<ShapeResult> boolean(const Shape& a, const Shape& b, CancelToken cancel, 
     } catch (const std::exception& e) {
         return makeError(ErrorCode::Internal, std::string(name) + ": " + e.what());
     }
+}
+
+/// Boolean with post-operation validation (F38). Flow: exact BOP; if it fails or its result fails the checks, retry
+/// once with a fuzzy value (1e-5 x size); if that result is still invalid, ShapeFix it, accepting the repair only when
+/// the topology counts are unchanged (so the history indices stay meaningful) and it passes the checks. Otherwise
+/// KernelFailure. An invalid or implausible solid is never returned.
+template <class Op>
+Result<ShapeResult> boolean(const Shape& a, const Shape& b, CancelToken cancel, const char* name, check::BooleanKind kind) {
+    if (a.isNull() || b.isNull()) return makeError(ErrorCode::InvalidArgument, std::string(name) + ": null operand");
+    if (cancel.cancelled()) return makeError(ErrorCode::Cancelled, std::string(name) + " cancelled");
+    const double va = cachedVolume(a);
+    const double vb = cachedVolume(b);
+
+    auto first = runBoolean<Op>(a, b, cancel, name, 0.0);
+    if (first && acceptableBoolean(kind, *first, va, vb)) return first;
+    if (!first && first.error().code == ErrorCode::Cancelled) return first;
+
+    const double fuzzy = 1e-5 * std::max(std::max(sizeOf(a), sizeOf(b)), 1e-3);
+    auto retry = runBoolean<Op>(a, b, cancel, name, fuzzy);
+    if (retry && acceptableBoolean(kind, *retry, va, vb)) return retry;
+    if (!retry && retry.error().code == ErrorCode::Cancelled) return retry;
+    if (retry) {
+        const TopoDS_Shape before = occtShape(retry->shape);
+        const TopoDS_Shape fixed = guarded(TopoDS_Shape(), [&] {
+            ShapeFix_Shape fix(before);
+            fix.Perform();
+            return unwrapSingle(fix.Shape());
+        });
+        if (!fixed.IsNull() && topologyCounts(fixed) == topologyCounts(before)) {
+            ShapeResult repaired;
+            repaired.shape = wrapShape(fixed);
+            repaired.history = remapHistory(retry->history, retry->shape, repaired.shape);
+            if (acceptableBoolean(kind, repaired, va, vb)) return repaired;
+        }
+    }
+    if (!first) return std::unexpected(first.error()); // the exact operation itself failed: report its own error
+    return makeError(ErrorCode::KernelFailure, std::string(name) + ": boolean produced an invalid result");
 }
 
 } // namespace
@@ -232,7 +451,9 @@ Result<ShapeResult> extrudeProfile(const Shape& profile, const Vec3& vector, Can
     if (profile.type() != ShapeType::Face && profile.type() != ShapeType::Wire)
         return makeError(ErrorCode::InvalidArgument, "extrudeProfile: profile must be a planar Face or closed planar Wire");
     if (cancel.cancelled()) return makeError(ErrorCode::Cancelled, "extrudeProfile cancelled");
+    ensureOcctSignals();
     try {
+        OCC_CATCH_SIGNALS
         TopoDS_Shape in = occtShape(profile);
         TopoDS_Face face;
         if (profile.type() == ShapeType::Face) {
@@ -255,6 +476,20 @@ Result<ShapeResult> extrudeProfile(const Shape& profile, const Vec3& vector, Can
         BRepGProp::VolumeProperties(res, props);
         if (std::abs(props.Mass()) < 1e-12)
             return makeError(ErrorCode::InvalidArgument, "extrudeProfile: vector lies in the profile plane");
+        // Validation (F38-style): a prism of a planar face has volume area * |v . n| exactly.
+        // Cheapest first: the analytic volume test (planar profile) before the whole-shape BRepCheck. Both must pass.
+        const bool valid = guarded(false, [&] {
+            GProp_GProps sp;
+            BRepGProp::SurfaceProperties(face, sp);
+            const BRepAdaptor_Surface ad(face, Standard_True);
+            if (ad.GetType() == GeomAbs_Plane) {
+                const gp_Dir n = ad.Plane().Axis().Direction();
+                const double expected = sp.Mass() * std::abs(vector.x * n.X() + vector.y * n.Y() + vector.z * n.Z());
+                if (!(std::abs(props.Mass() - expected) <= 1e-5 * expected + 1e-6)) return false;
+            }
+            return structurallyValid(res);
+        });
+        if (!valid) return makeError(ErrorCode::KernelFailure, "extrudeProfile: produced an invalid solid");
 
         ShapeResult r;
         r.shape = wrapShape(res);
@@ -297,13 +532,13 @@ Result<ShapeResult> extrudeProfile(const Shape& profile, const Vec3& vector, Can
 }
 
 Result<ShapeResult> fuse(const Shape& a, const Shape& b, CancelToken cancel) {
-    return boolean<BRepAlgoAPI_Fuse>(a, b, std::move(cancel), "fuse");
+    return boolean<BRepAlgoAPI_Fuse>(a, b, std::move(cancel), "fuse", check::BooleanKind::Fuse);
 }
 Result<ShapeResult> cut(const Shape& a, const Shape& b, CancelToken cancel) {
-    return boolean<BRepAlgoAPI_Cut>(a, b, std::move(cancel), "cut");
+    return boolean<BRepAlgoAPI_Cut>(a, b, std::move(cancel), "cut", check::BooleanKind::Cut);
 }
 Result<ShapeResult> common(const Shape& a, const Shape& b, CancelToken cancel) {
-    return boolean<BRepAlgoAPI_Common>(a, b, std::move(cancel), "common");
+    return boolean<BRepAlgoAPI_Common>(a, b, std::move(cancel), "common", check::BooleanKind::Common);
 }
 
 Result<Shape> makePolygonWire(std::span<const Vec3> points) {
@@ -426,13 +661,13 @@ Result<ShapeResult> diagnoseEdgeOp(const std::vector<std::uint32_t>& ids, Cancel
                                    Describe&& describe) {
     auto whole = build(ids);
     if (whole || whole.error().code == ErrorCode::Cancelled) return whole;
-    if (ids.size() == 1) return makeError(ErrorCode::KernelFailure, describe(ids[0]));
+    if (ids.size() == 1) return makeError(ErrorCode::KernelFailure, describe(ids[0]) + " [" + whole.error().message + "]");
     for (std::uint32_t id : ids) {
         if (cancel.cancelled()) return makeError(ErrorCode::Cancelled, "edge operation cancelled");
         auto one = build(std::vector<std::uint32_t>{id});
         if (!one) {
             if (one.error().code == ErrorCode::Cancelled) return one;
-            return makeError(ErrorCode::KernelFailure, describe(id));
+            return makeError(ErrorCode::KernelFailure, describe(id) + " [" + one.error().message + "]");
         }
     }
     return makeError(ErrorCode::KernelFailure, whole.error().message);
@@ -510,14 +745,60 @@ void sweepHistory(Sweep& sw, const Shape& profile, const SubShapeIndex& out, con
     linkFullTurnCaps(*profile.impl()->index, out, axis, h);
 }
 
+/// Reason an edge cannot take a fillet or chamfer (degenerate or zero length), or empty when it can.
+std::string edgeProblem(const TopoDS_Edge& e) {
+    if (BRep_Tool::Degenerated(e)) return "is degenerate";
+    GProp_GProps p;
+    BRepGProp::LinearProperties(e, p);
+    if (!(p.Mass() > 1e-7)) return "has zero length";
+    return {};
+}
+
+/// F39 validator for fillet/chamfer results: structural validity (whole shape) and a bounding
+/// box within the input's box grown by `allowance` (a fillet or chamfer cannot reach farther than its own size). On
+/// failure one ShapeFix repair is tried, accepted only when the topology counts are unchanged and it passes the whole-
+/// shape checks; otherwise KernelFailure. Never returns a bad solid.
+Result<ShapeResult> validatedEdgeResult(const Shape& input, ShapeResult r, double allowance, const char* name) {
+    const Box3 inBox = guarded(Box3{}, [&] { return boxOf(occtShape(input)); });
+    // Bounds first (cheap); BRepCheck only for a result whose box is already within the allowance.
+    const bool first = guarded(false, [&] {
+        return check::boundsWithin(inBox, boxOf(occtShape(r.shape)), allowance) && structurallyValidCached(r.shape);
+    });
+    if (first) return r;
+
+    const TopoDS_Shape before = occtShape(r.shape);
+    const TopoDS_Shape fixed = guarded(TopoDS_Shape(), [&] {
+        ShapeFix_Shape fix(before);
+        fix.Perform();
+        return unwrapSingle(fix.Shape());
+    });
+    if (!fixed.IsNull() && topologyCounts(fixed) == topologyCounts(before)) {
+        ShapeResult repaired;
+        repaired.shape = wrapShape(fixed);
+        repaired.history = remapHistory(r.history, r.shape, repaired.shape);
+        const bool ok = guarded(false, [&] {
+            return check::boundsWithin(inBox, boxOf(fixed), allowance) && structurallyValid(fixed);
+        });
+        if (ok) return repaired;
+    }
+    return makeError(ErrorCode::KernelFailure, std::string(name) + ": result failed validation (invalid or sliver geometry)");
+}
+
 Result<ShapeResult> buildFillet(const Shape& shape, const std::vector<std::uint32_t>& ids, double radius,
                                 CancelToken cancel) {
+    ensureOcctSignals();
     try {
+        OCC_CATCH_SIGNALS
         BRepFilletAPI_MakeFillet mk(occtShape(shape));
         for (std::uint32_t id : ids) {
             auto e = subShapeAt(shape, SubShapeKind::Edge, id, "fillet");
             if (!e) return std::unexpected(e.error());
-            mk.Add(radius, TopoDS::Edge(*e));
+            const TopoDS_Edge edge = TopoDS::Edge(*e);
+            if (shape.impl()->index->edges.FindIndex(edge) == 0)
+                return makeError(ErrorCode::KernelFailure, "fillet: edge " + std::to_string(id) + " does not belong to the shape");
+            if (const std::string why = edgeProblem(edge); !why.empty())
+                return makeError(ErrorCode::KernelFailure, "fillet: edge " + std::to_string(id) + " " + why);
+            mk.Add(radius, edge);
         }
         Handle(Message_ProgressIndicator) pi = new CancelProgress(cancel);
         mk.Build(pi->Start());
@@ -528,7 +809,7 @@ Result<ShapeResult> buildFillet(const Shape& shape, const std::vector<std::uint3
         ShapeResult r;
         r.shape = wrapShape(res);
         r.history = extractHistory(mk, {&shape}, *r.shape.impl()->index);
-        return r;
+        return validatedEdgeResult(shape, std::move(r), 2.0 * radius, "fillet");
     } catch (const StdFail_NotDone&) {
         return makeError(ErrorCode::KernelFailure, "fillet: kernel could not build the fillet");
     } catch (const Standard_Failure& e) {
@@ -542,16 +823,44 @@ Result<ShapeResult> buildFillet(const Shape& shape, const std::vector<std::uint3
 /// the lowest face index, which makes the result independent of OCCT's internal ancestor-list order.
 Result<ShapeResult> buildChamfer(const Shape& shape, const std::vector<std::uint32_t>& ids, double dist, double second,
                                  bool byAngle, CancelToken cancel) {
+    ensureOcctSignals();
     try {
+        OCC_CATCH_SIGNALS
         const TopoDS_Shape s = occtShape(shape);
-        TopTools_IndexedDataMapOfShapeListOfShape edgeFaces;
+        TopTools_IndexedDataMapOfShapeListOfShape edgeFaces, vertexEdges;
         TopExp::MapShapesAndAncestors(s, TopAbs_EDGE, TopAbs_FACE, edgeFaces);
+        TopExp::MapShapesAndAncestors(s, TopAbs_VERTEX, TopAbs_EDGE, vertexEdges);
         const auto& fmap = shape.impl()->index->faces;
+        // Setback that must stay on the edge's neighbourhood: both distances, or the single distance for the angle form.
+        const double setback = byAngle ? dist : std::max(dist, second);
+        // Bounding-box allowance (F39): the chamfer's extent in the other face is at most dist / sin(angle-to-face).
+        const double reach = byAngle ? dist / std::sin(std::min(second, kPiValue - second)) : setback;
         BRepFilletAPI_MakeChamfer mk(s);
         for (std::uint32_t id : ids) {
             auto eRes = subShapeAt(shape, SubShapeKind::Edge, id, "chamfer");
             if (!eRes) return std::unexpected(eRes.error());
             const TopoDS_Edge e = TopoDS::Edge(*eRes);
+            if (!shape.impl()->index->edges.Contains(e))
+                return makeError(ErrorCode::KernelFailure, "chamfer: edge " + std::to_string(id) + " does not belong to the shape");
+            if (const std::string why = edgeProblem(e); !why.empty())
+                return makeError(ErrorCode::KernelFailure, "chamfer: edge " + std::to_string(id) + " " + why);
+            // Pre-validation (F37/F39): the setback must be shorter than every NOT-selected edge meeting this edge at a
+            // vertex. Edges of the same selection (a tangent chain) are chamfered together and do not limit the setback.
+            for (int vi = 1; vi <= 2; ++vi) {
+                const TopoDS_Vertex v = vi == 1 ? TopExp::FirstVertex(e, Standard_True) : TopExp::LastVertex(e, Standard_True);
+                if (!vertexEdges.Contains(v)) continue;
+                for (TopTools_ListIteratorOfListOfShape it(vertexEdges.FindFromKey(v)); it.More(); it.Next()) {
+                    const TopoDS_Edge f = TopoDS::Edge(it.Value());
+                    const int fIndex = shape.impl()->index->edges.FindIndex(f) - 1; // 0-based, -1 if unknown
+                    if (f.IsSame(e) || std::binary_search(ids.begin(), ids.end(), static_cast<std::uint32_t>(fIndex))) continue;
+                    GProp_GProps lp;
+                    BRepGProp::LinearProperties(f, lp);
+                    if (setback >= lp.Mass())
+                        return makeError(ErrorCode::KernelFailure, "chamfer distance too large for edge " + std::to_string(id) +
+                                                                       " (setback " + num(setback) + " mm reaches an adjacent edge of " +
+                                                                       num(lp.Mass()) + " mm)");
+                }
+            }
             if (!edgeFaces.Contains(e))
                 return makeError(ErrorCode::KernelFailure, "chamfer: edge " + std::to_string(id) + " has no adjacent face");
             int best = 0;
@@ -576,7 +885,7 @@ Result<ShapeResult> buildChamfer(const Shape& shape, const std::vector<std::uint
         ShapeResult r;
         r.shape = wrapShape(res);
         r.history = extractHistory(mk, {&shape}, *r.shape.impl()->index);
-        return r;
+        return validatedEdgeResult(shape, std::move(r), 2.0 * reach, "chamfer");
     } catch (const StdFail_NotDone&) {
         return makeError(ErrorCode::KernelFailure, "chamfer: kernel could not build the chamfer");
     } catch (const Standard_Failure& e) {
@@ -668,7 +977,9 @@ Result<ShapeResult> revolve(const Shape& profile, const Axis& axis, double angle
     if (profile.type() != ShapeType::Face && profile.type() != ShapeType::Wire)
         return makeError(ErrorCode::InvalidArgument, "revolve: profile must be a planar Face or closed planar Wire");
     if (cancel.cancelled()) return makeError(ErrorCode::Cancelled, "revolve cancelled");
+    ensureOcctSignals();
     try {
+        OCC_CATCH_SIGNALS
         auto face = profileToFace(profile, "revolve");
         if (!face) return std::unexpected(face.error());
         const Vec3 d = normalised(axis.direction);
@@ -683,6 +994,8 @@ Result<ShapeResult> revolve(const Shape& profile, const Axis& axis, double angle
         BRepGProp::VolumeProperties(res, props);
         if (std::abs(props.Mass()) < 1e-12)
             return makeError(ErrorCode::InvalidArgument, "revolve: profile has no area on one side of the axis");
+        if (!guarded(false, [&] { return structurallyValid(res); }))
+            return makeError(ErrorCode::KernelFailure, "revolve: produced an invalid solid");
         ShapeResult r;
         r.shape = wrapShape(res);
         sweepHistory(rv, profile, *r.shape.impl()->index, axis, r.history);
@@ -983,3 +1296,33 @@ Result<ShapeResult> scale(const Shape& shape, const Vec3& center, double factor,
 }
 
 } // namespace iw::kernel
+
+namespace iw::kernel::check {
+
+bool isSolidValid(const Shape& s) {
+    if (s.isNull()) return false;
+    return structurallyValidCached(s);
+}
+
+bool volumesPlausible(BooleanKind kind, double volumeA, double volumeB, double volumeResult) {
+    const double tol = 1e-5 * (volumeA + volumeB) + 1e-6;
+    if (!(volumeResult > -tol)) return false; // also rejects NaN
+    switch (kind) {
+    case BooleanKind::Fuse:
+        return volumeResult >= std::max(volumeA, volumeB) - tol && volumeResult <= volumeA + volumeB + tol;
+    case BooleanKind::Cut: return volumeResult <= volumeA + tol;
+    case BooleanKind::Common: return volumeResult <= std::min(volumeA, volumeB) + tol;
+    }
+    return false;
+}
+
+bool boundsWithin(const Box3& input, const Box3& result, double allowance) {
+    const auto valid = [](const Box3& b) { return b.min.x <= b.max.x && b.min.y <= b.max.y && b.min.z <= b.max.z; };
+    if (!valid(input) || !valid(result)) return false;
+    const double slack = allowance + 1e-6;
+    return result.min.x >= input.min.x - slack && result.max.x <= input.max.x + slack &&
+           result.min.y >= input.min.y - slack && result.max.y <= input.max.y + slack &&
+           result.min.z >= input.min.z - slack && result.max.z <= input.max.z + slack;
+}
+
+} // namespace iw::kernel::check

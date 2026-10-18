@@ -2,6 +2,8 @@
 #include "ui/sketch/session.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <limits>
 #include <cmath>
 #include <memory>
 #include <numbers>
@@ -27,26 +29,38 @@ constexpr double kEps = 1e-7;
 constexpr double kTwoPi = 2.0 * std::numbers::pi;
 constexpr double kAxisTolRad = 1.5 * std::numbers::pi / 180.0;   ///< Near-horizontal / vertical auto-constraint.
 
-/// One undo step: the whole sketch before and after the edit. Snapshots keep the entity ids, so undo and redo
-/// restore exactly the same ids and the id counter never hands out a retired id again.
+/// Everything an undo step restores: the sketch and the session's driven (reference) dimensions.
+struct DocSnapshot {
+    Sketch sketch;
+    std::vector<DrivenDimension> driven;
+};
+
+/// One undo step: the whole document state before and after the edit. Snapshots keep the entity ids, so undo and
+/// redo restore exactly the same ids and the id counter never hands out a retired id again.
 class SketchEditCommand final : public Command {
 public:
-    SketchEditCommand(std::string text, Sketch* target, std::shared_ptr<const Sketch> before,
-                      std::shared_ptr<const Sketch> after)
-        : text_(std::move(text)), target_(target), before_(std::move(before)), after_(std::move(after)) {}
+    SketchEditCommand(std::string text, Sketch* target, std::vector<DrivenDimension>* drivenTarget,
+                      std::shared_ptr<const DocSnapshot> before, std::shared_ptr<const DocSnapshot> after)
+        : text_(std::move(text)), target_(target), drivenTarget_(drivenTarget), before_(std::move(before)),
+          after_(std::move(after)) {}
 
     Result<void> execute() override {
-        *target_ = *after_;
+        *target_ = after_->sketch;
+        *drivenTarget_ = after_->driven;
         return {};
     }
-    void undo() override { *target_ = *before_; }
+    void undo() override {
+        *target_ = before_->sketch;
+        *drivenTarget_ = before_->driven;
+    }
     std::string text() const override { return text_; }
 
 private:
     std::string text_;
     Sketch* target_;
-    std::shared_ptr<const Sketch> before_;
-    std::shared_ptr<const Sketch> after_;
+    std::vector<DrivenDimension>* drivenTarget_;
+    std::shared_ptr<const DocSnapshot> before_;
+    std::shared_ptr<const DocSnapshot> after_;
 };
 
 // ---- small vector helpers -----------------------------------------------------------------------------------
@@ -265,8 +279,8 @@ Result<void> addRectangle(Sketch& s, Point2 a, Point2 b, std::array<SketchEntity
 // ---- snapping and constraint helpers shared by the tools ------------------------------------------------------
 namespace {
 
-/// Constraint a snapped point implies for the point `mine` of a new entity (coincident / midpoint). Other snap kinds
-/// imply nothing for a single point.
+/// Constraint a snapped point implies for the point `mine` of a new entity: coincident, midpoint, or PointOnObject for
+/// on-curve and intersection snaps. Other snap kinds imply nothing for a single point.
 void constrainPoint(Sketch& s, SketchRef mine, const SnapHit& hit) {
     switch (hit.kind) {
     case SnapKind::Endpoint:
@@ -278,6 +292,13 @@ void constrainPoint(Sketch& s, SketchRef mine, const SnapHit& hit) {
             const sketch::SketchEntity* e = s.findEntity(hit.ref->entity);
             if (e && e->kind() == EntityKind::Line) (void)s.addConstraint(ConstraintKind::Midpoint, {mine, *hit.ref});
         }
+        break;
+    case SnapKind::OnCurve:
+        if (hit.ref) (void)s.addConstraint(ConstraintKind::PointOnObject, {mine, *hit.ref});
+        break;
+    case SnapKind::Intersection:
+        if (hit.ref) (void)s.addConstraint(ConstraintKind::PointOnObject, {mine, *hit.ref});
+        if (hit.other) (void)s.addConstraint(ConstraintKind::PointOnObject, {mine, *hit.other});
         break;
     default:
         break;
@@ -351,20 +372,38 @@ SketchSession::SketchSession(sketch::SketchPlane plane) : sketch_(std::move(plan
 
 SketchSession::~SketchSession() = default;
 
+namespace {
+
+/// Driven dimensions whose geometry still exists.
+std::vector<DrivenDimension> pruneDriven(const Sketch& s, std::vector<DrivenDimension> d) {
+    std::erase_if(d, [&](const DrivenDimension& dd) {
+        return std::any_of(dd.refs.begin(), dd.refs.end(), [&](const SketchRef& r) { return !s.findEntity(r.entity); });
+    });
+    return d;
+}
+
+} // namespace
+
+Result<void> SketchSession::commit(std::string text, Sketch next, std::vector<DrivenDimension> drivenNext) {
+    auto before = std::make_shared<const DocSnapshot>(DocSnapshot{sketch_, driven_});
+    auto after = std::make_shared<const DocSnapshot>(DocSnapshot{std::move(next), std::move(drivenNext)});
+    auto cmd = std::make_unique<SketchEditCommand>(std::move(text), &sketch_, &driven_, std::move(before),
+                                                   std::move(after));
+    if (auto r = undo_.push(std::move(cmd)); !r) return std::unexpected(r.error());
+    refresh();
+    return {};
+}
+
 Result<void> SketchSession::apply(std::string text, const std::function<Result<void>(Sketch&)>& edit) {
     Sketch next = sketch_;
     if (auto r = edit(next); !r) return std::unexpected(r.error());
-    const sketch::SketchSolveReport solved = sketch::solveSketch(next);
+    const sketch::SketchSolveReport solved = sketch::solveSketch(next, params_);
     if (!solved.ok()) {
         return makeError(ErrorCode::InvalidArgument,
                          solved.message.empty() ? std::string("the sketch constraints conflict") : solved.message);
     }
-    auto before = std::make_shared<const Sketch>(sketch_);
-    auto after = std::make_shared<const Sketch>(std::move(next));
-    auto cmd = std::make_unique<SketchEditCommand>(std::move(text), &sketch_, std::move(before), std::move(after));
-    if (auto r = undo_.push(std::move(cmd)); !r) return std::unexpected(r.error());
-    refresh();
-    return {};
+    std::vector<DrivenDimension> drivenNext = pruneDriven(next, driven_);
+    return commit(std::move(text), std::move(next), std::move(drivenNext));
 }
 
 Result<void> SketchSession::applyAuto(std::string text, const std::function<Result<void>(Sketch&, bool)>& edit) {
@@ -622,6 +661,9 @@ Result<void> SketchSession::click(Point2 p, double pickToleranceMm) {
         selectAt(p, pickToleranceMm);
         return {};
 
+    case SketchTool::Dimension:
+        return clickDimension(p, pickToleranceMm);
+
     case SketchTool::Trim:
         return trimAt(p, pickToleranceMm);
 
@@ -735,6 +777,11 @@ Result<void> SketchSession::clickLine(Point2 q, const std::optional<SnapHit>& hi
                                                                           : ConstraintKind::Tangent;
             auto c = s.addConstraint(k, {SketchRef{*id, std::nullopt}, *hit->other});
             if (!c) return std::unexpected(c.error());
+            if (hit->kind == SnapKind::Tangent) {
+                // The tangent point is on the circle or arc: pin the end there (tangency alone only fixes the distance).
+                auto on = s.addConstraint(ConstraintKind::PointOnObject, {SketchRef{*id, PointRole::End}, *hit->other});
+                if (!on) return std::unexpected(on.error());
+            }
         } else {
             // Near-axis segments become exactly horizontal or vertical.
             const Point2 d = q - from;
@@ -799,7 +846,7 @@ bool SketchSession::cancel() {
 }
 
 bool SketchSession::hasPending() const noexcept {
-    return lineStart_ || firstCorner_ || circleCenter_ || arcStart_;
+    return lineStart_ || firstCorner_ || circleCenter_ || arcStart_ || !dimPicks_.empty();
 }
 
 std::vector<EntityGeometry> SketchSession::preview() const {
@@ -869,17 +916,770 @@ std::optional<SketchEntityId> SketchSession::nearestEntity(Point2 p, double tolM
     return best;
 }
 
-std::optional<SketchEntityId> SketchSession::selectAt(Point2 p, double tolMm) {
-    selected_ = nearestEntity(p, tolMm);
-    return selected_;
+// ---- selection --------------------------------------------------------------------------------------------------
+
+void SketchSession::select(std::optional<SketchEntityId> id) {
+    selection_.clear();
+    if (id) selection_.push_back(SketchRef{*id, std::nullopt});
+    selConstraint_.reset();
+    selDimension_.reset();
+}
+
+void SketchSession::clearSelection() noexcept {
+    selection_.clear();
+    selConstraint_.reset();
+    selDimension_.reset();
+}
+
+void SketchSession::setSelection(std::vector<SketchRef> items) {
+    std::erase_if(items, [&](const SketchRef& r) { return !sketch_.findEntity(r.entity); });
+    selection_ = std::move(items);
+    selConstraint_.reset();
+    selDimension_.reset();
+}
+
+void SketchSession::selectConstraint(std::optional<sketch::SketchConstraintId> id) {
+    selection_.clear();
+    selDimension_.reset();
+    selConstraint_ = id;
+}
+
+void SketchSession::selectDimension(std::optional<DimensionRef> d) {
+    selection_.clear();
+    selConstraint_.reset();
+    selDimension_ = d;
+}
+
+std::optional<SketchRef> SketchSession::pickPointAt(Point2 p, double tolMm) const {
+    std::optional<SketchRef> best;
+    double bestDist = tolMm;
+    auto consider = [&](SketchRef ref, Point2 at) {
+        const double d = sketch::distance(p, at);
+        if (d <= bestDist && (!best || d < bestDist)) {
+            best = ref;
+            bestDist = d;
+        }
+    };
+    for (const auto& [id, e] : sketch_.entities()) {
+        std::visit(
+            [&](const auto& x) {
+                using T = std::decay_t<decltype(x)>;
+                if constexpr (std::is_same_v<T, sketch::PointGeom>) {
+                    consider(SketchRef{id, std::nullopt}, x.p);
+                } else if constexpr (std::is_same_v<T, LineGeom>) {
+                    consider(SketchRef{id, PointRole::Start}, x.start);
+                    consider(SketchRef{id, PointRole::End}, x.end);
+                } else if constexpr (std::is_same_v<T, sketch::ArcGeom>) {
+                    consider(SketchRef{id, PointRole::Start}, sketch::arcStart(x));
+                    consider(SketchRef{id, PointRole::End}, sketch::arcEnd(x));
+                    consider(SketchRef{id, PointRole::Center}, x.center);
+                } else {
+                    consider(SketchRef{id, PointRole::Center}, x.center);
+                }
+            },
+            e.geometry);
+    }
+    return best;
+}
+
+std::optional<SketchEntityId> SketchSession::selectAt(Point2 p, double tolMm, bool additive) {
+    std::optional<SketchRef> item = pickPointAt(p, tolMm);
+    if (!item) {
+        if (const auto e = nearestEntity(p, tolMm)) item = SketchRef{*e, std::nullopt};
+    }
+    selConstraint_.reset();
+    selDimension_.reset();
+    if (!item) {
+        if (!additive) selection_.clear();
+        return std::nullopt;
+    }
+    if (!additive) {
+        selection_ = {*item};
+    } else if (const auto it = std::find(selection_.begin(), selection_.end(), *item); it != selection_.end()) {
+        selection_.erase(it);
+    } else {
+        selection_.push_back(*item);
+    }
+    return item->entity;
+}
+
+// ---- constraints --------------------------------------------------------------------------------------------------
+namespace {
+
+std::string fmtNum(double v) {
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%.4f", v);
+    std::string t = buf;
+    while (!t.empty() && t.back() == '0') t.pop_back();
+    if (!t.empty() && t.back() == '.') t.pop_back();
+    if (t == "-0" || t.empty()) t = "0";
+    return t;
+}
+
+template <class T> bool contains(const std::vector<T>& v, const T& x) { return std::find(v.begin(), v.end(), x) != v.end(); }
+
+/// Where a curve's glyph sits: line / arc middle, a point itself, a circle on its upper right.
+Point2 entityAnchor(const EntityGeometry& g) {
+    return std::visit(
+        [](const auto& x) -> Point2 {
+            using T = std::decay_t<decltype(x)>;
+            if constexpr (std::is_same_v<T, sketch::PointGeom>) return x.p;
+            else if constexpr (std::is_same_v<T, LineGeom>) return (x.start + x.end) * 0.5;
+            else if constexpr (std::is_same_v<T, sketch::ArcGeom>) return sketch::arcMid(x);
+            else return polar(x.center, x.radius, std::numbers::pi / 4);
+        },
+        g);
+}
+
+const char* glyphLabel(ConstraintKind k) {
+    switch (k) {
+    case ConstraintKind::Horizontal: return "H";
+    case ConstraintKind::Vertical: return "V";
+    case ConstraintKind::Parallel: return "//";
+    case ConstraintKind::Perpendicular: return "_|_";
+    case ConstraintKind::Tangent: return "T";
+    case ConstraintKind::Equal: return "=";
+    case ConstraintKind::Concentric: return "O";
+    case ConstraintKind::Midpoint: return "M";
+    case ConstraintKind::Collinear: return "CL";
+    case ConstraintKind::Symmetric: return "S";
+    case ConstraintKind::Fix: return "F";
+    case ConstraintKind::PointOnObject: return "P";
+    case ConstraintKind::Coincident: return "";
+    }
+    return "";
+}
+
+} // namespace
+
+Result<std::vector<sketch::SketchConstraintId>> SketchSession::applyConstraint(ConstraintKind kind) {
+    if (selection_.empty()) return makeError(ErrorCode::InvalidArgument, "select geometry first");
+    std::vector<SketchEntityId> curves;   // whole non-point entities, click order
+    std::vector<SketchRef> points;        // sub-points and point entities
+    for (const SketchRef& r : selection_) {
+        const sketch::SketchEntity* e = sketch_.findEntity(r.entity);
+        if (!e) continue;
+        if (r.role || e->kind() == EntityKind::Point) {
+            points.push_back(r.role ? r : SketchRef{r.entity, std::nullopt});
+        } else if (!contains(curves, r.entity)) {
+            curves.push_back(r.entity);
+        }
+    }
+    auto kindOf = [&](SketchEntityId id) { return sketch_.findEntity(id)->kind(); };
+    auto isLine = [&](SketchEntityId id) { return kindOf(id) == EntityKind::Line; };
+    auto isRound = [&](SketchEntityId id) { return kindOf(id) == EntityKind::Circle || kindOf(id) == EntityKind::Arc; };
+    auto whole = [](SketchEntityId id) { return SketchRef{id, std::nullopt}; };
+
+    std::vector<std::pair<ConstraintKind, std::vector<SketchRef>>> adds;
+    const auto fail = [](const char* text) {
+        return makeError(ErrorCode::InvalidArgument, std::string(text));
+    };
+    switch (kind) {
+    case ConstraintKind::Horizontal:
+    case ConstraintKind::Vertical:
+        if (!curves.empty()) {
+            for (SketchEntityId id : curves) {
+                if (!isLine(id)) return fail("horizontal and vertical apply to lines or to two points");
+                adds.push_back({kind, {whole(id)}});
+            }
+        } else if (points.size() == 2) {
+            adds.push_back({kind, {points[0], points[1]}});
+        } else {
+            return fail("select lines, or two points");
+        }
+        break;
+    case ConstraintKind::Parallel:
+    case ConstraintKind::Perpendicular:
+    case ConstraintKind::Collinear:
+        if (curves.size() != 2 || !points.empty() || !isLine(curves[0]) || !isLine(curves[1]))
+            return fail("select two lines");
+        adds.push_back({kind, {whole(curves[0]), whole(curves[1])}});
+        break;
+    case ConstraintKind::Equal:
+        if (curves.size() != 2 || !points.empty() || (isLine(curves[0]) != isLine(curves[1])))
+            return fail("select two lines, or two circles / arcs");
+        adds.push_back({kind, {whole(curves[0]), whole(curves[1])}});
+        break;
+    case ConstraintKind::Tangent:
+        if (curves.size() != 2 || !points.empty() || (isLine(curves[0]) && isLine(curves[1])))
+            return fail("select a line and a circle / arc, or two circles / arcs");
+        adds.push_back({kind, {whole(curves[0]), whole(curves[1])}});
+        break;
+    case ConstraintKind::Concentric:
+        if (curves.size() != 2 || !points.empty() || !isRound(curves[0]) || !isRound(curves[1]))
+            return fail("select two circles / arcs");
+        adds.push_back({kind, {whole(curves[0]), whole(curves[1])}});
+        break;
+    case ConstraintKind::Coincident:
+        if (points.size() != 2 || !curves.empty() || points[0] == points[1]) return fail("select two points");
+        adds.push_back({kind, {points[0], points[1]}});
+        break;
+    case ConstraintKind::Midpoint:
+        if (points.size() != 1 || curves.size() != 1 || !isLine(curves[0])) return fail("select a point and a line");
+        adds.push_back({kind, {points[0], whole(curves[0])}});
+        break;
+    case ConstraintKind::PointOnObject:
+        if (points.size() != 1 || curves.size() != 1 || points[0].entity == curves[0])
+            return fail("select a point and a line, circle or arc");
+        adds.push_back({kind, {points[0], whole(curves[0])}});
+        break;
+    case ConstraintKind::Symmetric:
+        if (points.size() == 2 && curves.size() == 1 && isLine(curves[0])) {
+            adds.push_back({kind, {points[0], points[1], whole(curves[0])}});
+        } else if (points.size() == 3 && curves.empty()) {
+            adds.push_back({kind, {points[0], points[1], points[2]}});
+        } else {
+            return fail("select two points and a line, or three points");
+        }
+        break;
+    case ConstraintKind::Fix: {
+        std::vector<SketchEntityId> ents = curves;
+        for (const SketchRef& r : points)
+            if (!contains(ents, r.entity)) ents.push_back(r.entity);
+        for (SketchEntityId id : ents) {
+            const bool already = std::any_of(sketch_.constraints().begin(), sketch_.constraints().end(), [&](const auto& kv) {
+                return kv.second.kind == ConstraintKind::Fix && kv.second.refs[0].entity == id;
+            });
+            if (!already) adds.push_back({kind, {whole(id)}});
+        }
+        if (adds.empty()) return fail("already fixed");
+        break;
+    }
+    }
+
+    Sketch next = sketch_;
+    std::vector<sketch::SketchConstraintId> ids;
+    for (auto& [k, refs] : adds) {
+        auto id = next.addConstraint(k, refs);
+        if (!id) return std::unexpected(id.error());
+        ids.push_back(*id);
+    }
+    const sketch::SketchSolveReport rep = sketch::solveSketch(next, params_);
+    if (rep.status == sketch::SolverStatus::InvalidInput) return makeError(ErrorCode::InvalidArgument, rep.message);
+    if (!rep.ok()) return makeError(ErrorCode::InvalidArgument, "the constraint conflicts with the existing ones");
+    for (auto id : ids) {
+        if (contains(rep.redundantConstraints, id) || contains(rep.partiallyRedundantConstraints, id))
+            return makeError(ErrorCode::InvalidArgument, "the sketch already implies this constraint");
+    }
+    if (auto r = commit("Add Constraint", std::move(next), pruneDriven(sketch_, driven_)); !r) return std::unexpected(r.error());
+    return ids;
+}
+
+Result<void> SketchSession::toggleFix() {
+    std::vector<SketchEntityId> ents;
+    for (const SketchRef& r : selection_)
+        if (sketch_.findEntity(r.entity) && !contains(ents, r.entity)) ents.push_back(r.entity);
+    if (ents.empty()) return makeError(ErrorCode::InvalidArgument, "select geometry first");
+    auto fixOf = [&](SketchEntityId id) -> std::optional<sketch::SketchConstraintId> {
+        for (const auto& [cid, c] : sketch_.constraints())
+            if (c.kind == ConstraintKind::Fix && c.refs[0].entity == id) return cid;
+        return std::nullopt;
+    };
+    const bool allFixed = std::all_of(ents.begin(), ents.end(), [&](SketchEntityId id) { return fixOf(id).has_value(); });
+    if (!allFixed) {
+        auto r = applyConstraint(ConstraintKind::Fix);
+        if (!r) return std::unexpected(r.error());
+        return {};
+    }
+    std::vector<sketch::SketchConstraintId> ids;
+    for (SketchEntityId id : ents) ids.push_back(*fixOf(id));
+    return apply("Unfix", [&](Sketch& s) -> Result<void> {
+        for (auto cid : ids)
+            if (auto r = s.removeConstraint(cid); !r) return r;
+        return {};
+    });
+}
+
+Result<void> SketchSession::removeConstraint(sketch::SketchConstraintId id) {
+    return apply("Delete Constraint", [&](Sketch& s) { return s.removeConstraint(id); });
+}
+
+Result<void> SketchSession::removeDimension(std::uint64_t id, bool drivenDim) {
+    if (drivenDim) {
+        std::vector<DrivenDimension> next = driven_;
+        const auto n = std::erase_if(next, [&](const DrivenDimension& d) { return d.id == id; });
+        if (n == 0) return makeError(ErrorCode::NotFound, "no such dimension");
+        return commit("Delete Dimension", sketch_, std::move(next));
+    }
+    return apply("Delete Dimension", [&](Sketch& s) { return s.removeDimension(sketch::SketchDimensionId{id}); });
+}
+
+Result<void> SketchSession::deleteSelection() {
+    if (selConstraint_) return removeConstraint(*selConstraint_);
+    if (selDimension_) return removeDimension(selDimension_->id, selDimension_->driven);
+    std::vector<SketchEntityId> ents;
+    for (const SketchRef& r : selection_)
+        if (!contains(ents, r.entity)) ents.push_back(r.entity);
+    if (ents.empty()) return makeError(ErrorCode::NotFound, "nothing selected");
+    return apply("Delete", [&](Sketch& s) -> Result<void> {
+        for (SketchEntityId id : ents)
+            if (auto r = s.removeEntity(id); !r) return r;
+        return {};
+    });
+}
+
+std::vector<ConstraintGlyph> SketchSession::glyphs() const {
+    std::vector<ConstraintGlyph> out;
+    std::vector<std::pair<Point2, int>> used;   // anchors already taken, with their slot counts
+    for (const auto& [id, c] : sketch_.constraints()) {
+        if (c.refs.empty()) continue;
+        std::optional<Point2> at;
+        auto entityAt = [&](const SketchRef& r) -> std::optional<Point2> {
+            const sketch::SketchEntity* e = sketch_.findEntity(r.entity);
+            if (!e) return std::nullopt;
+            return entityAnchor(e->geometry);
+        };
+        auto pointAt = [&](const SketchRef& r) -> std::optional<Point2> {
+            auto q = sketch_.pointOf(r);
+            if (!q) return std::nullopt;
+            return *q;
+        };
+        switch (c.kind) {
+        case ConstraintKind::Horizontal:
+        case ConstraintKind::Vertical:
+            if (c.refs.size() == 1) {
+                at = entityAt(c.refs[0]);
+            } else {
+                const auto a = pointAt(c.refs[0]), b = pointAt(c.refs[1]);
+                if (a && b) at = (*a + *b) * 0.5;
+            }
+            break;
+        case ConstraintKind::Coincident:
+        case ConstraintKind::Midpoint:
+        case ConstraintKind::PointOnObject:
+        case ConstraintKind::Symmetric:
+            at = pointAt(c.refs[0]);
+            break;
+        case ConstraintKind::Concentric: {
+            const sketch::SketchEntity* e = sketch_.findEntity(c.refs[0].entity);
+            if (e) at = pointAt(SketchRef{c.refs[0].entity, PointRole::Center});
+            break;
+        }
+        case ConstraintKind::Tangent: {
+            // The tangent point: foot of the round curve's centre on the line, or on the first round curve.
+            const sketch::SketchEntity* a = sketch_.findEntity(c.refs[0].entity);
+            const sketch::SketchEntity* b = c.refs.size() > 1 ? sketch_.findEntity(c.refs[1].entity) : nullptr;
+            if (a && b) {
+                const sketch::SketchEntity* ln = a->kind() == EntityKind::Line ? a : (b->kind() == EntityKind::Line ? b : nullptr);
+                const sketch::SketchEntity* rd = ln == a ? b : a;
+                const auto gr = geoOf(rd->geometry);
+                if (ln && gr) {
+                    const Geo gl = *geoOf(ln->geometry);
+                    at = gl.p + gl.dir * lineParam(gl, gr->c);
+                } else if (gr) {
+                    const auto g2 = geoOf((rd == a ? b : a)->geometry);
+                    if (g2) at = gr->c + unitp(g2->c - gr->c) * gr->r;
+                }
+            }
+            break;
+        }
+        default:
+            at = entityAt(c.refs[0]);
+            break;
+        }
+        if (!at) continue;
+        int slot = 0;
+        for (auto& [pt, n] : used) {
+            if (sketch::distance(pt, *at) < 1e-6) {
+                slot = n++;
+                break;
+            }
+        }
+        if (slot == 0) used.emplace_back(*at, 1);
+        ConstraintGlyph g;
+        g.id = id;
+        g.kind = c.kind;
+        g.anchor = *at;
+        g.slot = slot;
+        g.label = glyphLabel(c.kind);
+        g.conflicting = contains(report_.conflictingConstraints, id) || contains(report_.redundantConstraints, id) ||
+                        contains(report_.partiallyRedundantConstraints, id);
+        out.push_back(std::move(g));
+    }
+    return out;
+}
+
+ConstraintState SketchSession::constraintState() const {
+    const bool bad = report_.status == sketch::SolverStatus::Failed || !report_.conflictingConstraints.empty() ||
+                     !report_.conflictingDimensions.empty() || !report_.redundantConstraints.empty() ||
+                     !report_.redundantDimensions.empty();
+    if (bad) return ConstraintState::Conflicting;
+    if (report_.ok() && report_.dof == 0 && !sketch_.entities().empty()) return ConstraintState::Fully;
+    return ConstraintState::Under;
+}
+
+// ---- dimensions ---------------------------------------------------------------------------------------------------
+
+Result<double> SketchSession::measure(sketch::DimensionKind kind, const std::vector<SketchRef>& refs) const {
+    using DK = sketch::DimensionKind;
+    auto pt = [&](std::size_t i) { return sketch_.pointOf(refs[i]); };
+    switch (kind) {
+    case DK::Distance:
+    case DK::DistanceX:
+    case DK::DistanceY: {
+        if (refs.size() != 2) return makeError(ErrorCode::InvalidArgument, "a distance needs two points");
+        auto a = pt(0), b = pt(1);
+        if (!a) return std::unexpected(a.error());
+        if (!b) return std::unexpected(b.error());
+        if (kind == DK::Distance) return sketch::distance(*a, *b);
+        return kind == DK::DistanceX ? b->x - a->x : b->y - a->y;
+    }
+    case DK::Radius:
+    case DK::Diameter: {
+        if (refs.size() != 1) return makeError(ErrorCode::InvalidArgument, "a radius needs one circle or arc");
+        const sketch::SketchEntity* e = sketch_.findEntity(refs[0].entity);
+        if (!e) return makeError(ErrorCode::NotFound, "no such entity");
+        double r = 0;
+        if (const auto* c = std::get_if<sketch::CircleGeom>(&e->geometry)) r = c->radius;
+        else if (const auto* a = std::get_if<sketch::ArcGeom>(&e->geometry)) r = a->radius;
+        else return makeError(ErrorCode::InvalidArgument, "a radius needs a circle or arc");
+        return kind == DK::Radius ? r : 2 * r;
+    }
+    case DK::Angle: {
+        if (refs.size() != 2) return makeError(ErrorCode::InvalidArgument, "an angle needs two lines");
+        const sketch::SketchEntity* a = sketch_.findEntity(refs[0].entity);
+        const sketch::SketchEntity* b = sketch_.findEntity(refs[1].entity);
+        if (!a || !b) return makeError(ErrorCode::NotFound, "no such entity");
+        const auto* la = std::get_if<LineGeom>(&a->geometry);
+        const auto* lb = std::get_if<LineGeom>(&b->geometry);
+        if (!la || !lb) return makeError(ErrorCode::InvalidArgument, "an angle needs two lines");
+        const Point2 d1 = la->end - la->start, d2 = lb->end - lb->start;
+        return std::atan2(crossp(d1, d2), dotp(d1, d2)) * 180.0 / std::numbers::pi;
+    }
+    }
+    return makeError(ErrorCode::InvalidArgument, "unknown dimension kind");
+}
+
+Result<SketchSession::DimensionPlan> SketchSession::planDimension(const std::vector<SketchRef>& picks,
+                                                                  Point2 mouse) const {
+    using DK = sketch::DimensionKind;
+    const auto bad = [](const char* t) { return makeError(ErrorCode::InvalidArgument, std::string(t)); };
+    auto entityOf = [&](const SketchRef& r) { return sketch_.findEntity(r.entity); };
+    auto isPointRef = [&](const SketchRef& r) {
+        const sketch::SketchEntity* e = entityOf(r);
+        return e && (r.role || e->kind() == EntityKind::Point);
+    };
+    DimensionPlan plan;
+    if (picks.size() == 1) {
+        const sketch::SketchEntity* e = entityOf(picks[0]);
+        if (!e || isPointRef(picks[0])) return bad("pick a line, circle or arc, or two points");
+        switch (e->kind()) {
+        case EntityKind::Line:
+            plan.kind = DK::Distance;
+            plan.refs = {SketchRef{picks[0].entity, PointRole::Start}, SketchRef{picks[0].entity, PointRole::End}};
+            break;
+        case EntityKind::Circle:
+            plan.kind = DK::Diameter;
+            plan.refs = {SketchRef{picks[0].entity, std::nullopt}};
+            break;
+        case EntityKind::Arc:
+            plan.kind = DK::Radius;
+            plan.refs = {SketchRef{picks[0].entity, std::nullopt}};
+            break;
+        default:
+            return bad("pick a line, circle or arc, or two points");
+        }
+        return plan;
+    }
+    if (picks.size() != 2) return bad("pick one or two things to dimension");
+    if (isPointRef(picks[0]) && isPointRef(picks[1])) {
+        auto a = sketch_.pointOf(picks[0]), b = sketch_.pointOf(picks[1]);
+        if (!a || !b) return bad("bad point");
+        if (sketch::distance(*a, *b) < kEps) return bad("the two points coincide");
+        const double x0 = std::min(a->x, b->x), x1 = std::max(a->x, b->x);
+        const double y0 = std::min(a->y, b->y), y1 = std::max(a->y, b->y);
+        const bool inX = mouse.x >= x0 && mouse.x <= x1, inY = mouse.y >= y0 && mouse.y <= y1;
+        plan.refs = {picks[0], picks[1]};
+        if (inX && !inY) {
+            plan.kind = DK::DistanceX;
+            if (b->x < a->x) std::swap(plan.refs[0], plan.refs[1]);
+        } else if (inY && !inX) {
+            plan.kind = DK::DistanceY;
+            if (b->y < a->y) std::swap(plan.refs[0], plan.refs[1]);
+        } else {
+            plan.kind = DK::Distance;
+        }
+        return plan;
+    }
+    const sketch::SketchEntity* ea = entityOf(picks[0]);
+    const sketch::SketchEntity* eb = entityOf(picks[1]);
+    if (ea && eb && !isPointRef(picks[0]) && !isPointRef(picks[1]) && ea->kind() == EntityKind::Line &&
+        eb->kind() == EntityKind::Line && picks[0].entity != picks[1].entity) {
+        plan.kind = DK::Angle;
+        plan.refs = {SketchRef{picks[0].entity, std::nullopt}, SketchRef{picks[1].entity, std::nullopt}};
+        auto m = measure(DK::Angle, plan.refs);
+        if (m && *m < 0) std::swap(plan.refs[0], plan.refs[1]);
+        return plan;
+    }
+    return bad("pick two points or two lines");
+}
+
+Result<Quantity> SketchSession::evaluateExpression(sketch::DimensionKind kind, const std::string& expression) const {
+    auto parsed = Expression::parse(expression);
+    if (!parsed) return std::unexpected(parsed.error());
+    ParameterLookup lookup = [this](std::string_view name) -> Result<Quantity> {
+        if (!params_) return makeError(ErrorCode::NotFound, "unknown parameter '" + std::string(name) + "'");
+        return params_->evaluate(name);
+    };
+    auto q = parsed->evaluate(lookup);
+    if (!q) return std::unexpected(q.error());
+    const bool angle = kind == sketch::DimensionKind::Angle;
+    if (q->dim == Dimension::Unitless)
+        return angle ? Quantity::radians(q->value * std::numbers::pi / 180.0) : Quantity::mm(q->value);
+    if (angle ? q->dim == Dimension::Angle : q->dim == Dimension::Length) return *q;
+    return makeError(ErrorCode::InvalidArgument, "the expression is a " + dimensionName(q->dim) + ", expected " +
+                                                     (angle ? "an angle" : "a length"));
+}
+
+Result<SketchSession::DimensionTry> SketchSession::addDimension(sketch::DimensionKind kind, std::vector<SketchRef> refs,
+                                                                std::string expression) {
+    if (expression.empty()) {
+        auto m = measure(kind, refs);
+        if (!m) return std::unexpected(m.error());
+        expression = fmtNum(*m);
+        if (kind == sketch::DimensionKind::Angle) expression += " deg";
+    } else if (auto v = evaluateExpression(kind, expression); !v) {
+        return std::unexpected(v.error());
+    }
+    Sketch next = sketch_;
+    auto id = next.addDimension(kind, std::move(refs), expression);
+    if (!id) return std::unexpected(id.error());
+    const sketch::SketchSolveReport rep = sketch::solveSketch(next, params_);
+    DimensionTry out;
+    if (rep.status == sketch::SolverStatus::InvalidInput) return makeError(ErrorCode::InvalidArgument, rep.message);
+    if (!rep.ok()) {
+        out.overConstrains = true;
+        out.message = "the dimension conflicts with the existing constraints";
+        return out;
+    }
+    if (contains(rep.redundantDimensions, *id) || contains(rep.partiallyRedundantDimensions, *id)) {
+        out.overConstrains = true;
+        out.message = "the sketch already fixes this measure";
+        return out;
+    }
+    if (auto r = commit("Add Dimension", std::move(next), driven_); !r) return std::unexpected(r.error());
+    out.id = *id;
+    return out;
+}
+
+Result<std::uint64_t> SketchSession::addDrivenDimension(sketch::DimensionKind kind, std::vector<SketchRef> refs) {
+    if (auto m = measure(kind, refs); !m) return std::unexpected(m.error());
+    for (const SketchRef& r : refs)
+        if (!sketch_.findEntity(r.entity)) return makeError(ErrorCode::NotFound, "no such entity");
+    std::vector<DrivenDimension> next = driven_;
+    DrivenDimension d;
+    d.id = nextDriven_++;
+    d.kind = kind;
+    d.refs = std::move(refs);
+    next.push_back(d);
+    if (auto r = commit("Add Reference Dimension", sketch_, std::move(next)); !r) return std::unexpected(r.error());
+    return d.id;
+}
+
+Result<void> SketchSession::setDimensionExpression(sketch::SketchDimensionId id, std::string expression) {
+    const auto it = sketch_.dimensions().find(id);
+    if (it == sketch_.dimensions().end()) return makeError(ErrorCode::NotFound, "no such dimension");
+    if (auto v = evaluateExpression(it->second.kind, expression); !v) return std::unexpected(v.error());
+    return apply("Edit Dimension", [&](Sketch& s) { return s.setDimensionExpression(id, expression); });
+}
+
+std::vector<DimensionView> SketchSession::dimensionViews() const {
+    std::vector<DimensionView> out;
+    auto prefix = [](sketch::DimensionKind k) -> std::string {
+        return k == sketch::DimensionKind::Radius ? "R" : (k == sketch::DimensionKind::Diameter ? "\xC3\x98" : "");
+    };
+    auto suffix = [](sketch::DimensionKind k) -> std::string { return k == sketch::DimensionKind::Angle ? "\xC2\xB0" : ""; };
+    for (const auto& [id, d] : sketch_.dimensions()) {
+        DimensionView v;
+        v.id = id.value();
+        v.kind = d.kind;
+        v.refs = d.refs;
+        v.expression = d.expression;
+        v.value = std::numeric_limits<double>::quiet_NaN();
+        v.conflicting = contains(report_.conflictingDimensions, id) || contains(report_.redundantDimensions, id) ||
+                        contains(report_.partiallyRedundantDimensions, id);
+        if (auto q = evaluateExpression(d.kind, d.expression)) {
+            v.value = d.kind == sketch::DimensionKind::Angle ? q->value * 180.0 / std::numbers::pi : q->value;
+            bool literal = false;
+            if (auto parsed = Expression::parse(d.expression)) literal = parsed->root().kind == ExprNode::Kind::Literal;
+            v.text = prefix(d.kind) + (literal ? "" : d.expression + " = ") + fmtNum(v.value) + suffix(d.kind);
+        } else {
+            v.text = "?";
+            v.conflicting = true;
+        }
+        out.push_back(std::move(v));
+    }
+    for (const DrivenDimension& d : driven_) {
+        DimensionView v;
+        v.id = d.id;
+        v.driven = true;
+        v.kind = d.kind;
+        v.refs = d.refs;
+        if (auto m = measure(d.kind, d.refs)) {
+            v.value = std::abs(*m);
+            v.text = "(" + prefix(d.kind) + fmtNum(v.value) + suffix(d.kind) + ")";
+        } else {
+            v.value = std::numeric_limits<double>::quiet_NaN();
+            v.text = "(?)";
+        }
+        out.push_back(std::move(v));
+    }
+    return out;
+}
+
+std::optional<DimensionEvent> SketchSession::takeDimensionEvent() {
+    auto e = std::move(dimEvent_);
+    dimEvent_.reset();
+    return e;
+}
+
+Result<void> SketchSession::clickDimension(Point2 p, double tolMm) {
+    const auto pt = pickPointAt(p, tolMm);
+    const auto ent = nearestEntity(p, tolMm);
+    auto isPointRef = [&](const SketchRef& r) {
+        const sketch::SketchEntity* e = sketch_.findEntity(r.entity);
+        return e && (r.role || e->kind() == EntityKind::Point);
+    };
+    auto place = [&]() -> Result<void> {
+        auto plan = planDimension(dimPicks_, p);
+        dimPicks_.clear();
+        if (!plan) return std::unexpected(plan.error());
+        auto t = addDimension(plan->kind, plan->refs);
+        if (!t) return std::unexpected(t.error());
+        DimensionEvent ev;
+        ev.kind = plan->kind;
+        ev.refs = plan->refs;
+        if (t->overConstrains) {
+            ev.type = DimensionEvent::Type::OverConstrains;
+            ev.message = t->message;
+        } else {
+            ev.type = DimensionEvent::Type::Created;
+            ev.id = t->id->value();
+        }
+        dimEvent_ = std::move(ev);
+        return {};
+    };
+
+    if (dimPicks_.empty()) {
+        if (pt) {
+            dimPicks_.push_back(*pt);
+        } else if (ent) {
+            dimPicks_.push_back(SketchRef{*ent, std::nullopt});
+        } else {
+            return makeError(ErrorCode::InvalidArgument, "pick a line, circle, arc or point to dimension");
+        }
+        return {};
+    }
+    if (dimPicks_.size() == 1) {
+        const SketchRef first = dimPicks_[0];
+        if (isPointRef(first)) {
+            if (!pt || *pt == first) return makeError(ErrorCode::InvalidArgument, "pick a second point");
+            dimPicks_.push_back(*pt);
+            return {};
+        }
+        const sketch::SketchEntity* fe = sketch_.findEntity(first.entity);
+        if (fe && fe->kind() == EntityKind::Line && ent && *ent != first.entity &&
+            sketch_.findEntity(*ent)->kind() == EntityKind::Line) {
+            dimPicks_.push_back(SketchRef{*ent, std::nullopt});   // two lines: an angle
+            return {};
+        }
+        return place();
+    }
+    return place();
+}
+
+// ---- live drag ----------------------------------------------------------------------------------------------------
+
+Result<void> SketchSession::beginDrag(const SketchRef& point) {
+    if (drag_) endDrag();
+    const sketch::SketchEntity* e = sketch_.findEntity(point.entity);
+    if (!e) return makeError(ErrorCode::NotFound, "no such entity");
+    const bool ok = e->kind() == EntityKind::Point ||
+                    (point.role && (*point.role == PointRole::Start || *point.role == PointRole::End ||
+                                    *point.role == PointRole::Center));
+    if (!ok) return makeError(ErrorCode::InvalidArgument, "only points can be dragged");
+    if (auto q = sketch_.pointOf(point); !q) return std::unexpected(q.error());
+    drag_ = DragState{point, std::make_shared<const Sketch>(sketch_), driven_, false};
+    return {};
+}
+
+Result<void> SketchSession::dragTo(Point2 target) {
+    if (!drag_) return makeError(ErrorCode::InvalidArgument, "no drag in progress");
+    const auto cur = sketch_.pointOf(drag_->point);
+    if (!cur) return std::unexpected(cur.error());
+    // The dragged point is held at the target by a temporary fixed point it is made coincident with. When the
+    // constraints cannot follow all the way, retry with half the step.
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        const Point2 goal = *cur + (target - *cur) * std::pow(0.5, attempt);
+        Sketch trial = sketch_;
+        auto pin = trial.addPoint(goal, true);
+        if (!pin) return std::unexpected(pin.error());
+        (void)trial.addConstraint(ConstraintKind::Fix, {SketchRef{*pin, std::nullopt}});
+        (void)trial.addConstraint(ConstraintKind::Coincident, {drag_->point, SketchRef{*pin, std::nullopt}});
+        if (!sketch::solveSketch(trial, params_).ok()) continue;
+        std::vector<SketchEntityId> ids;
+        for (const auto& [id, e] : sketch_.entities()) ids.push_back(id);
+        for (SketchEntityId id : ids) (void)sketch_.setGeometry(id, trial.findEntity(id)->geometry);
+        auto profiles = sketch::detectProfiles(sketch_);
+        profiles_ = profiles ? std::move(*profiles) : std::vector<sketch::SketchProfile>{};
+        drag_->moved = true;
+        return {};
+    }
+    return makeError(ErrorCode::InvalidArgument, "the constraints do not let the point move there");
+}
+
+void SketchSession::endDrag() {
+    if (!drag_) return;
+    DragState d = std::move(*drag_);
+    drag_.reset();
+    if (d.moved) {
+        auto before = std::make_shared<const DocSnapshot>(DocSnapshot{*d.before, d.beforeDriven});
+        auto after = std::make_shared<const DocSnapshot>(DocSnapshot{sketch_, driven_});
+        auto cmd = std::make_unique<SketchEditCommand>("Drag", &sketch_, &driven_, std::move(before), std::move(after));
+        (void)undo_.push(std::move(cmd));
+    }
+    refresh();
+}
+
+Result<void> SketchSession::resolve() {
+    Sketch next = sketch_;
+    const sketch::SketchSolveReport rep = sketch::solveSketch(next, params_);
+    if (!rep.ok()) {
+        return makeError(ErrorCode::InvalidArgument,
+                         rep.message.empty() ? std::string("the sketch constraints conflict") : rep.message);
+    }
+    bool moved = false;
+    for (const auto& [id, e] : sketch_.entities()) {
+        const sketch::SketchEntity* n = next.findEntity(id);
+        if (!n) continue;
+        const auto flat = [](const EntityGeometry& g) {
+            return std::visit(
+                [](const auto& x) -> std::array<double, 5> {
+                    using T = std::decay_t<decltype(x)>;
+                    if constexpr (std::is_same_v<T, sketch::PointGeom>) return {x.p.x, x.p.y, 0, 0, 0};
+                    else if constexpr (std::is_same_v<T, LineGeom>) return {x.start.x, x.start.y, x.end.x, x.end.y, 0};
+                    else if constexpr (std::is_same_v<T, sketch::ArcGeom>) return {x.center.x, x.center.y, x.radius, x.startAngle, x.sweep};
+                    else return {x.center.x, x.center.y, x.radius, 0, 0};
+                },
+                g);
+        };
+        const auto a = flat(e.geometry), b = flat(n->geometry);
+        for (std::size_t i = 0; i < a.size(); ++i) moved = moved || std::abs(a[i] - b[i]) > 1e-9;
+    }
+    if (!moved) {
+        refresh();
+        return {};
+    }
+    return commit("Update Parameters", std::move(next), driven_);
 }
 
 Result<void> SketchSession::trimAt(Point2 p, double tolMm) {
     const auto target = nearestEntity(p, tolMm);
     if (!target) return makeError(ErrorCode::InvalidArgument, "nothing to trim at that point");
     const sketch::SketchEntity& e = *sketch_.findEntity(*target);
+    if (e.kind() == EntityKind::Circle) return trimCircle(*target, p);
     if (e.kind() != EntityKind::Line && e.kind() != EntityKind::Arc)
-        return makeError(ErrorCode::InvalidArgument, "only lines and arcs can be trimmed");
+        return makeError(ErrorCode::InvalidArgument, "only lines, arcs and circles can be trimmed");
     const Geo geo = *geoOf(e.geometry);
     auto paramOf = [&](Point2 q) {
         if (!geo.circle) return lineParam(geo, q);
@@ -974,8 +1774,17 @@ Result<void> SketchSession::trimAt(Point2 p, double tolMm) {
                     if (r.entity != *target) {
                         mapped.push_back(r);
                     } else if (!r.role) {
-                        if (keepsOnPiece(kind)) mapped.push_back({pc.id, std::nullopt});
-                        else ok = false;
+                        if (keepsOnPiece(kind)) {
+                            mapped.push_back({pc.id, std::nullopt});
+                        } else if (kind == ConstraintKind::PointOnObject && &r == &refs[1] && refs[0].entity != *target) {
+                            // The point stays on the curve only if it falls within this piece.
+                            const auto q = s.pointOf(refs[0]);
+                            const double t = q ? paramOf(*q) : -1.0;
+                            if (q && t >= pc.t0 - 1e-9 && t <= pc.t1 + 1e-9) mapped.push_back({pc.id, std::nullopt});
+                            else ok = false;
+                        } else {
+                            ok = false;
+                        }
                     } else if (*r.role == PointRole::Start && pc.t0 <= 1e-12) {
                         mapped.push_back({pc.id, PointRole::Start});
                     } else if (*r.role == PointRole::End && pc.t1 >= 1 - 1e-12) {
@@ -991,6 +1800,110 @@ Result<void> SketchSession::trimAt(Point2 p, double tolMm) {
         }
         return {};
     });
+}
+
+Result<void> SketchSession::trimCircle(SketchEntityId target, Point2 p) {
+    const sketch::SketchEntity& e = *sketch_.findEntity(target);
+    const auto& circ = std::get<sketch::CircleGeom>(e.geometry);
+    const Geo geo = *geoOf(e.geometry);
+    auto paramOf = [&](Point2 q) {
+        double t = wrapAngle(angleOf(circ.center, q)) / kTwoPi;
+        return t >= 1 - 1e-12 ? 0.0 : t;
+    };
+
+    // Crossings (parameter 0..1 around the circle, CCW from angle 0) with the other curves, and who made them.
+    std::vector<std::pair<double, SketchEntityId>> cuts;
+    for (const auto& [id, o] : sketch_.entities()) {
+        if (id == target) continue;
+        auto og = geoOf(o.geometry);
+        if (!og) continue;
+        for (Point2 q : roots(geo, *og)) cuts.emplace_back(paramOf(q), id);
+    }
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end(),
+                           [](const auto& a, const auto& b) { return std::abs(a.first - b.first) < 1e-9; }),
+               cuts.end());
+    if (cuts.empty()) return apply("Trim", [&](Sketch& s) { return s.removeEntity(target); });
+    if (cuts.size() == 1)
+        return makeError(ErrorCode::InvalidArgument, "a circle needs two crossing curves to be trimmed");
+
+    const double tc = paramOf(p);
+    // The piece to remove runs from `lo` CCW to `hi`, the crossings around the click.
+    const std::size_t n = cuts.size();
+    std::size_t loI = n - 1, hiI = 0;
+    double lo = cuts[n - 1].first - 1.0, hi = cuts[0].first;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (cuts[i].first > tc) break;
+        loI = i;
+        lo = cuts[i].first;
+        hiI = (i + 1) % n;
+        hi = i + 1 < n ? cuts[i + 1].first : cuts[0].first + 1.0;
+    }
+    const double startAngle = wrapAngle(kTwoPi * hi);
+    const double sweep = kTwoPi * (1.0 - (hi - lo));
+    if (!(sweep > 1e-9)) return makeError(ErrorCode::InvalidArgument, "nothing to trim at that point");
+    const SketchEntityId startCutter = cuts[hiI].second, endCutter = cuts[loI].second;
+    const bool construction = e.construction;
+    const double r = circ.radius;
+    const Point2 c = circ.center;
+
+    auto build = [&](Sketch& s, bool autoOn) -> Result<void> {
+        struct Old {
+            ConstraintKind kind;
+            std::vector<SketchRef> refs;
+        };
+        std::vector<Old> olds;
+        for (const auto& [cid, cc] : s.constraints()) {
+            if (std::any_of(cc.refs.begin(), cc.refs.end(), [&](const SketchRef& rf) { return rf.entity == target; }))
+                olds.push_back({cc.kind, cc.refs});
+        }
+        struct OldDim {
+            sketch::DimensionKind kind;
+            std::string expression;
+        };
+        std::vector<OldDim> dims;
+        for (const auto& [did, d] : s.dimensions()) {
+            const bool onCircle = std::any_of(d.refs.begin(), d.refs.end(), [&](const SketchRef& rf) { return rf.entity == target; });
+            if (onCircle && (d.kind == sketch::DimensionKind::Radius || d.kind == sketch::DimensionKind::Diameter))
+                dims.push_back({d.kind, d.expression});
+        }
+        if (auto rm = s.removeEntity(target); !rm) return std::unexpected(rm.error());   // also drops its records
+        auto arc = s.addArc(c, r, startAngle, sweep, construction);
+        if (!arc) return std::unexpected(arc.error());
+        const SketchEntityId a = *arc;
+        for (const Old& o : olds) {
+            std::vector<SketchRef> mapped;
+            bool ok = true;
+            for (const SketchRef& rf : o.refs) {
+                if (rf.entity != target) {
+                    mapped.push_back(rf);
+                } else if (rf.role && *rf.role == PointRole::Center) {
+                    mapped.push_back({a, PointRole::Center});
+                } else if (!rf.role && (keepsOnPiece(o.kind) || o.kind == ConstraintKind::Equal)) {
+                    mapped.push_back({a, std::nullopt});
+                } else if (!rf.role && o.kind == ConstraintKind::PointOnObject && &rf == &o.refs[1]) {
+                    const auto q = s.pointOf(o.refs[0]);
+                    const double rel = q ? wrapAngle(angleOf(c, *q) - startAngle) : kTwoPi;
+                    if (q && rel <= sweep + 1e-9) mapped.push_back({a, std::nullopt});
+                    else ok = false;
+                } else {
+                    ok = false;
+                }
+            }
+            if (ok) (void)s.addConstraint(o.kind, mapped);
+        }
+        for (const OldDim& d : dims) (void)s.addDimension(d.kind, {SketchRef{a, std::nullopt}}, d.expression);
+        if (autoOn) {   // the arc's ends stay on the curves that cut it
+            (void)s.addConstraint(ConstraintKind::PointOnObject, {SketchRef{a, PointRole::Start}, SketchRef{startCutter, std::nullopt}});
+            (void)s.addConstraint(ConstraintKind::PointOnObject, {SketchRef{a, PointRole::End}, SketchRef{endCutter, std::nullopt}});
+        }
+        return {};
+    };
+    return applyAuto("Trim", build);
+}
+
+std::optional<SketchEntityId> SketchSession::offsetSeedAt(Point2 p, double tolMm) const {
+    return nearestEntity(p, tolMm);
 }
 
 Result<std::vector<SketchEntityId>> SketchSession::offsetAt(Point2 p, double tolMm) {
@@ -1172,6 +2085,7 @@ void SketchSession::clearPending() noexcept {
     arcStartHit_.reset();
     arcMid_.reset();
     tangentDrag_.reset();
+    dimPicks_.clear();
 }
 
 Result<void> SketchSession::undo() {
@@ -1191,8 +2105,17 @@ Result<void> SketchSession::redo() {
 void SketchSession::refresh() {
     auto profiles = sketch::detectProfiles(sketch_);
     profiles_ = profiles ? std::move(*profiles) : std::vector<sketch::SketchProfile>{};
-    report_ = sketch::diagnoseSketch(sketch_);
-    if (selected_ && !sketch_.findEntity(*selected_)) selected_.reset();
+    report_ = sketch::diagnoseSketch(sketch_, params_);
+    std::erase_if(selection_, [&](const SketchRef& r) { return !sketch_.findEntity(r.entity); });
+    if (selConstraint_ && !sketch_.constraints().count(*selConstraint_)) selConstraint_.reset();
+    if (selDimension_) {
+        const bool alive = selDimension_->driven
+                               ? std::any_of(driven_.begin(), driven_.end(),
+                                             [&](const DrivenDimension& d) { return d.id == selDimension_->id; })
+                               : sketch_.dimensions().count(sketch::SketchDimensionId{selDimension_->id}) > 0;
+        if (!alive) selDimension_.reset();
+    }
+    std::erase_if(dimPicks_, [&](const SketchRef& r) { return !sketch_.findEntity(r.entity); });
     snapHint_ = inference_.enabled && cursor_ ? snapAt(*cursor_) : std::nullopt;
 }
 

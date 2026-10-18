@@ -265,3 +265,21 @@ TEST(SolverBridge, ExpressionErrorIsReportedNotWritten) {
     EXPECT_EQ(rep.status, SolverStatus::InvalidInput);
     EXPECT_NE(rep.message.find("dimension"), std::string::npos) << rep.message;
 }
+
+// F20-sym: symmetric about a line with a fixed point and a fixed axis is consistent and fully determined.
+TEST(SolverBridge, SymmetricAboutAFixedLineMirrorsAndHasNoConflict) {
+    Sketch s = makeSketch();
+    auto axis = must(s.addLine({0, -10}, {0, 10}));
+    auto a = must(s.addPoint({3, 4}));
+    auto b = must(s.addPoint({-2, 6}));
+    must(s.addConstraint(ConstraintKind::Fix, {{axis, std::nullopt}}));
+    must(s.addConstraint(ConstraintKind::Fix, {{a, std::nullopt}}));
+    must(s.addConstraint(ConstraintKind::Symmetric, {{a, std::nullopt}, {b, std::nullopt}, {axis, std::nullopt}}));
+    SketchSolveReport rep = solveSketch(s);
+    ASSERT_EQ(rep.status, SolverStatus::Solved) << rep.message;
+    EXPECT_EQ(rep.dof, 0);
+    EXPECT_TRUE(rep.conflictingConstraints.empty());
+    const auto q = must(s.pointOf({b, std::nullopt}));
+    EXPECT_NEAR(q.x, -3.0, kTol);
+    EXPECT_NEAR(q.y, 4.0, kTol);
+}

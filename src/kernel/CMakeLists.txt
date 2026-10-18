@@ -10,6 +10,6 @@ target_link_libraries(iw_kernel_occt INTERFACE
     TKShHealing TKFillet TKMesh TKDE TKDESTEP TKDESTL TKXSBase TKXCAF TKLCAF TKCAF TKCDF)
 
 iw_add_module(kernel
-    SOURCES shape.cpp ops.cpp exchange.cpp
+    SOURCES shape.cpp ops.cpp exchange.cpp measure.cpp naming_support.cpp
     PUBLIC_LIBS iw_core
     PRIVATE_LIBS iw_kernel_occt)

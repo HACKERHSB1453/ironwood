@@ -65,6 +65,8 @@ public:
     ConstructionPlaneFeature(FeatureId id, ConstructionPlaneParams p) : id_(id), params_(std::move(p)) {}
     static Result<std::shared_ptr<recompute::Feature>> fromJson(FeatureId id, std::string_view json);
     FeatureId id() const override { return id_; }
+    /// Parameters as last set (edit them through Document::editConstruction*).
+    const ConstructionPlaneParams& params() const noexcept { return params_; }
     std::string_view kind() const override { return "plane"; }
     std::vector<naming::ElementRef> explicitRefs() const override;
     std::vector<std::string> parameterReferences() const override;
@@ -84,6 +86,8 @@ public:
     ConstructionAxisFeature(FeatureId id, ConstructionAxisParams p) : id_(id), params_(std::move(p)) {}
     static Result<std::shared_ptr<recompute::Feature>> fromJson(FeatureId id, std::string_view json);
     FeatureId id() const override { return id_; }
+    /// Parameters as last set (edit them through Document::editConstruction*).
+    const ConstructionAxisParams& params() const noexcept { return params_; }
     std::string_view kind() const override { return "axis"; }
     std::vector<naming::ElementRef> explicitRefs() const override;
     std::vector<std::string> parameterReferences() const override;
@@ -103,6 +107,8 @@ public:
     ConstructionPointFeature(FeatureId id, ConstructionPointParams p) : id_(id), params_(std::move(p)) {}
     static Result<std::shared_ptr<recompute::Feature>> fromJson(FeatureId id, std::string_view json);
     FeatureId id() const override { return id_; }
+    /// Parameters as last set (edit them through Document::editConstruction*).
+    const ConstructionPointParams& params() const noexcept { return params_; }
     std::string_view kind() const override { return "point"; }
     std::vector<naming::ElementRef> explicitRefs() const override { return {params_.ref}; }
     std::vector<BodyId> readsBodies() const override { return {params_.body}; }

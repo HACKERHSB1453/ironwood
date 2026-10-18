@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui/sbox.hpp"
 
+#include "ui/icons.hpp"
+
 #include <QApplication>
 #include <QKeyEvent>
 #include <QLineEdit>
@@ -65,6 +67,7 @@ void CommandPalette::rebuild() {
         if (!seq.isEmpty()) text += QStringLiteral("    %1").arg(seq.toString(QKeySequence::NativeText));
         if (!c->implemented()) text += QStringLiteral("    ") + tr("coming soon");
         auto* item = new QListWidgetItem(text, list_);
+        if (!c->icon.empty()) item->setIcon(icon(c->icon, 16, iconThemeFor(palette())));
         item->setData(kIdRole, QString::fromStdString(c->id));
         if (!c->implemented()) item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
     }

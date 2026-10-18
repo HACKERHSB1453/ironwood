@@ -27,7 +27,7 @@ Result<Resolution> resolve(const ElementRef& ref, const NamingMap& map) {
     for (std::uint32_t i = 0; i < n; ++i) {
         auto nm = map.nameOf(ref.type, i);
         if (!nm) continue;
-        if (!endsWith(nm->op, ".split") && !endsWith(nm->op, ".merge")) continue;
+        if (!endsWith(nm->op, ".split") && !endsWith(nm->op, ".merge") && !endsWith(nm->op, ".part")) continue;
         for (const auto& s : nm->sources)
             if (s == ref.name) {
                 successors.push_back(i);
@@ -46,6 +46,19 @@ Result<Resolution> resolve(const ElementRef& ref, const NamingMap& map) {
         return makeError(ErrorCode::Ambiguous, "resolve: " + ref.name.toString() + " has " +
                                                    std::to_string(successors.size()) +
                                                    " history successors; disambiguation required");
+    // A ".part" name (one piece of a tool element that was split) whose pieces have merged back into the whole: the
+    // source element itself carries the unsplit name.
+    if (endsWith(ref.name.op, ".part") && ref.name.sources.size() == 1) {
+        auto whole = map.indicesOf(ref.name.sources.front());
+        if (whole.size() == 1) {
+            Resolution r;
+            r.index = whole.front();
+            r.quality = ResolveQuality::HistoryDerived;
+            r.warnings.push_back("reference " + ref.name.toString() + " rebound through history to " +
+                                 map.nameOf(ref.type, r.index)->toString());
+            return r;
+        }
+    }
     // Geometric fallback is out of scope for v0.
     return makeError(ErrorCode::NotFound, "resolve: no element named " + ref.name.toString());
 }

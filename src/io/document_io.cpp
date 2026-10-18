@@ -25,7 +25,7 @@ using json = nlohmann::json;
 namespace {
 
 constexpr const char* kFormatTag = "ironwood-document";
-constexpr std::uint64_t kFormatVersion = kDocumentFormatVersion; // v1: "parameters" array
+constexpr std::uint64_t kFormatVersion = kDocumentFormatVersion; // v1: "parameters" array; v2: feature "name", "nameCounters"
 constexpr std::uint64_t kMaxSafeId = (std::uint64_t{1} << 53) - 1; // FORMAT.md: ids < 2^53 in v0
 constexpr const char* kManifestName = "manifest.json";
 
@@ -70,6 +70,8 @@ Result<json> buildManifest(const Document& doc) {
         entry["id"] = id;
         entry["kind"] = std::string(f.kind());
         entry["params"] = std::move(params);
+        // Written only when named, so an unnamed feature keeps the v1 entry shape.
+        if (!f.name().empty()) entry["name"] = f.name();
         features.push_back(std::move(entry));
         if (doc.timeline.isSuppressed(f.id())) suppressed.push_back(id);
         maxId = std::max(maxId, id);
@@ -106,6 +108,9 @@ Result<json> buildManifest(const Document& doc) {
     manifest["nextId"] = doc.nextId;
     manifest["timeline"] = std::move(timeline);
     manifest["parameters"] = std::move(params);
+    json counters = json::object();
+    for (const auto& [kind, n] : doc.nameCounters) counters[kind] = n;
+    manifest["nameCounters"] = std::move(counters);
     return manifest;
 }
 
@@ -231,6 +236,15 @@ Result<Document> buildDocument(const json& m, const recompute::FeatureRegistry& 
         return makeError(ErrorCode::ParseError, "manifest version 1 requires 'parameters'");
     }
 
+    // v2: per-kind default-name counters (optional; absent in v0/v1).
+    if (const json* counters = member(m, "nameCounters")) {
+        if (!counters->is_object()) return makeError(ErrorCode::ParseError, "manifest nameCounters is invalid");
+        for (const auto& [kind, n] : counters->items()) {
+            if (!n.is_number_unsigned()) return makeError(ErrorCode::ParseError, "manifest nameCounters is invalid");
+            doc.nameCounters[kind] = n.get<std::uint64_t>();
+        }
+    }
+
     const json* features = member(*timeline, "features");
     if (!features || !features->is_array()) return makeError(ErrorCode::ParseError, "timeline.features is invalid");
 
@@ -253,6 +267,11 @@ Result<Document> buildDocument(const json& m, const recompute::FeatureRegistry& 
         if (!created) return std::unexpected(created.error());
         if ((*created)->id() != FeatureId(id))
             return makeError(ErrorCode::ParseError, "feature factory returned a different id");
+        // v2: optional display name (absent in v0/v1 files; the Document assigns defaults after loading).
+        if (const json* fname = member(entry, "name")) {
+            if (!fname->is_string()) return makeError(ErrorCode::ParseError, "feature name is invalid");
+            (*created)->setName(fname->get<std::string>());
+        }
         doc.timeline.append(std::move(*created));
     }
     if (doc.nextId <= maxId) return makeError(ErrorCode::ParseError, "nextId must be greater than every feature id");
