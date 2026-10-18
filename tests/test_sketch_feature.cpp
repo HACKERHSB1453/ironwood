@@ -362,3 +362,51 @@ TEST(SketchFeature, DrivenFlagAndExpressionSurviveSketchJson) {
     ASSERT_TRUE(legacy.has_value()) << legacy.error().message;
     EXPECT_FALSE(legacy->dimensions().at(dimY).driven);
 }
+
+// ---- F46: warning attribute for under-constrained sketches ------------------------------------------------------
+
+TEST(SketchFeature, UnderConstrainedSketchPublishesWarningAttribute) {
+    // Dimensioned rectangle with no position constraint: DOF > 0, so the feature warns (the UI shows it yellow).
+    Rect r = makeRect("40 mm", "20 mm");
+    Document d;
+    const FeatureId skId = d.allocateFeatureId();
+    mustVoid(d.addFeature(sketchFeature(skId, r.sk)));
+    DocumentEvaluation ev = evalOk(d);
+    const FeatureStatus* st = statusOf(ev, skId);
+    ASSERT_NE(st, nullptr);
+    EXPECT_NE(st->attributes.at("dof"), "0");
+    EXPECT_EQ(st->attributes.at("warning"), "underconstrained");
+}
+
+TEST(SketchFeature, FullyConstrainedSketchHasNoWarning) {
+    // Anchoring the bottom-left corner on the sketch origin removes the translation DOF: fully constrained.
+    Rect r = makeRect("40 mm", "20 mm");
+    must(r.sk.addConstraint(sketch::ConstraintKind::Coincident,
+                            {{r.bottom, PointRole::Start}, {sketch::kOriginPointId, std::nullopt}}));
+    Document d;
+    const FeatureId skId = d.allocateFeatureId();
+    mustVoid(d.addFeature(sketchFeature(skId, r.sk)));
+    DocumentEvaluation ev = evalOk(d);
+    const FeatureStatus* st = statusOf(ev, skId);
+    ASSERT_NE(st, nullptr);
+    EXPECT_EQ(st->attributes.at("dof"), "0");
+    EXPECT_EQ(st->attributes.at("warning"), "none");
+}
+
+// ---- F46: reference geometry is persisted as nothing and re-created on load ------------------------------------
+
+TEST(SketchFeature, ReferenceGeometryIsNotWrittenButIsBackOnLoad) {
+    Rect r = makeRect("40 mm", "20 mm");
+    auto js = sketchToJson(r.sk);
+    ASSERT_TRUE(js.has_value());
+    // Four entities are written (the rectangle sides), none of them the reserved origin / axis ids.
+    std::size_t typeFields = 0;
+    for (std::size_t at = js->find("\"type\""); at != std::string::npos; at = js->find("\"type\"", at + 1)) ++typeFields;
+    EXPECT_EQ(typeFields, 4u);
+    EXPECT_EQ(js->find(std::to_string((std::uint64_t{1} << 60) - 4)), std::string::npos);
+    auto back = sketchFromJson(*js);
+    ASSERT_TRUE(back.has_value()) << (back ? "" : back.error().message);
+    EXPECT_EQ(back->entities().size(), 7u);  // four sides + origin + two axes, added on load
+    EXPECT_TRUE(back->findEntity(sketch::kOriginPointId) != nullptr);
+    EXPECT_TRUE(back->findEntity(sketch::kXAxisId)->construction);
+}

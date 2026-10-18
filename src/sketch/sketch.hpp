@@ -42,6 +42,18 @@ double distance(Point2 a, Point2 b) noexcept;
 /// Sub-point roles addressable by constraints and dimensions.
 enum class PointRole : std::uint8_t { Start, End, Center, Mid };
 
+/// Reserved ids of the reference geometry every sketch holds (F46, Fusion parity): the projected ORIGIN point (sketch
+/// (0, 0)) and the two sketch axes, construction lines through the origin along u and v. They are fixed in place and
+/// never removable. They sit in an id range the allocator never reaches, so they never clash with document ids and
+/// never move the id counter.
+inline constexpr SketchEntityId kOriginPointId{(std::uint64_t{1} << 60) - 4};
+inline constexpr SketchEntityId kXAxisId{(std::uint64_t{1} << 60) - 3};
+inline constexpr SketchEntityId kYAxisId{(std::uint64_t{1} << 60) - 2};
+/// Half length (mm) of the two axis lines.
+inline constexpr double kReferenceAxisHalfLength = 10000.0;
+/// True for kOriginPointId, kXAxisId and kYAxisId.
+bool isReferenceEntity(SketchEntityId id) noexcept;
+
 /// Sketch plane: origin, unit normal, unit x direction (mm). y direction = normal x xDir (right-handed).
 struct SketchPlane {
     Vec3 origin{};
@@ -141,6 +153,8 @@ struct SketchDimension {
 
 /// Editable 2D sketch on a plane. Ids are allocated by the sketch and never reused. All mutators validate their
 /// input and return an error (InvalidArgument / NotFound) without changing the sketch on failure.
+/// Every sketch starts with the reference geometry (kOriginPointId, kXAxisId, kYAxisId): construction entities that
+/// cannot be removed or made non-construction. Records and entity lists always include them; persistence skips them.
 class Sketch {
 public:
     explicit Sketch(SketchPlane plane);
@@ -158,7 +172,8 @@ public:
     /// Replaces the geometry of an existing entity, keeping its id. The kind must not change. Used by the solver.
     Result<void> setGeometry(SketchEntityId id, EntityGeometry geometry);
     Result<void> setConstruction(SketchEntityId id, bool construction);
-    /// Removes the entity and every constraint / dimension that references it.
+    /// Removes the entity and every constraint / dimension that references it. Errors: NotFound; InvalidArgument for
+    /// reference geometry (isReferenceEntity), which is never removable.
     Result<void> removeEntity(SketchEntityId id);
 
     const SketchEntity* findEntity(SketchEntityId id) const noexcept;
@@ -192,7 +207,8 @@ public:
 
     /// Next id the sketch will allocate (the counter; every id below it is either live or retired).
     std::uint64_t nextId() const noexcept { return nextId_; }
-    /// Restores an entity with id `id`. Errors: InvalidArgument (id invalid or in use, bad geometry).
+    /// Restores an entity with id `id`. Errors: InvalidArgument (id invalid or in use, bad geometry). Reference ids
+    /// are always in use (the constructor holds them), so they cannot be restored.
     Result<void> restoreEntity(SketchEntityId id, EntityGeometry geometry, bool construction = false);
     /// Restores a constraint record. Errors: InvalidArgument (id invalid or in use), NotFound / InvalidArgument (refs).
     Result<void> restoreConstraint(SketchConstraintId id, ConstraintKind kind, std::vector<SketchRef> refs);

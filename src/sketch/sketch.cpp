@@ -76,7 +76,17 @@ Point2 arcMid(const ArcGeom& a) noexcept {
 
 // ---- Sketch: entities ----------------------------------------------------------------------------------------
 
-Sketch::Sketch(SketchPlane plane) : plane_(plane) {}
+bool isReferenceEntity(SketchEntityId id) noexcept {
+    return id == kOriginPointId || id == kXAxisId || id == kYAxisId;
+}
+
+Sketch::Sketch(SketchPlane plane) : plane_(plane) {
+    entities_.emplace(kOriginPointId, SketchEntity{kOriginPointId, true, PointGeom{{0, 0}}});
+    entities_.emplace(kXAxisId, SketchEntity{kXAxisId, true,
+                                             LineGeom{{-kReferenceAxisHalfLength, 0}, {kReferenceAxisHalfLength, 0}}});
+    entities_.emplace(kYAxisId, SketchEntity{kYAxisId, true,
+                                             LineGeom{{0, -kReferenceAxisHalfLength}, {0, kReferenceAxisHalfLength}}});
+}
 
 Result<SketchEntityId> Sketch::addPoint(Point2 p, bool construction) {
     if (!finite(p)) return invalid("point is not finite");
@@ -180,7 +190,9 @@ Result<void> Sketch::restoreDimension(SketchDimensionId id, DimensionKind kind, 
 
 Result<void> Sketch::restoreNextId(std::uint64_t next) {
     std::uint64_t maxLive = 0;
-    for (const auto& [id, e] : entities_) maxLive = std::max(maxLive, id.value());
+    // Reference geometry lives in the reserved range above every allocated id: it does not count.
+    for (const auto& [id, e] : entities_)
+        if (!isReferenceEntity(id)) maxLive = std::max(maxLive, id.value());
     for (const auto& [id, c] : constraints_) maxLive = std::max(maxLive, id.value());
     for (const auto& [id, d] : dimensions_) maxLive = std::max(maxLive, id.value());
     if (next <= maxLive) return invalid("next id must be greater than every live id");
@@ -192,6 +204,7 @@ Result<void> Sketch::restoreNextId(std::uint64_t next) {
 Result<void> Sketch::setConstruction(SketchEntityId id, bool construction) {
     auto it = entities_.find(id);
     if (it == entities_.end()) return makeError(ErrorCode::NotFound, "sketch: no such entity");
+    if (isReferenceEntity(id)) return invalid("reference geometry is always construction");
     it->second.construction = construction;
     return {};
 }
@@ -199,6 +212,7 @@ Result<void> Sketch::setConstruction(SketchEntityId id, bool construction) {
 Result<void> Sketch::removeEntity(SketchEntityId id) {
     auto it = entities_.find(id);
     if (it == entities_.end()) return makeError(ErrorCode::NotFound, "sketch: no such entity");
+    if (isReferenceEntity(id)) return invalid("reference geometry (origin, axes) cannot be removed");
     entities_.erase(it);
     auto refersTo = [id](const SketchRef& r) { return r.entity == id; };
     for (auto c = constraints_.begin(); c != constraints_.end();) {

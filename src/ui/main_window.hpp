@@ -117,6 +117,11 @@ public:
     /// Edit Sketch (timeline double-click / menu): re-enters sketch mode with the sketch feature `id`. Finish Sketch
     /// replaces its sketch as one undo step; Esc discards the edit. Errors are reported in the status bar.
     void editSketch(FeatureId id);
+    /// Actions of the timeline's right-click menu. Edit is "Edit Sketch" for a sketch, "Edit..." otherwise.
+    enum class TimelineAction { Edit, Suppress, Delete, Rename };
+    /// Runs one timeline menu action on feature `id` (what the right-click menu does after the user picks an item).
+    /// Tests call it directly; the menu is only a front end for it.
+    void runTimelineAction(FeatureId id, TimelineAction action);
     /// Routes a viewport pick as the viewport's picked signal does (to the open dialog, or the browser selection).
     void routePick(const render::PickResult& r);
     /// Suppresses / unsuppresses, deletes, or renames a timeline feature. Same as the timeline menu. A rename is an

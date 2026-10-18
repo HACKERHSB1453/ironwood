@@ -31,6 +31,15 @@ using sketch::SketchEntityId;
 
 namespace {
 
+// Entities the user made (the fixed reference geometry, origin + two axes, is excluded: F46).
+std::size_t userEntityCount(const sketch::Sketch& s) {
+    std::size_t n = 0;
+    for (const auto& [id, e] : s.entities())
+        if (!sketch::isReferenceEntity(id)) ++n;
+    return n;
+}
+
+
 constexpr BodyId kB1{1}, kB2{2};
 
 /// Sketch on the XY plane with a W x H rectangle made of four lines e1 (bottom), e2 (right), e3 (top), e4 (left).
@@ -472,7 +481,7 @@ TEST(FeaturesSketch, SerialisationKeepsIdsAndNextIdAcrossRemovals) {
     ASSERT_TRUE(j.has_value());
     auto loaded = features::sketchFromJson(*j);
     ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
-    EXPECT_EQ(loaded->entities().size(), 3u);
+    EXPECT_EQ(userEntityCount(*loaded), 3u);
     EXPECT_TRUE(loaded->findEntity(*b) != nullptr);
     EXPECT_TRUE(loaded->findEntity(*c) != nullptr);
     EXPECT_TRUE(loaded->findEntity(*d) != nullptr);

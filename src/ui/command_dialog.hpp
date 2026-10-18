@@ -17,13 +17,21 @@
 #include "core/params.hpp"
 #include "core/result.hpp"
 
+#include <array>
+#include <memory>
+
 class QCheckBox;
 class QComboBox;
+class QEvent;
 class QLabel;
 class QLineEdit;
 class QListWidget;
 class QPushButton;
 class QTimer;
+
+namespace iw::tess {
+struct MeshData;
+}
 
 namespace iw::ui {
 
@@ -36,7 +44,10 @@ struct InputSpec {
     InputKind kind = InputKind::Value;
     Dimension dim = Dimension::Length; ///< Value: the dimension the expression must have.
     std::string defaultText;           ///< Value: expression; Dropdown: option; Checkbox: "1"/"0".
-    std::vector<QString> options;      ///< Dropdown choices; Selection candidates (by label).
+    std::vector<QString> options;      ///< Dropdown choices (the value the snapshot keeps); Selection candidates (by label).
+    /// Dropdown: text shown for each option (same size as `options`; empty = the option itself). The option stays the
+    /// item data, so the value is independent of what the user reads.
+    std::vector<QString> optionLabels = {};
 };
 
 /// Qt-free state of a command dialog: the raw text of every field, validation through a parameter table, and the
@@ -81,18 +92,32 @@ private:
 /// Evaluates expression text as a value of dimension `expected`. Bare numbers take the expected unit (mm, degrees).
 Result<Quantity> evaluateValueText(std::string_view text, Dimension expected, const ParameterTable* params);
 
+/// Geometry a preview produced besides its text (the owner draws it over the viewport). World-space triangles.
+struct PreviewMesh {
+    std::shared_ptr<const tess::MeshData> mesh;   ///< nullptr: no geometry.
+    std::array<float, 4> rgba{0.2f, 0.85f, 0.3f, 0.45f};   ///< RGBA 0..1, straight alpha.
+};
+
 struct PreviewResult {
     std::uint64_t seq = 0;   ///< Request number, increasing.
     std::string text;        ///< Preview text, or the failure message when `failed`.
     bool failed = false;
+    PreviewMesh geometry;    ///< Empty unless the preview produced geometry (never set when `failed`).
 };
 using PreviewFn = std::function<Result<std::string>(const DialogModel::Snapshot&, CancelToken)>;
+/// A preview that also produces geometry (see PreviewMesh).
+struct PreviewOutput {
+    std::string text;
+    PreviewMesh geometry;
+};
+using GeometryPreviewFn = std::function<Result<PreviewOutput>(const DialogModel::Snapshot&, CancelToken)>;
 
 /// Live preview on a latest-wins job: every request supersedes the previous one (which is cancelled), and `poll()`
 /// (GUI thread, never blocks) delivers only the newest finished preview, once.
 class LivePreview {
 public:
     LivePreview(JobSystem& jobs, PreviewFn fn, std::function<void(const PreviewResult&)> onResult);
+    LivePreview(JobSystem& jobs, GeometryPreviewFn fn, std::function<void(const PreviewResult&)> onResult);
 
     /// Starts a preview for `snap`. Never blocks.
     void request(DialogModel::Snapshot snap);
@@ -102,7 +127,7 @@ public:
     std::uint64_t requests() const noexcept { return seq_; }
 
 private:
-    PreviewFn fn_;
+    GeometryPreviewFn fn_;
     std::function<void(const PreviewResult&)> onResult_;
     LatestWins<PreviewResult> latest_;
     std::uint64_t seq_ = 0;
@@ -114,9 +139,15 @@ struct CommandDialogSpec {
     QString title;
     std::vector<InputSpec> inputs;
     PreviewFn preview;   ///< Optional.
+    /// Optional, used instead of `preview` when set: a preview that also produces geometry.
+    GeometryPreviewFn geometryPreview;
     std::function<Result<void>(const DialogModel::Snapshot&)> accept; ///< Called on OK with a valid snapshot.
     /// Optional: called after a field's text changed (typed, picked, or set with setText) and its preview requested.
     std::function<void(const std::string& field)> fieldChanged;
+    /// Optional: called on the GUI thread with every preview result delivered (failures included).
+    std::function<void(const PreviewResult&)> previewDelivered;
+    /// Optional: a dropdown option under the mouse changed (`option` = its value; empty when none is under the mouse).
+    std::function<void(const std::string& field, const std::string& option)> optionHovered;
 };
 
 /// Right-docked command panel: a form built from the spec, inline errors per field, a live preview line, and
@@ -148,6 +179,7 @@ private:
     void onFieldChanged(const std::string& name);
     void refreshValidation();
     void requestPreview();
+    bool eventFilter(QObject* watched, QEvent* event) override;
 
     CommandDialogSpec spec_;
     DialogModel model_;
@@ -161,6 +193,7 @@ private:
     std::map<std::string, QComboBox*, std::less<>> dropdowns_;
     std::map<std::string, QCheckBox*, std::less<>> checks_;
     std::map<std::string, QListWidget*, std::less<>> selectionLists_;
+    std::map<QObject*, std::string, std::less<>> hoverFields_;   ///< Dropdown views that report hovered options.
 };
 
 } // namespace iw::ui

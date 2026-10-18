@@ -27,14 +27,18 @@ SolverId dimensionSolverId(SketchDimensionId id) { return kDimensionIdBase + id.
 constexpr double kRadToDeg = 180.0 / std::numbers::pi;
 constexpr double kTwoPi = 2.0 * std::numbers::pi;
 
-/// Maps a sketch reference onto a solver reference. Error text is returned through `err`.
-std::optional<SolverRef> mapRef(const Sketch& s, const SketchRef& ref, std::string& err) {
+/// Maps a sketch reference onto a solver reference. `wholeEntityIsRole` marks a reference with no sub-point to a
+/// curve or line as SolverRole::Whole (used by Fix, which pins the whole entity) instead of its default sub-point.
+/// Error text is returned through `err`.
+std::optional<SolverRef> mapRef(const Sketch& s, const SketchRef& ref, std::string& err, bool wholeEntityIsRole = false) {
     const SketchEntity* e = s.findEntity(ref.entity);
     if (!e) {
         err = "reference to missing entity " + std::to_string(ref.entity.value());
         return std::nullopt;
     }
     const SolverId base = entityBase(ref.entity);
+    if (wholeEntityIsRole && !ref.role && e->kind() != EntityKind::Point)
+        return SolverRef{base, SolverRole::Whole};
     switch (e->kind()) {
     case EntityKind::Point:
         return SolverRef{base, SolverRole::Start};
@@ -128,14 +132,16 @@ std::optional<std::string> buildModel(const Sketch& s, const ParameterTable* par
     for (const auto& [id, e] : s.entities()) {
         if (id.value() > kMaxEntityValue) return std::string("entity id out of range");
         const SolverId b = entityBase(id);
+        // Reference geometry (origin, axes) is pinned structurally, so every solve keeps it where it is (F46).
+        const bool fixed = isReferenceEntity(id);
         std::visit(
             [&](const auto& g) {
                 using G = std::decay_t<decltype(g)>;
                 if constexpr (std::is_same_v<G, PointGeom>) {
-                    out.points.push_back({b, g.p.x, g.p.y});
+                    out.points.push_back({b, g.p.x, g.p.y, fixed});
                 } else if constexpr (std::is_same_v<G, LineGeom>) {
-                    out.points.push_back({b + 1, g.start.x, g.start.y});
-                    out.points.push_back({b + 2, g.end.x, g.end.y});
+                    out.points.push_back({b + 1, g.start.x, g.start.y, fixed});
+                    out.points.push_back({b + 2, g.end.x, g.end.y, fixed});
                     out.lines.push_back({b, b + 1, b + 2});
                 } else if constexpr (std::is_same_v<G, CircleGeom>) {
                     out.points.push_back({b + 1, g.center.x, g.center.y});
@@ -159,7 +165,7 @@ std::optional<std::string> buildModel(const Sketch& s, const ParameterTable* par
         sc.id = constraintSolverId(id);
         sc.kind = *kind;
         for (const SketchRef& r : c.refs) {
-            auto m = mapRef(s, r, err);
+            auto m = mapRef(s, r, err, c.kind == ConstraintKind::Fix);
             if (!m) return err;
             sc.refs.push_back(*m);
         }

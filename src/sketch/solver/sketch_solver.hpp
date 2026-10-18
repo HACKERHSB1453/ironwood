@@ -26,8 +26,9 @@ namespace iw::sketch {
 using SolverId = std::uint64_t;
 
 // Sub-point of an entity. Start/End: line or arc endpoints. Center: circle or arc centre.
-// Mid: midpoint of a line. For a point entity the role is ignored.
-enum class SolverRole : std::uint8_t { Start, End, Center, Mid };
+// Mid: midpoint of a line. For a point entity the role is ignored. Whole: the entity as a whole (only meaningful for
+// Fix on a line, circle or arc). A Fix on a sub-point pins that sub-point alone, never its sibling endpoint.
+enum class SolverRole : std::uint8_t { Start, End, Center, Mid, Whole };
 
 struct SolverRef {
     SolverId entity{};
@@ -38,6 +39,9 @@ struct SolverPoint {
     SolverId id{};
     double x = 0.0;
     double y = 0.0;
+    // Structural: the point is pinned at its position in every solve (reference geometry, F46). Fixed points never
+    // appear in conflict or redundancy reports.
+    bool fixed = false;
 };
 
 struct SolverLine {
@@ -80,8 +84,9 @@ enum class SolverConstraintKind : std::uint8_t {
     Collinear,
     // refs: point, point, axis. Axis is a line (mirror) or a point (point reflection).
     Symmetric,
-    // refs: 1 entity. Fixes the whole entity at its current position (point: x and y;
-    // line: both endpoints; circle: centre and radius; arc: centre, endpoints and radius).
+    // refs: 1 entity, optionally a sub-point. Pins it at its current position: point: x and y; a line with role
+    // Start or End: that endpoint only; a line with role Whole: both endpoints; circle or arc with role Center:
+    // the centre only; circle or arc with role Whole: centre and radius (arc: plus its endpoints).
     Fix,
     // refs: point (entity or sub-point), then 1 line, circle or arc. The point lies on that curve.
     PointOnObject,

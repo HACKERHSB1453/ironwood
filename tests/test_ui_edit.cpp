@@ -4,7 +4,9 @@
 // Offscreen only (QT_QPA_PLATFORM=offscreen is set by the environment below).
 #include <gtest/gtest.h>
 
+#include <QAbstractItemView>
 #include <QApplication>
+#include <QComboBox>
 #include <QCoreApplication>
 #include <QDockWidget>
 #include <QEventLoop>
@@ -34,6 +36,15 @@
 #include "ui/timeline/timeline_widget.hpp"
 
 namespace {
+
+// Entities the user made: every sketch also holds the fixed reference geometry (origin + two axes, F46).
+std::size_t countUserEntities(const iw::sketch::Sketch& s) {
+    std::size_t n = 0;
+    for (const auto& [id, e] : s.entities())
+        if (!iw::sketch::isReferenceEntity(id)) ++n;
+    return n;
+}
+
 using namespace iw;
 
 class QtEnv : public ::testing::Environment {
@@ -149,7 +160,7 @@ TEST(UiEditSketch, DoubleClickSketchReentersItAndFinishReplacesItInOneUndoStep) 
     ASSERT_TRUE(w.sketchMode()->editing());
     auto* session = w.sketchMode()->activeSession();
     ASSERT_NE(session, nullptr);
-    EXPECT_EQ(session->sketch().entities().size(), 4u);
+    EXPECT_EQ(countUserEntities(session->sketch()), 4u);  // reference geometry (origin, axes) excluded
     EXPECT_TRUE(session->sketch().findEntity(b.bottom) != nullptr);
     EXPECT_TRUE(session->sketch().findEntity(b.left) != nullptr);
     EXPECT_EQ(session->sketch().dimensions().size(), 2u);
@@ -367,6 +378,300 @@ TEST(UiExtrudeArrow, TypingInTheFieldMovesTheArrowAndSavesAScreenshot) {
     panel->reject();
     for (int i = 0; i < 3; ++i) QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
     EXPECT_EQ(arrow->mode(), ui::ManipulatorOverlay::Mode::None) << "arrow goes with the dialog";
+}
+
+// ---- right-click Edit Sketch is testable through the timeline action -----------------------------------------
+
+TEST(UiEditSketch, TimelineEditSketchActionReentersTheSketchWithoutTheMenu) {
+    ui::MainWindow w;
+    w.show();
+    ASSERT_TRUE(w.settle(5000));
+    const Block b = buildSketch(w);
+    ASSERT_FALSE(w.sketchMode()->active());
+
+    // The right-click menu's "Edit Sketch" item runs this action; the test injects it directly.
+    w.runTimelineAction(b.sketchId, ui::MainWindow::TimelineAction::Edit);
+    ASSERT_TRUE(w.sketchMode()->active());
+    ASSERT_TRUE(w.sketchMode()->editing());
+    auto* session = w.sketchMode()->activeSession();
+    ASSERT_NE(session, nullptr);
+    for (sketch::SketchEntityId line : {b.bottom, b.right, b.top, b.left}) {
+        const sketch::SketchEntity* ent = session->sketch().findEntity(line);
+        ASSERT_NE(ent, nullptr) << "the block's line " << line.value() << " is the sketch being edited";
+        EXPECT_NE(std::get_if<sketch::LineGeom>(&ent->geometry), nullptr);
+    }
+    EXPECT_TRUE(session->sketch().findEntity(b.bottom) != nullptr);
+    w.sketchMode()->finish();
+    ASSERT_TRUE(w.settle(5000));
+    EXPECT_FALSE(w.sketchMode()->active());
+    EXPECT_EQ(w.model()->timeline().size(), 1u) << "finishing an unchanged edit adds nothing";
+}
+
+TEST(UiEditSketch, TimelineEditOfAFeatureOpensItsDialogThroughTheSameAction) {
+    ui::MainWindow w;
+    w.show();
+    ASSERT_TRUE(w.settle(5000));
+    buildSketch(w);
+    ASSERT_TRUE(w.startFeature("extrude").has_value());
+    openPanel(w)->accept();
+    ASSERT_TRUE(w.settle(5000));
+    ASSERT_EQ(w.model()->timeline().size(), 2u);
+    w.runTimelineAction(w.model()->timeline().at(1)->id(), ui::MainWindow::TimelineAction::Edit);
+    ui::CommandPanel* panel = openPanel(w);
+    ASSERT_NE(panel, nullptr);
+    EXPECT_EQ(panel->model().text("operation"), "New body");
+    panel->reject();
+}
+
+// ---- Profile dropdown: "Profile N" labels, keys as item data, hover highlights the profile -------------------
+
+/// Two 40 x 20 rectangles in one sketch, finished: the left profile's centroid is (20, 10), the right one's (80, 10).
+Block buildTwoRectangles(ui::MainWindow& w) {
+    w.startSketch(ui::originPlane(ui::PlaneChoice::XY), ui::planeName(ui::PlaneChoice::XY));
+    auto* s = w.sketchMode()->activeSession();
+    auto left = s->addRect2pt({0, 0}, {40, 20});
+    auto right = s->addRect2pt({60, 0}, {100, 20});
+    EXPECT_TRUE(left.has_value() && right.has_value());
+    Block b{};
+    if (left) {
+        b.bottom = (*left)[0];
+    }
+    w.sketchMode()->finish();
+    EXPECT_TRUE(w.settle(5000));
+    b.sketchId = w.model()->timeline().at(0)->id();
+    return b;
+}
+
+QComboBox* dropdown(ui::CommandPanel* panel, const char* field) {
+    return panel->findChild<QComboBox*>(QStringLiteral("input_%1").arg(field));
+}
+
+TEST(UiProfileDropdown, ProfilesAreNumberedPerSketchByCentroidAndKeepTheirKeyAsData) {
+    ui::MainWindow w;
+    w.resize(1280, 800);
+    w.show();
+    ASSERT_TRUE(w.settle(5000));
+    buildTwoRectangles(w);
+    ASSERT_TRUE(w.startFeature("extrude").has_value());
+    ui::CommandPanel* panel = openPanel(w);
+    ASSERT_NE(panel, nullptr);
+    QComboBox* box = dropdown(panel, "profile");
+    ASSERT_NE(box, nullptr);
+    ASSERT_EQ(box->count(), 2);
+    EXPECT_EQ(box->itemText(0), QStringLiteral("Profile 1")) << "left rectangle: smaller centroid x";
+    EXPECT_EQ(box->itemText(1), QStringLiteral("Profile 2"));
+    const QString key0 = box->itemData(0).toString(), key1 = box->itemData(1).toString();
+    EXPECT_FALSE(key0.isEmpty());
+    EXPECT_NE(key0, key1);
+    EXPECT_NE(key0, QStringLiteral("Profile 1")) << "the internal name is the data, not the label";
+    EXPECT_EQ(QString::fromStdString(panel->model().text("profile")), key0) << "the default is Profile 1";
+
+    // Choosing Profile 2 moves the arrow to the right rectangle's centroid (80, 10, 0).
+    box->setCurrentIndex(1);
+    EXPECT_EQ(QString::fromStdString(panel->model().text("profile")), key1);
+    ui::ManipulatorOverlay* arrow = w.manipulators();
+    ASSERT_NE(arrow, nullptr);
+    const QPointF anchor = worldToWidget(w, Vec3{80, 10, 0});
+    const QPointF handle = arrow->handlePos();
+    const double pxPerMm = ui::sketchPixelsPerMm(w.viewport()->camera(), w.viewport()->height());
+    const QPointF dir = normalDirPx(w, Vec3{80, 10, 0}, Vec3{0, 0, 1});
+    EXPECT_NEAR(std::hypot(handle.x() - anchor.x() - dir.x() * 10.0 * pxPerMm, handle.y() - anchor.y() - dir.y() * 10.0 * pxPerMm), 0.0, 1.5)
+        << "arrow starts at the Profile 2 centroid";
+
+    // Setting the value from code selects the item with that key too.
+    panel->setText("profile", key0);
+    EXPECT_EQ(box->currentIndex(), 0);
+    panel->reject();
+}
+
+TEST(UiProfileDropdown, HoveringAnOptionHighlightsItsProfileOverlayUntilTheMouseLeaves) {
+    ui::MainWindow w;
+    w.resize(1280, 800);
+    w.show();
+    ASSERT_TRUE(w.settle(5000));
+    buildTwoRectangles(w);
+    ASSERT_TRUE(w.startFeature("extrude").has_value());
+    ui::CommandPanel* panel = openPanel(w);
+    ASSERT_NE(panel, nullptr);
+    QComboBox* box = dropdown(panel, "profile");
+    ASSERT_NE(box, nullptr);
+    const auto& faces = w.viewport()->overlayFaces();
+    ASSERT_EQ(faces.size(), 2u) << "one overlay per profile";
+    const float base = faces[0].rgba[3];
+    EXPECT_NEAR(faces[1].rgba[3], base, 1e-6);
+
+    // Hovering the second item (the popup's view reports `entered`) brightens exactly that profile's overlay.
+    QAbstractItemView* view = box->view();
+    emit view->entered(view->model()->index(1, 0));
+    EXPECT_GT(w.viewport()->overlayFaces()[1].rgba[3], base) << "hovered profile is highlighted";
+    EXPECT_NEAR(w.viewport()->overlayFaces()[0].rgba[3], base, 1e-6) << "the other profile is not";
+
+    // The mouse leaving the list clears the highlight.
+    QEvent leave(QEvent::Leave);
+    QApplication::sendEvent(view->viewport(), &leave);
+    EXPECT_NEAR(w.viewport()->overlayFaces()[1].rgba[3], base, 1e-6);
+    panel->reject();
+}
+
+// ---- Revolve angle ring ----------------------------------------------------------------------------------------
+
+TEST(UiRevolveRing, RingIsBoundToTheAngleFieldAndDragWritesIt) {
+    ui::MainWindow w;
+    w.resize(1280, 800);
+    w.show();
+    ASSERT_TRUE(w.settle(5000));
+    const Block b = buildSketch(w);
+    ASSERT_TRUE(w.startFeature("revolve").has_value());
+    ui::CommandPanel* panel = openPanel(w);
+    ASSERT_NE(panel, nullptr);
+    ui::ManipulatorOverlay* ring = w.manipulators();
+    ASSERT_NE(ring, nullptr);
+    ASSERT_EQ(ring->mode(), ui::ManipulatorOverlay::Mode::Angle) << "ring shown while Revolve is open";
+
+    // Axis: the bottom line of the block (y = 0, along X). The ring sits on the axis at the centroid's projection.
+    QComboBox* axes = dropdown(panel, "axis");
+    ASSERT_NE(axes, nullptr);
+    const std::string suffix = " / line " + std::to_string(b.bottom.value());
+    int axisRow = -1;
+    for (int i = 0; i < axes->count(); ++i)
+        if (axes->itemText(i).toStdString().ends_with(suffix)) axisRow = i;
+    ASSERT_GE(axisRow, 0);
+    axes->setCurrentIndex(axisRow);
+    const QPointF centre = worldToWidget(w, Vec3{20, 0, 0});
+
+    // The angle field drives the ring (the default is a full turn).
+    EXPECT_NEAR(ring->value(), 360.0, 1e-6);
+    panel->setText("angle", QStringLiteral("90 deg"));
+    EXPECT_NEAR(ring->value(), 90.0, 1e-6) << "the ring takes the typed angle";
+
+    // Dragging the handle 30 degrees further (in screen angle about the ring centre) writes 120 deg into the field.
+    const QPointF handle = ring->handlePos();
+    const double r = std::hypot(handle.x() - centre.x(), handle.y() - centre.y());
+    const double a = std::atan2(-(handle.y() - centre.y()), handle.x() - centre.x()) + std::numbers::pi / 6.0;
+    const QPointF target(centre.x() + r * std::cos(a), centre.y() - r * std::sin(a));
+    sendMouse(ring, QEvent::MouseButtonPress, handle);
+    sendMouse(ring, QEvent::MouseMove, target);
+    sendMouse(ring, QEvent::MouseButtonRelease, target);
+    auto angle = panel->model().valueOf("angle");
+    ASSERT_TRUE(angle.has_value());
+    EXPECT_NEAR(angle->value * 180.0 / std::numbers::pi, 120.0, 0.2) << "drag sets the angle field";
+    panel->reject();
+    for (int i = 0; i < 3; ++i) QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    EXPECT_EQ(ring->mode(), ui::ManipulatorOverlay::Mode::None) << "ring goes with the dialog";
+}
+
+// ---- Live preview body: translucent, green / red, gone on Cancel / OK, errors without a preview ----------------
+
+/// Waits (pumping the preview) until the panel shows a preview whose text contains `needle`, or the budget runs out.
+bool waitForPreviewText(ui::CommandPanel* panel, const char* needle) {
+    for (int i = 0; i < 1000 && !panel->previewText().contains(QString::fromUtf8(needle)); ++i) {
+        panel->pollPreview();
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        QThread::msleep(5);
+    }
+    return panel->previewText().contains(QString::fromUtf8(needle));
+}
+
+TEST(UiPreviewBody, ExtrudePreviewIsATranslucentGreenBodyThatGoesAwayOnCancel) {
+    ui::MainWindow w;
+    w.resize(1280, 800);
+    w.show();
+    ASSERT_TRUE(w.settle(5000));
+    ui::CommandPanel* panel = openExtrudeOnBlock(w);
+    ASSERT_NE(panel, nullptr);
+    ASSERT_TRUE(waitForPreviewText(panel, "8000")) << panel->previewText().toStdString();   // 40 x 20 x 10
+    for (int i = 0; i < 5; ++i) QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+
+    // Profile overlay first (index 0 = the profile, pickable), then the preview body last.
+    const auto& faces = w.viewport()->overlayFaces();
+    ASSERT_EQ(faces.size(), 2u);
+    const render::OverlayFace& body = faces.back();
+    EXPECT_NEAR(body.rgba[3], 0.45f, 1e-3) << "about 45% alpha";
+    EXPECT_GT(body.rgba[1], body.rgba[0]) << "green for a new body";
+    EXPECT_GT(body.triangles.size(), 0u) << "the produced body is tessellated";
+    // The triangles are the surface of the 40 x 20 x 10 box: every vertex lies within its bounds.
+    for (const Vec3& p : body.triangles) {
+        EXPECT_GE(p.x, -1e-3);
+        EXPECT_LE(p.x, 40.0 + 1e-3);
+        EXPECT_GE(p.z, -1e-3);
+        EXPECT_LE(p.z, 10.0 + 1e-3);
+    }
+
+    if (const char* dir = std::getenv("IW_TEST_DUMP_DIR")) {
+        EXPECT_TRUE(w.grab().save(QString::fromLocal8Bit(dir) + "/ui_extrude_translucent_preview.png"));
+    }
+    panel->reject();
+    for (int i = 0; i < 3; ++i) QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    EXPECT_EQ(w.viewport()->overlayFaces().size(), 0u) << "preview and profiles go with the dialog";
+}
+
+TEST(UiPreviewBody, CutPreviewIsRedAndOkClearsIt) {
+    ui::MainWindow w;
+    w.resize(1280, 800);
+    w.show();
+    ASSERT_TRUE(w.settle(5000));
+    buildSketch(w);
+    ASSERT_TRUE(w.startFeature("extrude").has_value());
+    openPanel(w)->accept();
+    ASSERT_TRUE(w.settle(5000));
+    // A second sketch-based extrude that cuts the first body.
+    buildSketch(w);
+    ASSERT_TRUE(w.startFeature("extrude").has_value());
+    ui::CommandPanel* panel = openPanel(w);
+    ASSERT_NE(panel, nullptr);
+    panel->setText("distance", QStringLiteral("5 mm"));
+    panel->setText("operation", QStringLiteral("Cut"));
+    QComboBox* ops = dropdown(panel, "operation");
+    ASSERT_NE(ops, nullptr);
+    EXPECT_EQ(ops->currentText(), QStringLiteral("Cut"));
+    // Wait for the preview of the Cut (red), not the earlier New body one (green).
+    bool red = false;
+    for (int i = 0; i < 1000 && !red; ++i) {
+        panel->pollPreview();
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        QThread::msleep(5);
+        const auto& faces = w.viewport()->overlayFaces();
+        red = faces.size() >= 2 && faces.back().rgba[3] > 0.4f && faces.back().rgba[0] > faces.back().rgba[1];
+    }
+    ASSERT_TRUE(red) << "the cut preview is drawn red: " << panel->previewText().toStdString() << " faces=" << w.viewport()->overlayFaces().size();
+    const auto& faces = w.viewport()->overlayFaces();
+    const render::OverlayFace& body = faces.back();
+    EXPECT_GT(body.rgba[0], body.rgba[1]) << "red for a cut";
+    EXPECT_NEAR(body.rgba[3], 0.45f, 1e-3);
+
+    // OK adds the feature and clears the preview.
+    ASSERT_TRUE(panel->okEnabled());
+    panel->accept();
+    ASSERT_TRUE(w.settle(5000));
+    EXPECT_EQ(w.viewport()->overlayFaces().size(), 0u);
+}
+
+TEST(UiPreviewBody, FailedPreviewShowsTheErrorAndNoBody) {
+    ui::MainWindow w;
+    w.resize(1280, 800);
+    w.show();
+    ASSERT_TRUE(w.settle(5000));
+    buildSketch(w);
+    ASSERT_TRUE(w.startFeature("extrude").has_value());
+    openPanel(w)->accept();
+    ASSERT_TRUE(w.settle(5000));
+    ASSERT_TRUE(w.startFeature("fillet").has_value());
+    ui::CommandPanel* fi = openPanel(w);
+    ASSERT_NE(fi, nullptr);
+    render::PickResult pick;
+    pick.bodyIndex = 0;
+    pick.edgeIndex = edgeOfLength(w, 10.0);   // a 10 mm high edge
+    w.routePick(pick);
+    fi->setText("radius", QStringLiteral("30 mm"));   // larger than the body: the fillet cannot exist
+    for (int i = 0; i < 1000 && fi->previewText().isEmpty(); ++i) {
+        fi->pollPreview();
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        QThread::msleep(5);
+    }
+    ASSERT_FALSE(fi->previewText().isEmpty());
+    EXPECT_FALSE(fi->previewText().contains("Volume")) << fi->previewText().toStdString();
+    EXPECT_TRUE(w.viewport()->overlayFaces().empty()) << "no preview body for a failed feature";
+    fi->reject();
 }
 
 } // namespace

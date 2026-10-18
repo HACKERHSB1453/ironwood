@@ -25,6 +25,15 @@ using sketch::PointRole;
 
 namespace {
 
+// Entities the user made (the fixed reference geometry, origin + two axes, is excluded: F46).
+std::size_t userEntityCount(const sketch::Sketch& s) {
+    std::size_t n = 0;
+    for (const auto& [id, e] : s.entities())
+        if (!sketch::isReferenceEntity(id)) ++n;
+    return n;
+}
+
+
 template <class T> T must(Result<T> r) {
     EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message);
     return r.has_value() ? *r : T{};
@@ -476,9 +485,9 @@ TEST(DocumentSketch, SketchForEditAndReplaceSketchAreUndoable) {
     // Re-entering sketch mode: a copy of the stored definition.
     auto copy = d.sketchForEdit(skId);
     ASSERT_TRUE(copy.has_value());
-    EXPECT_EQ(copy->entities().size(), 1u);
+    EXPECT_EQ(userEntityCount(*copy), 1u);
     must(copy->addCircle({10, 0}, 1.0));
-    EXPECT_EQ(d.sketchForEdit(skId)->entities().size(), 1u) << "the returned copy is independent";
+    EXPECT_EQ(userEntityCount(*d.sketchForEdit(skId)), 1u) << "the returned copy is independent";
     EXPECT_FALSE(d.sketchForEdit(d.allocateFeatureId()).has_value());
 
     mustVoid(d.replaceSketch(skId, *copy));

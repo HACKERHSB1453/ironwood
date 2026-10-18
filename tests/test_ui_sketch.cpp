@@ -77,10 +77,26 @@ const auto* const kEnv = ::testing::AddGlobalTestEnvironment(new SketchEnv);
 
 constexpr double kTol = 1e-6;
 
+// Entities the user made. Every sketch also holds the reference geometry (origin + two axes, F46), which is excluded
+// here: it is always present, fixed and construction.
+std::size_t userCount(const sketch::Sketch& s) {
+    std::size_t n = 0;
+    for (const auto& [id, e] : s.entities())
+        if (!sketch::isReferenceEntity(id)) ++n;
+    return n;
+}
+
+sketch::SketchEntityId lastUser(const sketch::Sketch& s) {
+    sketch::SketchEntityId last{};
+    for (const auto& [id, e] : s.entities())
+        if (!sketch::isReferenceEntity(id)) last = id;
+    return last;
+}
+
 int countKind(const sketch::Sketch& s, sketch::EntityKind k) {
     int n = 0;
     for (const auto& [id, e] : s.entities())
-        if (e.kind() == k) ++n;
+        if (!sketch::isReferenceEntity(id) && e.kind() == k) ++n;
     return n;
 }
 
@@ -131,7 +147,7 @@ TEST(SketchSession, RectangleIsFourLinesEightConstraintsDofFourOneProfile) {
     auto r = s.addRect2pt({0, 0}, {40, 20});
     ASSERT_TRUE(r) << r.error().message;
     EXPECT_EQ(countKind(s.sketch(), sketch::EntityKind::Line), 4);
-    EXPECT_EQ(s.sketch().entities().size(), 4u);
+    EXPECT_EQ(userCount(s.sketch()), 4u);
     EXPECT_EQ(s.sketch().constraints().size(), 8u);
     int coincident = 0, horizontal = 0, vertical = 0;
     for (const auto& [id, c] : s.sketch().constraints()) {
@@ -169,7 +185,7 @@ TEST(SketchSession, ConstructionEntitiesAreExcludedFromProfiles) {
     ASSERT_TRUE(s.toggleConstruction((*rect)[0]));
     EXPECT_EQ(s.profiles().size(), 1u);
     ASSERT_TRUE(s.addCircleCenter({20, 10}, 5));
-    auto circleId = s.sketch().entities().rbegin()->first;
+    auto circleId = lastUser(s.sketch());
     ASSERT_TRUE(s.toggleConstruction(circleId));
     EXPECT_EQ(s.profiles().size(), 1u);
 }
@@ -182,20 +198,20 @@ TEST(SketchSession, UndoRedoRestoresEntitiesConstraintsAndProfiles) {
     EXPECT_EQ(s.profiles().size(), 2u);
 
     ASSERT_TRUE(s.undo());
-    EXPECT_EQ(s.sketch().entities().size(), 4u);
+    EXPECT_EQ(userCount(s.sketch()), 4u);
     EXPECT_EQ(s.profiles().size(), 1u);
     EXPECT_EQ(s.undoStack().undoText(), "Create Rectangle");
     EXPECT_TRUE(s.canRedo());
 
     ASSERT_TRUE(s.undo());
-    EXPECT_EQ(s.sketch().entities().size(), 0u);
+    EXPECT_EQ(userCount(s.sketch()), 0u);
     EXPECT_EQ(s.sketch().constraints().size(), 0u);
     EXPECT_EQ(s.profiles().size(), 0u);
     EXPECT_FALSE(s.canUndo());
 
     ASSERT_TRUE(s.redo());
     ASSERT_TRUE(s.redo());
-    EXPECT_EQ(s.sketch().entities().size(), 5u);
+    EXPECT_EQ(userCount(s.sketch()), 5u);
     EXPECT_EQ(s.sketch().constraints().size(), 8u);
     EXPECT_EQ(s.profiles().size(), 2u);
     EXPECT_FALSE(s.canRedo());
@@ -209,14 +225,14 @@ TEST(SketchSession, FailedEditLeavesSketchAndHistoryUnchanged) {
     EXPECT_FALSE(s.addLine({1, 1}, {1, 1}));             // zero length
     EXPECT_FALSE(s.addCircleCenter({0, 0}, 0));           // zero radius
     EXPECT_FALSE(s.toggleConstruction(sketch::SketchEntityId{999}));
-    EXPECT_EQ(s.sketch().entities().size(), 1u);
+    EXPECT_EQ(userCount(s.sketch()), 1u);
     EXPECT_EQ(s.undoStack().size(), undoSize);
 }
 
 TEST(SketchSession, RectCenterUsesCentreAndCorner) {
     SketchSession s = makeSession();
     ASSERT_TRUE(s.addRectCenter({0, 0}, {10, 5}));
-    EXPECT_EQ(s.sketch().entities().size(), 4u);
+    EXPECT_EQ(userCount(s.sketch()), 4u);
     EXPECT_EQ(s.sketch().constraints().size(), 8u);
     ASSERT_EQ(s.profiles().size(), 1u);
     EXPECT_NEAR(s.profiles()[0].area, 200.0, 200.0 * 1e-9);
@@ -228,7 +244,7 @@ TEST(SketchSession, LineToolPolylineJoinsSegments) {
     SketchSession s = makeSession();
     s.setTool(SketchTool::Line);
     ASSERT_TRUE(s.click({0, 0}));           // starts the polyline, no entity yet
-    EXPECT_EQ(s.sketch().entities().size(), 0u);
+    EXPECT_EQ(userCount(s.sketch()), 0u);
     ASSERT_TRUE(s.click({10, 0}));
     ASSERT_TRUE(s.click({10, 10}));
     EXPECT_TRUE(s.hasPending());
@@ -236,8 +252,11 @@ TEST(SketchSession, LineToolPolylineJoinsSegments) {
     EXPECT_FALSE(s.hasPending());
     EXPECT_EQ(countKind(s.sketch(), sketch::EntityKind::Line), 2);
     // Inference is on by default: the joint plus the first segment's Horizontal and a Perpendicular snap for the second.
-    ASSERT_EQ(s.sketch().constraints().size(), 3u);
-    EXPECT_EQ(countConstraints(s.sketch(), ConstraintKind::Coincident), 1);
+    // F46: the first click at (0,0) snaps to the sketch origin (one more Coincident), and the joint at (10,0) lies on
+    // the X axis, so it is also PointOnObject that axis.
+    ASSERT_EQ(s.sketch().constraints().size(), 5u);
+    EXPECT_EQ(countConstraints(s.sketch(), ConstraintKind::Coincident), 2);
+    EXPECT_EQ(countConstraints(s.sketch(), ConstraintKind::PointOnObject), 1);
     EXPECT_EQ(countConstraints(s.sketch(), ConstraintKind::Horizontal), 1);
     EXPECT_EQ(countConstraints(s.sketch(), ConstraintKind::Perpendicular), 1);
     EXPECT_EQ(s.undoStack().size(), 2u);    // one undo step per segment
@@ -245,8 +264,8 @@ TEST(SketchSession, LineToolPolylineJoinsSegments) {
     // Starting again after the polyline ended does not join to the old one.
     ASSERT_TRUE(s.click({50, 50}));
     ASSERT_TRUE(s.click({60, 50}));
-    EXPECT_EQ(countConstraints(s.sketch(), ConstraintKind::Coincident), 1);   // still only the first joint
-    EXPECT_EQ(s.sketch().constraints().size(), 4u);                           // + the new segment's Horizontal
+    EXPECT_EQ(countConstraints(s.sketch(), ConstraintKind::Coincident), 2);   // still only the first joint (+ origin)
+    EXPECT_EQ(s.sketch().constraints().size(), 6u);                           // + the new segment's Horizontal
 }
 
 TEST(SketchSession, EscCancelsToolThenReportsNothingLeft) {
@@ -258,7 +277,7 @@ TEST(SketchSession, EscCancelsToolThenReportsNothingLeft) {
     EXPECT_TRUE(s.cancel());                // drops the half-placed rectangle and returns to Select
     EXPECT_EQ(s.tool(), SketchTool::Select);
     EXPECT_FALSE(s.hasPending());
-    EXPECT_EQ(s.sketch().entities().size(), 0u);
+    EXPECT_EQ(userCount(s.sketch()), 0u);
     EXPECT_FALSE(s.cancel());
 }
 
@@ -266,11 +285,11 @@ TEST(SketchSession, RectangleToolTakesTwoClicks) {
     SketchSession s = makeSession();
     s.setTool(SketchTool::Rectangle);
     ASSERT_TRUE(s.click({0, 0}));
-    EXPECT_EQ(s.sketch().entities().size(), 0u);
+    EXPECT_EQ(userCount(s.sketch()), 0u);
     s.setCursor(Point2{30, 15});
     ASSERT_EQ(s.preview().size(), 4u);      // rubber band: four sides
     ASSERT_TRUE(s.click({30, 15}));
-    EXPECT_EQ(s.sketch().entities().size(), 4u);
+    EXPECT_EQ(userCount(s.sketch()), 4u);
     EXPECT_FALSE(s.hasPending());
     EXPECT_EQ(s.tool(), SketchTool::Rectangle);   // the tool stays active for the next rectangle
 }
@@ -282,7 +301,7 @@ TEST(SketchSession, CircleToolCentreThenRadiusPoint) {
     s.setCursor(Point2{3, 4});
     ASSERT_EQ(s.preview().size(), 1u);
     ASSERT_TRUE(s.click({3, 4}));
-    ASSERT_EQ(s.sketch().entities().size(), 1u);
+    ASSERT_EQ(userCount(s.sketch()), 1u);
     const auto& e = s.sketch().entities().begin()->second;
     ASSERT_EQ(e.kind(), sketch::EntityKind::Circle);
     EXPECT_NEAR(std::get<sketch::CircleGeom>(e.geometry).radius, 5.0, kTol);
@@ -356,7 +375,7 @@ TEST(SketchInference, SnapToEndpointAddsCoincidentToTheSnappedEnd) {
     ASSERT_TRUE(s.click({39.8, 0.1}));          // snapped to the corner (40, 0)
     ASSERT_TRUE(s.click({60, 30}));             // free end
     s.endPolyline();
-    const sketch::SketchEntityId line = s.sketch().entities().rbegin()->first;
+    const sketch::SketchEntityId line = lastUser(s.sketch());
     const int before = static_cast<int>(s.sketch().constraints().size());
     EXPECT_GT(before, 8);
     // Some coincident constraint joins the new line's start to an existing point at (40, 0).
@@ -378,7 +397,7 @@ TEST(SketchInference, NearHorizontalSegmentGetsHorizontal) {
     ASSERT_TRUE(s.click({0, 0}));
     ASSERT_TRUE(s.click({30, 0.3}));            // 0.57 degrees off the x axis
     s.endPolyline();
-    const sketch::SketchEntityId line = s.sketch().entities().rbegin()->first;
+    const sketch::SketchEntityId line = lastUser(s.sketch());
     bool horizontal = false;
     for (const auto& [id, c] : s.sketch().constraints())
         horizontal = horizontal || (c.kind == ConstraintKind::Horizontal && c.refs[0].entity == line);
@@ -452,9 +471,9 @@ TEST(SketchArc, ThreePointArcIsCcwAndThroughAllThreePoints) {
     s.setTool(SketchTool::Arc);
     ASSERT_TRUE(s.click({10, 0}));
     ASSERT_TRUE(s.click({0, 10}));
-    EXPECT_EQ(s.sketch().entities().size(), 0u);
+    EXPECT_EQ(userCount(s.sketch()), 0u);
     ASSERT_TRUE(s.click({-10, 0}));
-    ASSERT_EQ(s.sketch().entities().size(), 1u);
+    ASSERT_EQ(userCount(s.sketch()), 1u);
     const auto& arc = std::get<sketch::ArcGeom>(s.sketch().entities().begin()->second.geometry);
     EXPECT_NEAR(arc.radius, 10, kTol);
     EXPECT_NEAR(arc.center.x, 0, kTol);
@@ -467,7 +486,7 @@ TEST(SketchArc, ThreePointArcIsCcwAndThroughAllThreePoints) {
 TEST(SketchArc, CollinearThreePointArcIsRejected) {
     SketchSession s = makeSession();
     EXPECT_FALSE(s.addArc3({0, 0}, {5, 0}, {10, 0}));
-    EXPECT_EQ(s.sketch().entities().size(), 0u);
+    EXPECT_EQ(userCount(s.sketch()), 0u);
 }
 
 TEST(SketchArc, TangentArcFromLineEndIsTangentAndG1) {
@@ -487,7 +506,8 @@ TEST(SketchArc, TangentArcFromLineEndIsTangentAndG1) {
     EXPECT_NEAR(g.sweep, std::numbers::pi / 2, 1e-6);
     // Tangent constraint between the line and the arc, and the arc starts at the line end.
     EXPECT_EQ(countConstraints(s.sketch(), ConstraintKind::Tangent), 1);
-    EXPECT_EQ(countConstraints(s.sketch(), ConstraintKind::Coincident), 1);
+    // Two Coincident: the line's start snapped to the origin (F46), and the arc starts at the line end.
+    EXPECT_EQ(countConstraints(s.sketch(), ConstraintKind::Coincident), 2);
     // G1 at the joint: the arc's tangent there is the line direction (+x): the radius is vertical.
     const Point2 joint = sketch::arcStart(g);
     EXPECT_NEAR(joint.x, 10, kTol);
@@ -535,13 +555,13 @@ TEST(SketchTrim, TrimmingAMiddlePieceKeepsIdsAndCarriesHorizontal) {
 
     s.setTool(SketchTool::Trim);
     ASSERT_TRUE(s.click({20, 10}));              // removes (0..40, 10)
-    ASSERT_EQ(s.sketch().entities().size(), 6u);  // 4 sides + 2 pieces
+    ASSERT_EQ(userCount(s.sketch()), 6u);  // 4 sides + 2 pieces
     // The left piece keeps the line's id, the right piece is new.
     const auto& left = std::get<LineGeom>(s.sketch().findEntity(line)->geometry);
     EXPECT_NEAR(left.start.x, -10, kTol);
     EXPECT_NEAR(left.end.x, 0, kTol);
     EXPECT_NEAR(left.end.y, 10, kTol);
-    const sketch::SketchEntityId right = s.sketch().entities().rbegin()->first;
+    const sketch::SketchEntityId right = lastUser(s.sketch());
     EXPECT_NE(right, line);
     const auto& rg = std::get<LineGeom>(s.sketch().findEntity(right)->geometry);
     EXPECT_NEAR(rg.start.x, 40, kTol);
@@ -553,7 +573,7 @@ TEST(SketchTrim, TrimmingAMiddlePieceKeepsIdsAndCarriesHorizontal) {
     ASSERT_EQ(s.profiles().size(), 1u);
     EXPECT_NEAR(s.profiles()[0].area, 800.0, 800.0 * 1e-9);
     EXPECT_TRUE(s.undo());
-    EXPECT_EQ(s.sketch().entities().size(), 5u);
+    EXPECT_EQ(userCount(s.sketch()), 5u);
 }
 
 TEST(SketchTrim, CrossingLinesSplitTheTargetAtBothIntersections) {
@@ -566,14 +586,14 @@ TEST(SketchTrim, CrossingLinesSplitTheTargetAtBothIntersections) {
     const auto& a = std::get<LineGeom>(s.sketch().findEntity(target)->geometry);
     EXPECT_NEAR(a.start.y, -10, kTol);
     EXPECT_NEAR(a.end.y, 0, kTol);
-    EXPECT_EQ(s.sketch().entities().size(), 4u);  // target kept + one new piece + two crossers
+    EXPECT_EQ(userCount(s.sketch()), 4u);  // target kept + one new piece + two crossers
 }
 
 TEST(SketchTrim, TrimmingWithoutIntersectionsRemovesTheWholeLine) {
     SketchSession s = makeSession();
     ASSERT_TRUE(s.addLine({0, 0}, {10, 0}));
     ASSERT_TRUE(s.trimAt({5, 0}));
-    EXPECT_EQ(s.sketch().entities().size(), 0u);
+    EXPECT_EQ(userCount(s.sketch()), 0u);
 }
 
 TEST(SketchOffset, OffsetOfTwentyByTenRectByTwoMakesRingAndTwentyFourByFourteen) {
@@ -654,7 +674,7 @@ TEST(SketchTools, CenterRectangleByClicksIsCentredOnTheFirstClick) {
     s.setTool(SketchTool::CenterRectangle);
     ASSERT_TRUE(s.click({0, 0}));
     ASSERT_TRUE(s.click({10, 5}));
-    EXPECT_EQ(s.sketch().entities().size(), 4u);
+    EXPECT_EQ(userCount(s.sketch()), 4u);
     ASSERT_EQ(s.profiles().size(), 1u);
     EXPECT_NEAR(s.profiles()[0].area, 200.0, 200.0 * 1e-9);
     EXPECT_NEAR(s.profiles()[0].centroid.x, 0.0, kTol);
@@ -666,7 +686,7 @@ TEST(SketchTools, TrimAndOffsetClicksUseTheTools) {
     s.setOffsetDistance(1.0);
     s.setTool(SketchTool::Offset);
     ASSERT_TRUE(s.click({10, 0}));              // bottom side: the loop it belongs to grows by 1
-    EXPECT_EQ(s.sketch().entities().size(), 8u);
+    EXPECT_EQ(userCount(s.sketch()), 8u);
     s.setTool(SketchTool::Select);
 }
 
@@ -722,7 +742,7 @@ TEST(SketchMode, RectangleAndCircleByMouseClicksAndEscExit) {
     EXPECT_EQ(s->tool(), SketchTool::Rectangle);
     QTest::mouseClick(vp, Qt::LeftButton, Qt::NoModifier, screenOf(*win, {-30, -20}));
     QTest::mouseClick(vp, Qt::LeftButton, Qt::NoModifier, screenOf(*win, {40, 25}));
-    EXPECT_EQ(s->sketch().entities().size(), 4u);
+    EXPECT_EQ(userCount(s->sketch()), 4u);
     EXPECT_EQ(s->sketch().constraints().size(), 8u);
     EXPECT_EQ(s->report().dof, 4);
     ASSERT_EQ(s->profiles().size(), 1u);
@@ -736,9 +756,10 @@ TEST(SketchMode, RectangleAndCircleByMouseClicksAndEscExit) {
     QTest::keyClick(vp, Qt::Key_C);
     QTest::mouseClick(vp, Qt::LeftButton, Qt::NoModifier, screenOf(*win, {0, 0}));
     QTest::mouseClick(vp, Qt::LeftButton, Qt::NoModifier, screenOf(*win, {12, 0}));
-    EXPECT_EQ(s->sketch().entities().size(), 5u);
+    EXPECT_EQ(userCount(s->sketch()), 5u);
     EXPECT_EQ(s->profiles().size(), 2u);   // ring + disc
-    EXPECT_EQ(s->report().dof, 7);
+    // The centre click at (0,0) snaps to the origin (F46): centre fixed in both coordinates, two DOF fewer.
+    EXPECT_EQ(s->report().dof, 5);
 
     // First Esc cancels the tool (back to Select), the sketch stays open; second Esc finishes.
     QTest::keyClick(vp, Qt::Key_Escape);
@@ -763,9 +784,9 @@ TEST(SketchMode, PolylineByDoubleClickAndConstructionToggleWithUndo) {
     // double-click event, so the first press is sent explicitly: it adds the last segment, the double click ends.
     QTest::mouseClick(vp, Qt::LeftButton, Qt::NoModifier, screenOf(*win, {20, 15}));
     QTest::mouseDClick(vp, Qt::LeftButton, Qt::NoModifier, screenOf(*win, {20, 15}));
-    EXPECT_EQ(s->sketch().entities().size(), 2u);
+    EXPECT_EQ(userCount(s->sketch()), 2u);
     EXPECT_FALSE(s->hasPending());
-    EXPECT_EQ(countConstraints(s->sketch(), ConstraintKind::Coincident), 1);   // + inferred H / Perpendicular
+    EXPECT_EQ(countConstraints(s->sketch(), ConstraintKind::Coincident), 2);   // origin snap at (0,0) + the joint
 
     // Select tool: click the first segment, X makes it construction, Ctrl+Z undoes that step.
     QTest::keyClick(vp, Qt::Key_Escape);             // Line -> Select
@@ -817,13 +838,13 @@ TEST(SketchMode, TangentArcByDraggingFromALineEnd) {
     processFor(500);   // keep the next press from reading as a double click
     QTest::mouseClick(vp, Qt::LeftButton, Qt::NoModifier, screenOf(*win, {10, 0}));
     processFor(500);
-    ASSERT_EQ(s->sketch().entities().size(), 1u);
+    ASSERT_EQ(userCount(s->sketch()), 1u);
     // Press on the polyline end, drag to (15, 5): a tangent arc, not a new straight segment.
     QTest::mousePress(vp, Qt::LeftButton, Qt::NoModifier, screenOf(*win, {10, 0}));
     QTest::mouseMove(vp, screenOf(*win, {12, 2}));
     QTest::mouseMove(vp, screenOf(*win, {15, 5}));
     QTest::mouseRelease(vp, Qt::LeftButton, Qt::NoModifier, screenOf(*win, {15, 5}));
-    ASSERT_EQ(s->sketch().entities().size(), 2u);
+    ASSERT_EQ(userCount(s->sketch()), 2u);
     int arcs = 0, tangents = 0;
     for (const auto& [id, e] : s->sketch().entities()) arcs += e.kind() == sketch::EntityKind::Arc;
     for (const auto& [id, c] : s->sketch().constraints()) tangents += c.kind == ConstraintKind::Tangent;
@@ -1004,7 +1025,7 @@ TEST(SketchConstraints, GlyphsAreSelectableAndDeletable) {
     // With no glyph selected, Delete removes the selected entities and what references them.
     s.select(*l1);
     ASSERT_TRUE(s.deleteSelection());
-    EXPECT_EQ(s.sketch().entities().size(), 1u);
+    EXPECT_EQ(userCount(s.sketch()), 1u);
     EXPECT_EQ(s.sketch().constraints().size(), 0u);
 }
 
@@ -1246,7 +1267,7 @@ TEST(SketchMode, ConstraintToolbarAddsParallelAndGlyphClickPlusDeleteRemovesIt) 
     ASSERT_TRUE(s->selectedConstraint());
     QTest::keyClick(vp, Qt::Key_Delete);
     EXPECT_EQ(countConstraints(s->sketch(), ConstraintKind::Parallel), 0);
-    EXPECT_EQ(s->sketch().entities().size(), 2u);
+    EXPECT_EQ(userCount(s->sketch()), 2u);
 }
 
 TEST(SketchMode, DimensionToolEditorAcceptsExpressionsAndDoubleClickReEdits) {
@@ -1353,15 +1374,16 @@ TEST(SketchMode, OffsetDistanceComesFromACommandPanel) {
     QTest::mouseClick(vp, Qt::LeftButton, Qt::NoModifier, screenOf(*win, {0, -10}));
     CommandPanel* panel = win->sketchMode()->offsetPanel();
     ASSERT_NE(panel, nullptr);
-    EXPECT_EQ(s->sketch().entities().size(), 4u);                        // nothing happens until OK
+    EXPECT_EQ(userCount(s->sketch()), 4u);                        // nothing happens until OK
     panel->setText("distance", "d + 1");
     EXPECT_FALSE(panel->okEnabled());                                    // unknown parameter
     panel->setText("distance", "3 mm");
     EXPECT_TRUE(panel->okEnabled());
     panel->accept();
-    EXPECT_EQ(s->sketch().entities().size(), 8u);
+    EXPECT_EQ(userCount(s->sketch()), 8u);
     double minx = 1e9, maxx = -1e9;
     for (const auto& [id, e] : s->sketch().entities()) {
+        if (sketch::isReferenceEntity(id)) continue;
         if (const auto* l = std::get_if<LineGeom>(&e.geometry)) {
             minx = std::min({minx, l->start.x, l->end.x});
             maxx = std::max({maxx, l->start.x, l->end.x});

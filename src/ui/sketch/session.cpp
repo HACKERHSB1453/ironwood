@@ -576,6 +576,7 @@ std::optional<SnapHit> SketchSession::snapAt(Point2 p) const {
     if (lineStart_) {
         const Point2 from = *lineStart_;
         for (const auto& [id, g] : curves) {
+            if (sketch::isReferenceEntity(id)) continue;  // the axes are not tangent / perpendicular snap sources
             if (g.circle) {
                 for (Point2 t : tangentPoints(g, from))
                     addPoint(4, t, {SnapKind::Tangent, t, std::nullopt, SketchRef{id, std::nullopt},
@@ -914,6 +915,7 @@ std::optional<SketchEntityId> SketchSession::nearestEntity(Point2 p, double tolM
     std::optional<SketchEntityId> best;
     double bestDist = tolMm;
     for (const auto& [id, e] : sketch_.entities()) {
+        if (sketch::isReferenceEntity(id)) continue;  // the origin and axes are never picked by a click
         double d = 0;
         if (auto g = geoOf(e.geometry)) {
             auto q = nearestOn(*g, p);
@@ -1229,8 +1231,9 @@ Result<void> SketchSession::deleteSelection() {
     if (selConstraint_) return removeConstraint(*selConstraint_);
     if (selDimension_) return removeDimension(selDimension_->id, selDimension_->driven);
     std::vector<SketchEntityId> ents;
+    // Reference geometry (origin, axes) is never deleted: it is skipped, so Select All + Delete still removes the rest.
     for (const SketchRef& r : selection_)
-        if (!contains(ents, r.entity)) ents.push_back(r.entity);
+        if (!contains(ents, r.entity) && !sketch::isReferenceEntity(r.entity)) ents.push_back(r.entity);
     if (ents.empty()) return makeError(ErrorCode::NotFound, "nothing selected");
     return apply("Delete", [&](Sketch& s) -> Result<void> {
         for (SketchEntityId id : ents)
@@ -1325,7 +1328,10 @@ ConstraintState SketchSession::constraintState() const {
                      !report_.conflictingDimensions.empty() || !report_.redundantConstraints.empty() ||
                      !report_.redundantDimensions.empty();
     if (bad) return ConstraintState::Conflicting;
-    if (report_.ok() && report_.dof == 0 && !sketch_.entities().empty()) return ConstraintState::Fully;
+    // Reference geometry (origin, axes) is always present and fixed: it does not make an empty sketch "fully" constrained.
+    const bool hasUserEntities = std::any_of(sketch_.entities().begin(), sketch_.entities().end(),
+                                             [](const auto& kv) { return !sketch::isReferenceEntity(kv.first); });
+    if (report_.ok() && report_.dof == 0 && hasUserEntities) return ConstraintState::Fully;
     return ConstraintState::Under;
 }
 
@@ -1711,7 +1717,7 @@ Result<void> SketchSession::trimAt(Point2 p, double tolMm) {
     // Cut parameters (0..1 along the target) where other curves cross it strictly inside.
     std::vector<double> cuts;
     for (const auto& [id, o] : sketch_.entities()) {
-        if (id == *target) continue;
+        if (id == *target || sketch::isReferenceEntity(id)) continue;
         auto og = geoOf(o.geometry);
         if (!og) continue;
         for (Point2 q : roots(geo, *og)) {
@@ -1836,7 +1842,7 @@ Result<void> SketchSession::trimCircle(SketchEntityId target, Point2 p) {
     // Crossings (parameter 0..1 around the circle, CCW from angle 0) with the other curves, and who made them.
     std::vector<std::pair<double, SketchEntityId>> cuts;
     for (const auto& [id, o] : sketch_.entities()) {
-        if (id == target) continue;
+        if (id == target || sketch::isReferenceEntity(id)) continue;
         auto og = geoOf(o.geometry);
         if (!og) continue;
         for (Point2 q : roots(geo, *og)) cuts.emplace_back(paramOf(q), id);

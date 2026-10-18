@@ -352,3 +352,74 @@ TEST(UiTimeline, DialogsRefuseAddingWhileRolledBack) {
     dragMarkerTo(w, 2);
     ASSERT_TRUE(w.settle(5000));
 }
+
+TEST(UiTimeline, FinishingAnEmptySketchAddsNoFeature) {
+    // Every sketch holds the reference origin and axes; they must not count as user geometry.
+    ui::MainWindow w;
+    w.show();
+    ASSERT_TRUE(w.settle(5000));
+    w.startSketch(ui::originPlane(ui::PlaneChoice::XY), ui::planeName(ui::PlaneChoice::XY));
+    ASSERT_NE(w.sketchMode()->activeSession(), nullptr);
+    w.sketchMode()->finish();
+    ASSERT_TRUE(w.settle(5000));
+    EXPECT_EQ(w.model()->timeline().size(), 0u) << "an empty sketch adds nothing to the timeline";
+    EXPECT_TRUE(w.timelineWidget()->entries().empty());
+
+    // A sketch with one user point is not empty and is added.
+    w.startSketch(ui::originPlane(ui::PlaneChoice::XY), ui::planeName(ui::PlaneChoice::XY));
+    ASSERT_TRUE(w.sketchMode()->activeSession()->addPoint({5, 5}).has_value());
+    w.sketchMode()->finish();
+    ASSERT_TRUE(w.settle(5000));
+    EXPECT_EQ(w.model()->timeline().size(), 1u);
+}
+
+TEST(UiTimeline, UnderconstrainedSketchShowsWarningOnTimelineAndBrowser) {
+    ui::MainWindow w;
+    w.show();
+    ASSERT_TRUE(w.settle(5000));
+    w.startSketch(ui::originPlane(ui::PlaneChoice::XY), ui::planeName(ui::PlaneChoice::XY));
+    ASSERT_TRUE(w.sketchMode()->activeSession()->addRect2pt({0, 0}, {10, 10}).has_value());
+    w.sketchMode()->finish();
+    ASSERT_TRUE(w.settle(5000));
+
+    // Timeline: yellow warning with the degrees-of-freedom text on hover.
+    ASSERT_EQ(w.timelineWidget()->entries().size(), 1u);
+    const auto& entry = w.timelineWidget()->entries()[0];
+    EXPECT_EQ(entry.state, recompute::FeatureStatus::State::Ok);
+    EXPECT_TRUE(entry.warning);
+    const std::string message = entry.message.toStdString();
+    EXPECT_NE(message.find("Sketch is not fully constrained ("), std::string::npos) << message;
+    EXPECT_NE(message.find(" degrees of freedom)"), std::string::npos) << message;
+
+    // Browser: the sketch item carries the same text as its tooltip and a warning-badged icon.
+    QTreeWidgetItem* sketches = nullptr;
+    for (int i = 0; i < w.browser()->topLevelItemCount(); ++i)
+        if (w.browser()->topLevelItem(i)->text(0) == "Sketches") sketches = w.browser()->topLevelItem(i);
+    ASSERT_NE(sketches, nullptr);
+    ASSERT_EQ(sketches->childCount(), 1);
+    EXPECT_EQ(sketches->child(0)->toolTip(0).toStdString(), message.substr(0, message.find('\n')));
+    EXPECT_FALSE(sketches->child(0)->icon(0).isNull());
+}
+
+TEST(UiTimeline, FullyConstrainedSketchHasNoUnderconstrainedWarning) {
+    ui::MainWindow w;
+    w.show();
+    ASSERT_TRUE(w.settle(5000));
+    w.startSketch(ui::originPlane(ui::PlaneChoice::XY), ui::planeName(ui::PlaneChoice::XY));
+    ui::SketchSession* s = w.sketchMode()->activeSession();
+    ASSERT_NE(s, nullptr);
+    // One point pinned by Fix has no free degrees of freedom.
+    auto pt = s->addPoint({5, 5});
+    ASSERT_TRUE(pt.has_value());
+    s->select(*pt);
+    ASSERT_TRUE(s->toggleFix());
+    s->clearSelection();
+    ASSERT_TRUE(s->resolve());
+    ASSERT_EQ(s->report().dof, 0);
+    w.sketchMode()->finish();
+    ASSERT_TRUE(w.settle(5000));
+
+    ASSERT_EQ(w.timelineWidget()->entries().size(), 1u);
+    EXPECT_FALSE(w.timelineWidget()->entries()[0].warning);
+    EXPECT_FALSE(w.timelineWidget()->entries()[0].message.contains("not fully constrained"));
+}

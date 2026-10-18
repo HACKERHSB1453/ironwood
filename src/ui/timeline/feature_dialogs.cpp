@@ -10,6 +10,7 @@
 #include <optional>
 #include <map>
 #include <numbers>
+#include <tuple>
 #include <utility>
 
 #include "features/construction_features.hpp"
@@ -57,15 +58,24 @@ struct FaceChoice {
     std::uint32_t index = 0;
 };
 struct ProfileChoice {
-    QString label;
+    QString label;       ///< What the dropdown shows: "Profile N", N counting the profiles of its sketch by centroid.
+    std::string key;     ///< What the dropdown keeps (its item data): the sketch id and the internal profile name.
     FeatureId sketch;
-    std::string profile;
+    std::string profile; ///< Internal profile name (the sketch's own, stable across rebuilds).
     Vec3 anchor{};   ///< Centroid of the profile in world space (where the distance arrow starts).
     Vec3 normal{};   ///< Plane normal of the sketch (the one-side extrude direction).
 };
+
+/// Dropdown key of a profile: stable across evaluations (sketch id plus the profile's internal name).
+std::string profileKeyOf(FeatureId sketch, const std::string& profile) {
+    return std::to_string(sketch.value()) + "/" + profile;
+}
 struct AxisChoice {
     QString label;
     features::RevolveAxis axis;
+    Vec3 origin{};        ///< A point of the axis in world space (valid when `located`).
+    Vec3 direction{};     ///< Direction of the axis in world space (not necessarily unit).
+    bool located = false; ///< The axis geometry is known (its feature or sketch line is evaluated).
 };
 struct PlaneChoice {
     QString label;
@@ -85,6 +95,17 @@ render::OverlayFace profileOverlay(const sketch::SketchPlane& plane, const sketc
         overlay.triangles.push_back(Vec3{mesh->positions[i], mesh->positions[i + 1], mesh->positions[i + 2]});
     }
     return overlay;
+}
+
+/// The triangles of a tessellated preview body, as one translucent overlay.
+std::vector<render::OverlayFace> meshOverlay(const tess::MeshData& mesh, std::array<float, 4> rgba) {
+    render::OverlayFace overlay;
+    overlay.rgba = rgba;
+    for (std::uint32_t v : mesh.indices) {
+        const std::size_t i = 3 * static_cast<std::size_t>(v);
+        overlay.triangles.push_back(Vec3{mesh.positions[i], mesh.positions[i + 1], mesh.positions[i + 2]});
+    }
+    return {std::move(overlay)};
 }
 
 /// Everything a dialog needs, captured by value (shared between the panel's callbacks and preview jobs).
@@ -140,6 +161,20 @@ InputSpec dropdownField(const char* name, const char* label, std::vector<QString
     return s;
 }
 
+/// Profile dropdown: the keys are the profiles' keys, the texts their "Profile N" labels.
+InputSpec profileField(const std::vector<ProfileChoice>& profiles, std::string def) {
+    InputSpec s;
+    s.name = "profile";
+    s.label = QStringLiteral("Profile");
+    s.kind = InputKind::Dropdown;
+    s.defaultText = std::move(def);
+    for (const ProfileChoice& p : profiles) {
+        s.options.push_back(QString::fromStdString(p.key));
+        s.optionLabels.push_back(p.label);
+    }
+    return s;
+}
+
 InputSpec checkField(const char* name, const char* label, bool on) {
     InputSpec s;
     s.name = name;
@@ -179,9 +214,9 @@ std::vector<std::string> selectionOf(const Snap& s, const char* name) {
     return it == s.selections.end() ? std::vector<std::string>{} : it->second;
 }
 
-Result<const ProfileChoice*> profileNamed(const DialogCtx& c, const std::string& label) {
+Result<const ProfileChoice*> profileNamed(const DialogCtx& c, const std::string& key) {
     for (const ProfileChoice& p : c.profiles)
-        if (p.label.toStdString() == label) return &p;
+        if (p.key == key) return &p;
     return makeError(ErrorCode::InvalidArgument, "select a sketch profile");
 }
 
@@ -227,17 +262,16 @@ KindSpec extrudeSpec(const DialogCtx& c, const Feature* existing) {
     KindSpec k;
     k.title = c.editing ? QStringLiteral("Edit Extrude") : QStringLiteral("Extrude");
     const auto* ex = dynamic_cast<const features::ExtrudeFeature*>(existing);
-    std::vector<QString> profiles, targets;
-    for (const ProfileChoice& p : c.profiles) profiles.push_back(p.label);
+    std::vector<QString> targets;
     for (const BodyChoice& b : c.bodies) targets.push_back(b.label);
-    std::string profileDef = profiles.empty() ? std::string() : profiles.front().toStdString();
+    std::string profileDef = c.profiles.empty() ? std::string() : c.profiles.front().key;
     std::string extentDef = "One side", opDef = "New body", targetDef = targets.empty() ? std::string() : targets.front().toStdString();
     std::string distance = "10 mm", distance2 = "0 mm";
     if (ex) {
         const auto& p = ex->params();
         if (const auto* ref = std::get_if<features::SketchReferenceSource>(&p.source)) {
             for (const ProfileChoice& pc : c.profiles)
-                if (pc.sketch == ref->sketch && pc.profile == ref->profile) profileDef = pc.label.toStdString();
+                if (pc.sketch == ref->sketch && pc.profile == ref->profile) profileDef = pc.key;
         }
         switch (p.extent) {
         case features::ExtrudeParams::Extent::OneSide: extentDef = "One side"; break;
@@ -256,7 +290,7 @@ KindSpec extrudeSpec(const DialogCtx& c, const Feature* existing) {
             if (b.body == p.body) targetDef = b.label.toStdString();
     }
     k.inputs = {
-        dropdownField("profile", "Profile", profiles, profileDef),
+        profileField(c.profiles, profileDef),
         dropdownField("extent", "Extent", {"One side", "Two sides", "Symmetric"}, extentDef),
         valueField("distance", "Distance", Dimension::Length, distance),
         valueField("distance2", "Distance 2", Dimension::Length, distance2),
@@ -410,11 +444,10 @@ KindSpec holeSpec(const DialogCtx& c, const Feature* existing) {
 KindSpec revolveSpec(const DialogCtx& c, const Feature* existing) {
     KindSpec k;
     k.title = c.editing ? QStringLiteral("Edit Revolve") : QStringLiteral("Revolve");
-    std::vector<QString> profiles, axes, targets;
-    for (const ProfileChoice& p : c.profiles) profiles.push_back(p.label);
+    std::vector<QString> axes, targets;
     for (const AxisChoice& a : c.axes) axes.push_back(a.label);
     for (const BodyChoice& b : c.bodies) targets.push_back(b.label);
-    std::string profileDef = profiles.empty() ? std::string() : profiles.front().toStdString();
+    std::string profileDef = c.profiles.empty() ? std::string() : c.profiles.front().key;
     std::string axisDef = axes.empty() ? std::string() : axes.front().toStdString();
     std::string extentDef = "Full", angle = "360 deg", angle2 = "0 deg", opDef = "New body";
     std::string targetDef = targets.empty() ? std::string() : targets.front().toStdString();
@@ -422,7 +455,7 @@ KindSpec revolveSpec(const DialogCtx& c, const Feature* existing) {
         const auto& p = rv->params();
         if (const auto* ref = std::get_if<features::SketchReferenceSource>(&p.source))
             for (const ProfileChoice& pc : c.profiles)
-                if (pc.sketch == ref->sketch && pc.profile == ref->profile) profileDef = pc.label.toStdString();
+                if (pc.sketch == ref->sketch && pc.profile == ref->profile) profileDef = pc.key;
         for (const AxisChoice& a : c.axes) {
             const bool same = a.axis.kind == p.axis.kind &&
                               (p.axis.kind == features::RevolveAxis::Kind::Construction ? a.axis.construction == p.axis.construction
@@ -447,7 +480,7 @@ KindSpec revolveSpec(const DialogCtx& c, const Feature* existing) {
             if (b.body == p.body) targetDef = b.label.toStdString();
     }
     k.inputs = {
-        dropdownField("profile", "Profile", profiles, profileDef),
+        profileField(c.profiles, profileDef),
         dropdownField("axis", "Axis", axes, axisDef),
         dropdownField("extent", "Extent", {"Full", "One side", "Two sides", "Symmetric"}, extentDef),
         valueField("angle", "Angle", Dimension::Angle, angle),
@@ -668,17 +701,69 @@ struct FeatureDialogs::Impl {
     MakeFn make;
     bool profilePicks = false;         ///< Profile overlays are shown: a click on one chooses that profile.
     bool arrowOn = false;              ///< Extrude is open: the distance arrow follows the profile and the field.
-    std::vector<QMetaObject::Connection> arrowConns;
+    bool ringOn = false;               ///< Revolve is open: the angle ring follows the profile, axis and the field.
+    std::vector<QMetaObject::Connection> manipConns;
+    /// Bumped whenever a dialog opens or closes: late preview / hover callbacks of an older dialog are ignored.
+    std::uint64_t session = 0;
+    std::vector<render::OverlayFace> profileFaces;   ///< Profile overlays (index = position in ctx->profiles).
+    int hoveredProfile = -1;                         ///< Profile listed under the mouse in the Profile dropdown.
+    std::vector<render::OverlayFace> previewFaces;   ///< The live preview body, drawn after the profiles.
     explicit Impl(FeatureHost& h) : host(h) {}
+
+    /// Pushes the profile overlays (the hovered one brighter) and then the preview body to the viewport. Profile
+    /// overlay indices stay the profile positions, so a click on a profile still picks it.
+    void pushOverlays() {
+        std::vector<render::OverlayFace> all;
+        all.reserve(profileFaces.size() + previewFaces.size());
+        for (std::size_t i = 0; i < profileFaces.size(); ++i) {
+            render::OverlayFace f = profileFaces[i];
+            if (static_cast<int>(i) == hoveredProfile) f.rgba[3] = 0.75f;
+            all.push_back(std::move(f));
+        }
+        all.insert(all.end(), previewFaces.begin(), previewFaces.end());
+        host.setOverlayFaces(std::move(all));
+    }
+
+    const ProfileChoice* profileOf(const std::string& key) const {
+        if (!ctx) return nullptr;
+        for (const ProfileChoice& p : ctx->profiles)
+            if (p.key == key) return &p;
+        return nullptr;
+    }
+    int profileIndexOf(const std::string& key) const {
+        if (!ctx) return -1;
+        for (std::size_t i = 0; i < ctx->profiles.size(); ++i)
+            if (ctx->profiles[i].key == key) return static_cast<int>(i);
+        return -1;
+    }
+    const AxisChoice* axisOf(const std::string& label) const {
+        if (!ctx) return nullptr;
+        for (const AxisChoice& a : ctx->axes)
+            if (a.label.toStdString() == label) return &a;
+        return nullptr;
+    }
+
+    /// Hover over a dropdown option: the profile it names is highlighted ("" = none).
+    void setHoveredProfile(const std::string& key) {
+        const int index = key.empty() ? -1 : profileIndexOf(key);
+        if (index == hoveredProfile) return;
+        hoveredProfile = index;
+        pushOverlays();
+    }
+
+    std::optional<QPointF> toPx(const Vec3& p) const {
+        render::Viewport* vp = host.viewport();
+        if (!vp) return std::nullopt;
+        const auto ndc = vp->camera().project(p);
+        if (!ndc) return std::nullopt;
+        return QPointF((ndc->x + 1.0) * 0.5 * vp->width(), (1.0 - ndc->y) * 0.5 * vp->height());
+    }
 
     /// Places the distance arrow at the chosen profile's centroid, along its normal, at the current distance.
     void updateArrow() {
         ManipulatorOverlay* ov = host.manipulators();
         if (!arrowOn || !panel || !ctx || !ov) return;
-        const std::string profileText = panel->model().text("profile");
-        const ProfileChoice* prof = nullptr;
-        for (const ProfileChoice& p : ctx->profiles)
-            if (p.label.toStdString() == profileText) prof = &p;
+        const ProfileChoice* prof = profileOf(panel->model().text("profile"));
         const auto value = panel->model().valueOf("distance");
         if (!prof || !value || value->dim != Dimension::Length) {
             ov->clear();
@@ -687,12 +772,7 @@ struct FeatureDialogs::Impl {
         render::Viewport* vp = host.viewport();
         if (!vp) return;
         const render::Camera& cam = vp->camera();
-        const double w = vp->width(), h = vp->height();
-        auto toPx = [&](const Vec3& p) -> std::optional<QPointF> {
-            const auto ndc = cam.project(p);
-            if (!ndc) return std::nullopt;
-            return QPointF((ndc->x + 1.0) * 0.5 * w, (1.0 - ndc->y) * 0.5 * h);
-        };
+        const double h = vp->height();
         const auto a = toPx(prof->anchor);
         const auto b = toPx(prof->anchor + prof->normal);
         if (!a || !b) {
@@ -708,23 +788,62 @@ struct FeatureDialogs::Impl {
                          QStringLiteral("%1 mm").arg(value->value, 0, 'f', 1));
     }
 
-    /// Dragging the arrow writes the distance back as a plain number, snapped to 0.1 mm (the expression is replaced).
-    void attachArrow(CommandPanel* dialog) {
+    /// Revolve: the angle ring is drawn on the axis at the chosen profile's centroid, its start at the profile and its
+    /// handle at the angle field (screen space: the ring is the projection of the sweep's circle about the axis).
+    void updateRing() {
         ManipulatorOverlay* ov = host.manipulators();
-        if (!ov) return;
-        arrowConns.push_back(QObject::connect(ov, &ManipulatorOverlay::distanceChanged, dialog, [this, dialog](double mm) {
-            if (!arrowOn || panel != dialog) return;
-            const double snapped = std::round(mm * 10.0) / 10.0;
-            dialog->setText("distance", QStringLiteral("%1 mm").arg(snapped, 0, 'f', 1));
-        }));
-        if (render::Viewport* vp = host.viewport())
-            arrowConns.push_back(QObject::connect(vp, &render::Viewport::cameraChanged, dialog, [this] { updateArrow(); }));
+        if (!ringOn || !panel || !ctx || !ov) return;
+        const ProfileChoice* prof = profileOf(panel->model().text("profile"));
+        const AxisChoice* axis = axisOf(panel->model().text("axis"));
+        const auto angle = panel->model().valueOf("angle");
+        const double len = axis ? length(axis->direction) : 0.0;
+        if (!prof || !axis || !axis->located || len < 1e-12 || !angle || angle->dim != Dimension::Angle) {
+            ov->clear();
+            return;
+        }
+        const Vec3 dir = axis->direction * (1.0 / len);
+        const Vec3 onAxis = axis->origin + dir * dot(prof->anchor - axis->origin, dir);
+        const auto centre = toPx(onAxis);
+        const auto start = toPx(prof->anchor);
+        if (!centre || !start) {
+            ov->clear();
+            return;
+        }
+        const double radius = std::max(40.0, std::hypot(start->x() - centre->x(), start->y() - centre->y()));
+        const double valueDeg = angle->value * 180.0 / std::numbers::pi;
+        ov->showAngle(*centre, screenAngleDeg(*centre, *start), valueDeg, radius,
+                      QStringLiteral("%1 deg").arg(valueDeg, 0, 'f', 1));
     }
 
-    void detachArrow() {
-        for (const QMetaObject::Connection& c : arrowConns) QObject::disconnect(c);
-        arrowConns.clear();
+    /// Dragging the arrow writes the distance back as a plain number, snapped to 0.1 mm (the expression is replaced).
+    /// Dragging the ring writes the angle back the same way, in degrees.
+    void attachManipulators(CommandPanel* dialog) {
+        ManipulatorOverlay* ov = host.manipulators();
+        if (!ov) return;
+        if (arrowOn)
+            manipConns.push_back(QObject::connect(ov, &ManipulatorOverlay::distanceChanged, dialog, [this, dialog](double mm) {
+                if (!arrowOn || panel != dialog) return;
+                const double snapped = std::round(mm * 10.0) / 10.0;
+                dialog->setText("distance", QStringLiteral("%1 mm").arg(snapped, 0, 'f', 1));
+            }));
+        if (ringOn)
+            manipConns.push_back(QObject::connect(ov, &ManipulatorOverlay::angleChanged, dialog, [this, dialog](double deg) {
+                if (!ringOn || panel != dialog) return;
+                const double snapped = std::round(deg * 10.0) / 10.0;
+                dialog->setText("angle", QStringLiteral("%1 deg").arg(snapped, 0, 'f', 1));
+            }));
+        if (render::Viewport* vp = host.viewport())
+            manipConns.push_back(QObject::connect(vp, &render::Viewport::cameraChanged, dialog, [this] {
+                updateArrow();
+                updateRing();
+            }));
+    }
+
+    void detachManipulators() {
+        for (const QMetaObject::Connection& c : manipConns) QObject::disconnect(c);
+        manipConns.clear();
         arrowOn = false;
+        ringOn = false;
         if (ManipulatorOverlay* ov = host.manipulators()) ov->clear();
     }
 
@@ -752,7 +871,7 @@ struct FeatureDialogs::Impl {
         // A click on a profile overlay chooses that profile (the Profile dropdown stays as the fallback).
         if (profilePicks && r.overlayIndex) {
             if (*r.overlayIndex < ctx->profiles.size())
-                panel->setText("profile", ctx->profiles[*r.overlayIndex].label);
+                panel->setText("profile", QString::fromStdString(ctx->profiles[*r.overlayIndex].key));
             return;
         }
         if (!r.bodyIndex) return;
@@ -854,13 +973,24 @@ Result<void> FeatureDialogs::start(const std::string& kind, std::optional<Featur
                                   naming::ElementRef{n->feature, naming::ElementType::Face, *n}, i});
         }
     }
-    for (const auto& [sid, sol] : shown.eval.sketches)
-        for (const sketch::SketchProfile& p : sol.profiles) {
-            const sketch::SketchPlane& plane = sol.sketch.plane();
-            ctx->profiles.push_back({QString::fromStdString(titleOf(sid) + " / " + p.name), sid, p.name,
-                                     plane.toWorld(p.centroid), plane.normal});
-            ctx->profileOverlays.push_back(profileOverlay(plane, p));
+    for (const auto& [sid, sol] : shown.eval.sketches) {
+        // Profiles of one sketch are numbered 1, 2, ... by their world centroid (x, then y, then z): the numbers follow
+        // the geometry, not the order the solver happens to list the regions in.
+        const sketch::SketchPlane& plane = sol.sketch.plane();
+        std::vector<const sketch::SketchProfile*> ordered;
+        for (const sketch::SketchProfile& p : sol.profiles) ordered.push_back(&p);
+        std::stable_sort(ordered.begin(), ordered.end(), [&plane](const sketch::SketchProfile* a, const sketch::SketchProfile* b) {
+            const Vec3 ca = plane.toWorld(a->centroid), cb = plane.toWorld(b->centroid);
+            return std::tie(ca.x, ca.y, ca.z) < std::tie(cb.x, cb.y, cb.z);
+        });
+        std::uint32_t number = 0;
+        for (const sketch::SketchProfile* p : ordered) {
+            ++number;
+            ctx->profiles.push_back({QStringLiteral("Profile %1").arg(number), profileKeyOf(sid, p->name), sid, p->name,
+                                     plane.toWorld(p->centroid), plane.normal});
+            ctx->profileOverlays.push_back(profileOverlay(plane, *p));
         }
+    }
     for (std::size_t i = 0; i < tl.size(); ++i) {
         const Feature& f = *tl.at(i);
         if (editing && f.id() == *editing) continue;   // a construction cannot be based on itself
@@ -868,7 +998,13 @@ Result<void> FeatureDialogs::start(const std::string& kind, std::optional<Featur
             features::RevolveAxis a;
             a.kind = features::RevolveAxis::Kind::Construction;
             a.construction = f.id();
-            ctx->axes.push_back({QString::fromStdString(titleOf(f.id())), a});
+            AxisChoice choice{QString::fromStdString(titleOf(f.id())), a};
+            if (auto g = shown.eval.construction.find(f.id()); g != shown.eval.construction.end()) {
+                choice.origin = g->second.origin;
+                choice.direction = g->second.direction;
+                choice.located = true;
+            }
+            ctx->axes.push_back(std::move(choice));
         }
         if (f.kind() == "plane") ctx->planes.push_back({QString::fromStdString(titleOf(f.id())), f.id()});
     }
@@ -876,11 +1012,14 @@ Result<void> FeatureDialogs::start(const std::string& kind, std::optional<Featur
         // Sketch lines as revolve axes
         for (const auto& [eid, ent] : sol.sketch.entities()) {
             if (const auto* ln = std::get_if<sketch::LineGeom>(&ent.geometry)) {
-                (void)ln;
                 features::RevolveAxis a;
                 a.kind = features::RevolveAxis::Kind::SketchLine;
                 a.line = eid;
-                ctx->axes.push_back({QString::fromStdString(titleOf(sid) + " / line " + std::to_string(eid.value())), a});
+                AxisChoice choice{QString::fromStdString(titleOf(sid) + " / line " + std::to_string(eid.value())), a};
+                choice.origin = sol.sketch.plane().toWorld(ln->start);
+                choice.direction = sol.sketch.plane().toWorld(ln->end) - choice.origin;
+                choice.located = true;
+                ctx->axes.push_back(std::move(choice));
             }
         }
     }
@@ -905,15 +1044,19 @@ Result<void> FeatureDialogs::start(const std::string& kind, std::optional<Featur
     impl_->ctx = cc;
     impl_->make = make;
     impl_->pick = spec.pick;
+    const std::uint64_t gen = ++impl_->session;
 
+    // Colour of the preview body: red where the feature removes material, green where it adds or reshapes.
+    const bool removes = kind == "hole";
     CommandDialogSpec dlg;
     dlg.title = spec.title;
     dlg.inputs = spec.inputs;
-    // The distance arrow (Extrude) follows the profile and the distance field while the dialog is open.
+    // The distance arrow (Extrude) and the angle ring (Revolve) follow the profile and their field while open.
     dlg.fieldChanged = [this](const std::string& field) {
         if (impl_->arrowOn && (field == "distance" || field == "profile")) impl_->updateArrow();
+        if (impl_->ringOn && (field == "angle" || field == "profile" || field == "axis")) impl_->updateRing();
     };
-    dlg.preview = [make, cc](const Snap& s, CancelToken token) -> Result<std::string> {
+    dlg.geometryPreview = [make, cc, removes](const Snap& s, CancelToken token) -> Result<PreviewOutput> {
         const TextFn text = [&s](std::string_view n) { return formatted(s, n); };
         auto cand = make(s, text, *cc);
         if (!cand) return std::unexpected(cand.error());
@@ -929,12 +1072,32 @@ Result<void> FeatureDialogs::start(const std::string& kind, std::optional<Featur
         if (!idx || *idx >= ev->statuses.size()) return makeError(ErrorCode::Internal, "preview missing");
         const FeatureStatus& st = ev->statuses[*idx];
         if (st.state == FeatureStatus::State::Failed) return std::unexpected(st.error);
+        PreviewOutput out;
+        out.text = "OK";
         if (auto body = timeline::producedBody(**cand)) {
-            if (auto vol = timeline::volumeOfBody(*ev, *body)) {
-                return std::string("Volume " + std::to_string(static_cast<long long>(std::llround(*vol))) + " mm3");
+            if (auto vol = timeline::volumeOfBody(*ev, *body))
+                out.text = "Volume " + std::to_string(static_cast<long long>(std::llround(*vol))) + " mm3";
+            // The produced body, tessellated on this job and drawn translucent by the dialog.
+            if (auto shape = ev->bodies.find(*body); shape != ev->bodies.end()) {
+                auto mesh = tess::tessellate(shape->second, tess::TessParams{}, token);
+                if (!mesh) return std::unexpected(mesh.error());
+                out.geometry.mesh = std::make_shared<const tess::MeshData>(std::move(*mesh));
+                out.geometry.rgba = removes || choiceOf(s, "operation") == "Cut"
+                                        ? std::array<float, 4>{0.95f, 0.22f, 0.18f, 0.45f}
+                                        : std::array<float, 4>{0.20f, 0.85f, 0.30f, 0.45f};
             }
         }
-        return std::string("OK");
+        return out;
+    };
+    dlg.previewDelivered = [this, gen](const PreviewResult& r) {
+        if (gen != impl_->session || !impl_->panel) return;   // a result of a dialog that is no longer open
+        impl_->previewFaces.clear();
+        if (!r.failed && r.geometry.mesh) impl_->previewFaces = meshOverlay(*r.geometry.mesh, r.geometry.rgba);
+        impl_->pushOverlays();
+    };
+    dlg.optionHovered = [this, gen](const std::string& field, const std::string& option) {
+        if (gen != impl_->session || field != "profile") return;
+        impl_->setHoveredProfile(option);
     };
     dlg.accept = [this, make, cc](const Snap&) -> Result<void> {
         // Re-snapshot on the GUI thread: the panel's raw text is the source of expressions.
@@ -954,19 +1117,28 @@ Result<void> FeatureDialogs::start(const std::string& kind, std::optional<Featur
     for (const QString& label : spec.preselect) impl_->selectItem(label, spec.pick == PickMode::Face || spec.pick == PickMode::FaceUV);
     // Profile overlays while the Extrude / Revolve dialog is open (a profile is chosen by clicking it).
     impl_->profilePicks = kind == "extrude" || kind == "revolve";
-    host_.setOverlayFaces(impl_->profilePicks ? cc->profileOverlays : std::vector<render::OverlayFace>{});
+    impl_->profileFaces = impl_->profilePicks ? cc->profileOverlays : std::vector<render::OverlayFace>{};
+    impl_->previewFaces.clear();
+    impl_->hoveredProfile = -1;
+    impl_->pushOverlays();
     host_.setPickHandler([this](const render::PickResult& r) { impl_->onPick(r); });
     impl_->arrowOn = kind == "extrude";
-    if (impl_->arrowOn) impl_->attachArrow(panel);
+    impl_->ringOn = kind == "revolve";
+    if (impl_->arrowOn || impl_->ringOn) impl_->attachManipulators(panel);
     QObject::connect(panel, &CommandPanel::finished, [this](bool) {
         host_.setPickHandler({});
-        host_.setOverlayFaces({});
-        impl_->detachArrow();
+        ++impl_->session;   // late results of this dialog are ignored
+        impl_->profileFaces.clear();
+        impl_->previewFaces.clear();
+        impl_->hoveredProfile = -1;
+        impl_->pushOverlays();
+        impl_->detachManipulators();
         impl_->profilePicks = false;
         impl_->panel = nullptr;
     });
     host_.showPanel(panel);
     impl_->updateArrow();
+    impl_->updateRing();
     return {};
 }
 

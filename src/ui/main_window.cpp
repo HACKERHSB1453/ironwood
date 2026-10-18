@@ -15,6 +15,8 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMouseEvent>
+#include <QPainter>
+#include <QPixmap>
 #include <QProgressBar>
 #include <QSettings>
 #include <QStatusBar>
@@ -71,6 +73,34 @@ QString messageOf(const recompute::FeatureStatus& s) {
         out += QString::fromStdString(d.message);
     }
     return out;
+}
+
+/// Under-constrained warning of a sketch (SketchFeature publishes warning="underconstrained" while DOF > 0). Empty when
+/// the sketch is fully constrained or the status carries no such attribute.
+QString underconstrainedMessage(const recompute::FeatureStatus& s) {
+    const auto warning = s.attributes.find("warning");
+    if (warning == s.attributes.end() || warning->second != "underconstrained") return {};
+    const auto dof = s.attributes.find("dof");
+    const QString count = dof != s.attributes.end() ? QString::fromStdString(dof->second) : QStringLiteral("?");
+    return QCoreApplication::translate("MainWindow", "Sketch is not fully constrained (%1 degrees of freedom)").arg(count);
+}
+
+/// The icon with the timeline's yellow warning badge ('!') at its top-right corner.
+QIcon withWarningBadge(const QIcon& base) {
+    QPixmap pm = base.pixmap(16, 16);
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing);
+    const QRectF badge(8.0, 0.0, 8.0, 8.0);
+    p.setPen(QPen(QColor("#7d6608"), 1));
+    p.setBrush(QColor("#f1c40f"));
+    p.drawEllipse(badge);
+    QFont f = p.font();
+    f.setPixelSize(7);
+    f.setBold(true);
+    p.setFont(f);
+    p.setPen(QColor("#202020"));
+    p.drawText(badge, Qt::AlignCenter, QStringLiteral("!"));
+    return QIcon(pm);
 }
 
 } // namespace
@@ -463,7 +493,11 @@ Result<void> MainWindow::commitFeature(std::shared_ptr<const recompute::Feature>
 
 void MainWindow::commitSketch(SketchSession* session) {
     if (!model_ || !session) return;
-    if (session->sketch().entities().empty()) {
+    // Every sketch holds the reference origin and axes, so only user entities decide whether it is empty.
+    const auto& entities = session->sketch().entities();
+    const bool hasUserEntity = std::any_of(entities.begin(), entities.end(),
+                                           [](const auto& kv) { return !sketch::isReferenceEntity(kv.first); });
+    if (!hasUserEntity) {
         setStatus(tr("Empty sketch: nothing added to the timeline"));
         return;
     }
@@ -613,6 +647,11 @@ void MainWindow::rebuildTimeline() {
             e.message = messageOf(s);
             for (const auto& d : s.diagnostics)
                 if (d.severity == recompute::Diagnostic::Severity::Warning) e.warning = true;
+            const QString underconstrained = underconstrainedMessage(s);
+            if (!underconstrained.isEmpty()) {
+                e.warning = true;
+                e.message = e.message.isEmpty() ? underconstrained : underconstrained + QLatin1Char('\n') + e.message;
+            }
         }
         if (e.state == recompute::FeatureStatus::State::Failed) e.warning = false;
         entries.push_back(std::move(e));
@@ -645,18 +684,29 @@ void MainWindow::showTimelineMenu(FeatureId id, QPoint globalPos) {
     QAction* ren = menu.addAction(tr("Rename..."));
     QAction* chosen = menu.exec(globalPos);
     if (!chosen) return;
-    if (chosen == edit) {
+    if (chosen == edit) runTimelineAction(id, TimelineAction::Edit);
+    else if (chosen == sup) runTimelineAction(id, TimelineAction::Suppress);
+    else if (chosen == del) runTimelineAction(id, TimelineAction::Delete);
+    else if (chosen == ren) runTimelineAction(id, TimelineAction::Rename);
+}
+
+void MainWindow::runTimelineAction(FeatureId id, TimelineAction action) {
+    if (!model_) return;
+    auto idx = model_->timeline().indexOf(id);
+    if (!idx) return;
+    const std::string kind = std::string(model_->timeline().at(*idx)->kind());
+    const bool suppressed = model_->timeline().isSuppressed(id);
+    switch (action) {
+    case TimelineAction::Edit:
         if (kind == "sketch") {
             editSketch(id);
         } else if (auto r = startFeature(kind, id); !r) {
             setStatus(tr("Cannot edit: %1").arg(QString::fromStdString(r.error().message)));
         }
-    } else if (chosen == sup) {
-        setFeatureSuppressed(id, !suppressed);
-    } else if (chosen == del) {
-        deleteFeature(id);
-    } else if (chosen == ren) {
-        renameFeature(id);
+        break;
+    case TimelineAction::Suppress: setFeatureSuppressed(id, !suppressed); break;
+    case TimelineAction::Delete: deleteFeature(id); break;
+    case TimelineAction::Rename: renameFeature(id); break;
     }
 }
 
@@ -809,9 +859,16 @@ void MainWindow::rebuildBrowser() {
 
     std::vector<std::string> names = timeline::displayNames(shown_.timeline);
     QTreeWidgetItem* sketches = group(tr("Sketches"));
-    for (std::size_t i = 0; i < shown_.timeline.size(); ++i)
-        if (std::string(shown_.timeline.at(i)->kind()) == "sketch")
-            leaf(sketches, QString::fromStdString(names[i]), "browser_sketch");
+    for (std::size_t i = 0; i < shown_.timeline.size(); ++i) {
+        if (std::string(shown_.timeline.at(i)->kind()) != "sketch") continue;
+        QTreeWidgetItem* item = leaf(sketches, QString::fromStdString(names[i]), "browser_sketch");
+        // Under-constrained sketch: a small warning marker on the item, the same text as its timeline hover.
+        const QString underconstrained = i < shown_.out.eval.statuses.size() ? underconstrainedMessage(shown_.out.eval.statuses[i]) : QString{};
+        if (!underconstrained.isEmpty()) {
+            item->setIcon(0, withWarningBadge(item->icon(0)));
+            item->setToolTip(0, underconstrained);
+        }
+    }
 
     QTreeWidgetItem* bodies = group(tr("Bodies"));
     std::size_t k = 0;

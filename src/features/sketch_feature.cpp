@@ -69,7 +69,8 @@ Result<sketch::SketchPlane> resolvePlane(const EvalContext& ctx, const PlaneRef&
 Result<sketch::Sketch> rebase(const sketch::Sketch& src, const sketch::SketchPlane& plane) {
     sketch::Sketch out(plane);
     for (const auto& [id, e] : src.entities())
-        if (auto r = out.restoreEntity(id, e.geometry, e.construction); !r) return std::unexpected(r.error());
+        if (sketch::isReferenceEntity(id)) continue;  // the new sketch already holds its own reference geometry
+        else if (auto r = out.restoreEntity(id, e.geometry, e.construction); !r) return std::unexpected(r.error());
     for (const auto& [id, c] : src.constraints())
         if (auto r = out.restoreConstraint(id, c.kind, c.refs); !r) return std::unexpected(r.error());
     for (const auto& [id, d] : src.dimensions())
@@ -83,7 +84,8 @@ Result<sketch::Sketch> rebase(const sketch::Sketch& src, const sketch::SketchPla
 Result<sketch::Sketch> buildSketch(const sketch::Sketch& geometry, const sketch::Sketch& records, bool withDriven) {
     sketch::Sketch out(records.plane());
     for (const auto& [id, e] : geometry.entities())
-        if (auto r = out.restoreEntity(id, e.geometry, e.construction); !r) return std::unexpected(r.error());
+        if (sketch::isReferenceEntity(id)) continue;
+        else if (auto r = out.restoreEntity(id, e.geometry, e.construction); !r) return std::unexpected(r.error());
     for (const auto& [id, c] : records.constraints())
         if (auto r = out.restoreConstraint(id, c.kind, c.refs); !r) return std::unexpected(r.error());
     for (const auto& [id, d] : records.dimensions()) {
@@ -225,6 +227,9 @@ Result<FeatureResult> SketchFeature::compute(const EvalContext& ctx) const {
     out.diagnostics = std::move(sol->diagnostics);
     out.attributes["dof"] = std::to_string(sol->report.dof);
     out.attributes["profiles"] = std::to_string(sol->profiles.size());
+    // Warning for the UI (yellow): an under-constrained sketch still solves, but its free DOFs can drift when a
+    // parameter changes. "none" when fully constrained.
+    out.attributes["warning"] = sol->report.dof > 0 ? "underconstrained" : "none";
     for (const auto& [id, value] : sol->drivenValues) out.attributes["driven." + std::to_string(id.value())] = std::to_string(value);
     return out;
 }

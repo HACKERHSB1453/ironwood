@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui/command_dialog.hpp"
 
+#include <QAbstractItemView>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QEvent>
 #include <QFont>
-#include <QAbstractItemView>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -137,7 +138,24 @@ Result<DialogModel::Snapshot> DialogModel::snapshot() const {
 
 // ---- LivePreview ----------------------------------------------------------------------------------------------
 
+namespace {
+
+/// A text-only preview as a geometry preview (no geometry).
+GeometryPreviewFn withoutGeometry(PreviewFn fn) {
+    if (!fn) return {};
+    return [fn = std::move(fn)](const DialogModel::Snapshot& snap, CancelToken token) -> Result<PreviewOutput> {
+        auto r = fn(snap, token);
+        if (!r) return std::unexpected(r.error());
+        return PreviewOutput{std::move(*r), {}};
+    };
+}
+
+} // namespace
+
 LivePreview::LivePreview(JobSystem& jobs, PreviewFn fn, std::function<void(const PreviewResult&)> onResult)
+    : fn_(withoutGeometry(std::move(fn))), onResult_(std::move(onResult)), latest_(jobs) {}
+
+LivePreview::LivePreview(JobSystem& jobs, GeometryPreviewFn fn, std::function<void(const PreviewResult&)> onResult)
     : fn_(std::move(fn)), onResult_(std::move(onResult)), latest_(jobs) {}
 
 void LivePreview::request(DialogModel::Snapshot snap) {
@@ -147,8 +165,8 @@ void LivePreview::request(DialogModel::Snapshot snap) {
         if (token.cancelled()) return makeError(ErrorCode::Cancelled, "superseded");
         auto r = fn(snap, token);
         if (token.cancelled()) return makeError(ErrorCode::Cancelled, "superseded");
-        if (!r) return PreviewResult{seq, r.error().message, true};
-        return PreviewResult{seq, *r, false};
+        if (!r) return PreviewResult{seq, r.error().message, true, {}};
+        return PreviewResult{seq, std::move(r->text), false, std::move(r->geometry)};
     });
 }
 
@@ -168,9 +186,11 @@ CommandPanel::CommandPanel(CommandDialogSpec spec, const ParameterTable* params,
     : QWidget(parent),
       spec_(std::move(spec)),
       model_(spec_.inputs, params),
-      preview_(jobs, spec_.preview, [this](const PreviewResult& r) {
-          if (previewLabel_) previewLabel_->setText(QString::fromStdString(r.text));
-      }) {
+      preview_(jobs, spec_.geometryPreview ? spec_.geometryPreview : withoutGeometry(spec_.preview),
+               [this](const PreviewResult& r) {
+                   if (previewLabel_) previewLabel_->setText(QString::fromStdString(r.text));
+                   if (spec_.previewDelivered) spec_.previewDelivered(r);
+               }) {
     setAttribute(Qt::WA_DeleteOnClose, false);
     buildForm();
     pollTimer_ = new QTimer(this);
@@ -213,13 +233,27 @@ void CommandPanel::buildForm() {
         }
         case InputKind::Dropdown: {
             auto* box = new QComboBox(field);
-            for (const QString& o : s.options) box->addItem(o);
-            box->setCurrentText(QString::fromStdString(s.defaultText));
+            box->setObjectName(QString::fromStdString("input_" + s.name));
+            // The option is the item data (the value the snapshot keeps); the label is what the user reads.
+            for (std::size_t i = 0; i < s.options.size(); ++i) {
+                const bool labelled = i < s.optionLabels.size() && !s.optionLabels[i].isEmpty();
+                box->addItem(labelled ? s.optionLabels[i] : s.options[i], s.options[i]);
+            }
+            if (const int at = box->findData(QString::fromStdString(s.defaultText)); at >= 0) box->setCurrentIndex(at);
             dropdowns_[s.name] = box;
-            connect(box, &QComboBox::currentTextChanged, this, [this, name = s.name](const QString& t) {
-                model_.setText(name, t.toStdString());
+            connect(box, &QComboBox::currentIndexChanged, this, [this, box, name = s.name](int at) {
+                if (at < 0) return;
+                model_.setText(name, box->itemData(at).toString().toStdString());
                 onFieldChanged(name);
             });
+            // Hovering an option reports its value (a profile overlay highlights); leaving the list reports none.
+            QAbstractItemView* view = box->view();
+            view->setMouseTracking(true);
+            connect(view, &QAbstractItemView::entered, this, [this, box, name = s.name](const QModelIndex& idx) {
+                if (spec_.optionHovered) spec_.optionHovered(name, box->itemData(idx.row()).toString().toStdString());
+            });
+            view->viewport()->installEventFilter(this);
+            hoverFields_[view->viewport()] = s.name;
             col->addWidget(box);
             break;
         }
@@ -286,6 +320,12 @@ void CommandPanel::setText(std::string_view name, const QString& text) {
         it->second->setText(text); // emits textChanged -> model + preview
         return;
     }
+    if (auto it = dropdowns_.find(name); it != dropdowns_.end()) {
+        if (const int at = it->second->findData(text); at >= 0) {
+            it->second->setCurrentIndex(at); // emits currentIndexChanged -> model + preview (when it changed)
+            return;
+        }
+    }
     model_.setText(name, text.toStdString());
     onFieldChanged(std::string(name));
 }
@@ -305,8 +345,15 @@ void CommandPanel::refreshValidation() {
     okButton_->setEnabled(model_.canAccept());
 }
 
+bool CommandPanel::eventFilter(QObject* watched, QEvent* event) {
+    if (event->type() == QEvent::Leave && spec_.optionHovered) {
+        if (auto it = hoverFields_.find(watched); it != hoverFields_.end()) spec_.optionHovered(it->second, std::string());
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
 void CommandPanel::requestPreview() {
-    if (!spec_.preview) return;
+    if (!spec_.preview && !spec_.geometryPreview) return;
     if (!model_.canAccept()) {
         previewLabel_->clear();
         return;

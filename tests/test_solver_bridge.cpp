@@ -283,3 +283,152 @@ TEST(SolverBridge, SymmetricAboutAFixedLineMirrorsAndHasNoConflict) {
     EXPECT_NEAR(q.x, -3.0, kTol);
     EXPECT_NEAR(q.y, 4.0, kTol);
 }
+
+// ---- F47: Fix on a line endpoint pins that endpoint only -------------------------------------------------------
+
+// Regression: Fix on the bottom-left corner (bottom line, role Start) + H/V + two dimensions was reported redundant and
+// then conflicting, because the adapter pinned BOTH endpoints of the line (the role was ignored). Pinning the sibling
+// endpoint made the horizontal constraint redundant and the width dimension conflict with its pinned coordinate.
+TEST(SolverBridge, FixOnLineEndpointPinsOnlyThatEndpoint) {
+    Sketch s = makeSketch();
+    Rect r = addRoughRect(s);
+    must(s.addConstraint(ConstraintKind::Fix, {{r.bottom, PointRole::Start}}));
+    auto dw = must(s.addDimension(DimensionKind::DistanceX, {{r.bottom, PointRole::Start}, {r.bottom, PointRole::End}}, "40"));
+    auto dh = must(s.addDimension(DimensionKind::DistanceY, {{r.left, PointRole::Start}, {r.left, PointRole::End}}, "20"));
+    (void)dw;
+    (void)dh;
+    const Point2 corner0 = lineOf(s, r.bottom).start;
+
+    SketchSolveReport rep = solveSketch(s);
+    ASSERT_EQ(rep.status, SolverStatus::Solved) << rep.message;
+    EXPECT_TRUE(rep.redundantConstraints.empty());
+    EXPECT_TRUE(rep.redundantDimensions.empty());
+    EXPECT_TRUE(rep.conflictingConstraints.empty());
+    EXPECT_TRUE(rep.conflictingDimensions.empty());
+    EXPECT_EQ(rep.dof, 0);
+    EXPECT_TRUE(near(lineOf(s, r.bottom).start, corner0));  // the pinned endpoint did not move
+    EXPECT_NEAR(distance(lineOf(s, r.bottom).start, lineOf(s, r.bottom).end), 40.0, kTol);
+
+    // Editing a dimension must not conflict with the pinned corner: the width changes, the corner stays.
+    ASSERT_TRUE(s.setDimensionExpression(dw, "60").has_value());
+    SketchSolveReport edited = solveSketch(s);
+    ASSERT_EQ(edited.status, SolverStatus::Solved) << edited.message;
+    EXPECT_TRUE(near(lineOf(s, r.bottom).start, corner0));
+    EXPECT_NEAR(lineOf(s, r.bottom).end.x - corner0.x, 60.0, kTol);
+}
+
+// Same constraints with the fix on a sub-point of a point entity: the existing working form, kept as a control.
+TEST(SolverBridge, FixOnPointEntityAndLineEndpointAgree) {
+    Sketch s = makeSketch();
+    auto p = must(s.addPoint({0.4, -0.2}));
+    Rect r = addRoughRect(s);
+    must(s.addConstraint(ConstraintKind::Coincident, {{p, std::nullopt}, {r.bottom, PointRole::Start}}));
+    must(s.addConstraint(ConstraintKind::Fix, {{p, std::nullopt}}));
+    must(s.addDimension(DimensionKind::DistanceX, {{r.bottom, PointRole::Start}, {r.bottom, PointRole::End}}, "40"));
+    must(s.addDimension(DimensionKind::DistanceY, {{r.left, PointRole::Start}, {r.left, PointRole::End}}, "20"));
+    SketchSolveReport rep = solveSketch(s);
+    ASSERT_EQ(rep.status, SolverStatus::Solved) << rep.message;
+    EXPECT_EQ(rep.dof, 0);
+    EXPECT_TRUE(rep.redundantConstraints.empty());
+}
+
+// Fix on a whole line (no sub-point) still pins both endpoints, as before.
+TEST(SolverBridge, FixOnWholeLinePinsBothEndpoints) {
+    Sketch s = makeSketch();
+    auto line = must(s.addLine({0, 0}, {10, 0.5}));
+    must(s.addConstraint(ConstraintKind::Fix, {{line, std::nullopt}}));
+    SketchSolveReport rep = solveSketch(s);
+    ASSERT_EQ(rep.status, SolverStatus::Solved) << rep.message;
+    EXPECT_EQ(rep.dof, 0);
+    EXPECT_TRUE(near(lineOf(s, line).start, {0, 0}));
+    EXPECT_TRUE(near(lineOf(s, line).end, {10, 0.5}));
+}
+
+// ---- F46: reference geometry and minimal-movement solves --------------------------------------------------------
+
+namespace {
+
+// Corner centroid of the rough rectangle (its four line endpoints, averaged).
+Point2 centroidOf(const Sketch& s, const Rect& r) {
+    const Point2 pts[] = {lineOf(s, r.bottom).start, lineOf(s, r.right).start, lineOf(s, r.top).start,
+                          lineOf(s, r.left).start};
+    Point2 c{};
+    for (const Point2& p : pts) c = c + p;
+    return c * 0.25;
+}
+
+// Rectangle that is dimensioned but not anchored: H/V and a width and height dimension, no position constraint.
+Rect dimensionedRect(Sketch& s, SketchDimensionId& width) {
+    Rect r = addRoughRect(s);
+    width = must(s.addDimension(DimensionKind::DistanceX, {{r.bottom, PointRole::Start}, {r.bottom, PointRole::End}}, "40"));
+    must(s.addDimension(DimensionKind::DistanceY, {{r.left, PointRole::Start}, {r.left, PointRole::End}}, "20"));
+    return r;
+}
+
+}  // namespace
+
+// Regression (drift): a parameter edit on a dimension-only rectangle must not translate it. Anchored to the origin,
+// the bottom-left corner stays on (0, 0) and only the far edge moves.
+TEST(SolverBridge, DimensionOnlyRectangleAnchoredToOriginDoesNotDrift) {
+    Sketch s = makeSketch();
+    SketchDimensionId width{};
+    Rect r = dimensionedRect(s, width);
+    must(s.addConstraint(ConstraintKind::Coincident, {{r.bottom, PointRole::Start}, {kOriginPointId, std::nullopt}}));
+    SketchSolveReport rep = solveSketch(s);
+    ASSERT_EQ(rep.status, SolverStatus::Solved) << rep.message;
+    EXPECT_EQ(rep.dof, 0);
+    EXPECT_TRUE(near(lineOf(s, r.bottom).start, {0, 0}));
+
+    ASSERT_TRUE(s.setDimensionExpression(width, "60").has_value());
+    SketchSolveReport edited = solveSketch(s);
+    ASSERT_EQ(edited.status, SolverStatus::Solved) << edited.message;
+    EXPECT_TRUE(near(lineOf(s, r.bottom).start, {0, 0}, kTol));
+    EXPECT_NEAR(lineOf(s, r.bottom).end.x, 60.0, kTol);
+    EXPECT_NEAR(lineOf(s, r.right).start.x, 60.0, kTol);
+}
+
+// Regression (drift): an UNanchored dimension-only rectangle has free translation. A parameter edit must change its
+// size in place: the centroid stays put (minimal change from the current positions), it does not jump to a new place.
+TEST(SolverBridge, UnanchoredDimensionOnlyRectangleStaysPutOnParameterEdit) {
+    Sketch s = makeSketch();
+    SketchDimensionId width{};
+    Rect r = dimensionedRect(s, width);
+    SketchSolveReport rep = solveSketch(s);
+    ASSERT_EQ(rep.status, SolverStatus::Solved) << rep.message;
+    EXPECT_GT(rep.dof, 0);  // under-constrained: translation is free
+    const Point2 c0 = centroidOf(s, r);
+
+    ASSERT_TRUE(s.setDimensionExpression(width, "60").has_value());
+    SketchSolveReport edited = solveSketch(s);
+    ASSERT_EQ(edited.status, SolverStatus::Solved) << edited.message;
+    EXPECT_NEAR(distance(lineOf(s, r.bottom).start, lineOf(s, r.bottom).end), 60.0, kTol);
+    const Point2 c1 = centroidOf(s, r);
+    EXPECT_NEAR(c1.x, c0.x, kTol);
+    EXPECT_NEAR(c1.y, c0.y, kTol);
+}
+
+// Fusion parity: the origin is a fixed construction point and the axes are fixed construction lines, so a sketch can
+// snap to them. Coincident with the origin pins a corner and removes the translation DOF.
+TEST(SolverBridge, OriginAndAxesAreFixedAndSnappable) {
+    Sketch s = makeSketch();
+    SketchDimensionId width{};
+    Rect r = dimensionedRect(s, width);
+    must(s.addConstraint(ConstraintKind::PointOnObject, {{r.bottom, PointRole::Start}, {kXAxisId, std::nullopt}}));
+    must(s.addConstraint(ConstraintKind::PointOnObject, {{r.bottom, PointRole::Start}, {kYAxisId, std::nullopt}}));
+    SketchSolveReport rep = solveSketch(s);
+    ASSERT_EQ(rep.status, SolverStatus::Solved) << rep.message;
+    EXPECT_EQ(rep.dof, 0);
+    EXPECT_TRUE(near(lineOf(s, r.bottom).start, {0, 0}));
+    // Reference geometry itself never moves.
+    EXPECT_TRUE(near(std::get<PointGeom>(s.findEntity(kOriginPointId)->geometry).p, {0, 0}));
+    EXPECT_NEAR(lineOf(s, kXAxisId).start.x, -kReferenceAxisHalfLength, kTol);
+}
+
+// Under-constrained: DOF > 0 is reported (the feature layer turns it into a warning).
+TEST(SolverBridge, UnanchoredRectangleReportsPositiveDof) {
+    Sketch s = makeSketch();
+    SketchDimensionId width{};
+    dimensionedRect(s, width);
+    SketchSolveReport rep = diagnoseSketch(s);
+    EXPECT_GT(rep.dof, 0);
+}

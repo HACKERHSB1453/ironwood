@@ -156,6 +156,7 @@ Result<json> toJson(const sketch::Sketch& sk) {
 
     json entities = json::array();
     for (const auto& [id, e] : sk.entities()) {
+        if (sketch::isReferenceEntity(id)) continue;  // origin and axes are part of every sketch: not persisted
         json j = json::object();
         j["id"] = id.value();
         j["construction"] = e.construction;
@@ -238,6 +239,9 @@ Result<Sketch> fromJson(const json& j) {
         if (!e.is_object() || !e.contains("id") || !e["id"].is_number_unsigned())
             return makeError(ErrorCode::ParseError, "sketch: entity id missing");
         const sketch::SketchEntityId id{e["id"].get<std::uint64_t>()};
+        // Reference geometry is created by the Sketch constructor; a file that carries it (older or hand-made) is
+        // accepted, and the constructor's copy is kept.
+        if (sketch::isReferenceEntity(id)) continue;
         const bool construction = e.value("construction", false);
         const std::string type = e.value("type", std::string{});
         Result<void> restored;

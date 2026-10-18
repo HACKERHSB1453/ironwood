@@ -140,6 +140,18 @@ struct Model {
     }
 
     // Midpoint of `line`: the point lies on the line and on its perpendicular bisector.
+    // Pins both coordinates of `p` to their current values (refreshed from the sketch on every solve: the target is a
+    // constant, the source is the parameter itself).
+    void pinPoint(GCS::Point p, int tag)
+    {
+        double* tx = slot(0.0);
+        double* ty = slot(0.0);
+        keep(sys.addConstraintCoordinateX(p, tx, tag));
+        keep(sys.addConstraintCoordinateY(p, ty, tag));
+        valueSlots.push_back(ValueSlot{tx, p.x, kNoConstraint, 1.0});
+        valueSlots.push_back(ValueSlot{ty, p.y, kNoConstraint, 1.0});
+    }
+
     void addMidpoint(GCS::Point p, GCS::Line& line, int tag)
     {
         keep(sys.addConstraintPointOnLine(p, line, tag));
@@ -162,41 +174,53 @@ struct Model {
 
 void Model::addFix(const SolverConstraint& c, int tag)
 {
-    // Each fixed coordinate or radius is pinned to its current value, refreshed from the sketch on
-    // every solve (the target is a constant, the source is the parameter itself).
-    auto pinPoint = [&](GCS::Point p) {
-        double* tx = slot(0.0);
-        double* ty = slot(0.0);
-        keep(sys.addConstraintCoordinateX(p, tx, tag));
-        keep(sys.addConstraintCoordinateY(p, ty, tag));
-        valueSlots.push_back(ValueSlot{tx, p.x, kNoConstraint, 1.0});
-        valueSlots.push_back(ValueSlot{ty, p.y, kNoConstraint, 1.0});
+    // The sub-point role selects what is pinned. Before this honoured the role, Fix on a line endpoint pinned BOTH
+    // endpoints (4 equations), so a Horizontal or Vertical on that line was redundant and a later dimension on the
+    // other endpoint conflicted (F47).
+    const SolverRef& ref = c.refs[0];
+    const Entity& e = find(ref.entity);
+    auto pinRadius = [&](const Entity& ce) {
+        double* tr = slot(0.0);
+        if (ce.kind == Entity::Kind::Arc) {
+            keep(sys.addConstraintArcRadius(*ce.arc, tr, tag));
+            valueSlots.push_back(ValueSlot{tr, ce.arc->rad, kNoConstraint, 1.0});
+        } else {
+            keep(sys.addConstraintCircleRadius(*ce.circle, tr, tag));
+            valueSlots.push_back(ValueSlot{tr, ce.circle->rad, kNoConstraint, 1.0});
+        }
     };
-    const Entity& e = find(c.refs[0].entity);
     switch (e.kind) {
         case Entity::Kind::Point:
-            pinPoint(e.point);
+            pinPoint(e.point, tag);
             break;
         case Entity::Kind::Line:
-            pinPoint(e.line->p1);
-            pinPoint(e.line->p2);
+            if (ref.role == SolverRole::Start) {
+                pinPoint(e.line->p1, tag);
+            } else if (ref.role == SolverRole::End) {
+                pinPoint(e.line->p2, tag);
+            } else {
+                pinPoint(e.line->p1, tag);
+                pinPoint(e.line->p2, tag);
+            }
             break;
-        case Entity::Kind::Circle: {
-            pinPoint(e.circle->center);
-            double* tr = slot(0.0);
-            keep(sys.addConstraintCircleRadius(*e.circle, tr, tag));
-            valueSlots.push_back(ValueSlot{tr, e.circle->rad, kNoConstraint, 1.0});
+        case Entity::Kind::Circle:
+            pinPoint(e.circle->center, tag);
+            if (ref.role != SolverRole::Center) pinRadius(e);
             break;
-        }
-        case Entity::Kind::Arc: {
-            pinPoint(e.arc->center);
-            pinPoint(e.arc->start);
-            pinPoint(e.arc->end);
-            double* tr = slot(0.0);
-            keep(sys.addConstraintArcRadius(*e.arc, tr, tag));
-            valueSlots.push_back(ValueSlot{tr, e.arc->rad, kNoConstraint, 1.0});
+        case Entity::Kind::Arc:
+            if (ref.role == SolverRole::Start) {
+                pinPoint(e.arc->start, tag);
+            } else if (ref.role == SolverRole::End) {
+                pinPoint(e.arc->end, tag);
+            } else if (ref.role == SolverRole::Center) {
+                pinPoint(e.arc->center, tag);
+            } else {
+                pinPoint(e.arc->center, tag);
+                pinPoint(e.arc->start, tag);
+                pinPoint(e.arc->end, tag);
+                pinRadius(e);
+            }
             break;
-        }
     }
 }
 
@@ -440,7 +464,7 @@ std::vector<std::uint64_t> structureSignature(const SolverSketch& s, const Solve
     std::vector<std::uint64_t> sig;
     sig.push_back(s.points.size());
     for (const SolverPoint& p : s.points) {
-        sig.push_back(p.id);
+        sig.insert(sig.end(), {p.id, p.fixed ? 1U : 0U});
     }
     sig.push_back(s.lines.size());
     for (const SolverLine& l : s.lines) {
@@ -485,6 +509,8 @@ std::unique_ptr<Model> buildModel(const SolverSketch& input, const SolverRef* dr
         m->unknowns.push_back(e.point.x);
         m->unknowns.push_back(e.point.y);
         m->pointOrder.push_back(e.point);
+        // Structural pin (tag 0): a fixed point keeps its position in every solve and is never reported.
+        if (p.fixed) m->pinPoint(e.point, 0);
     }
 
     for (const SolverLine& l : input.lines) {

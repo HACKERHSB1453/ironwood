@@ -99,7 +99,8 @@ TEST(SketchEntities, InvalidGeometryIsRejected) {
     EXPECT_EQ(s.addArc({0, 0}, 1, 0, 0).error().code, ErrorCode::InvalidArgument);
     EXPECT_EQ(s.addArc({0, 0}, 1, 0, 2 * kPi).error().code, ErrorCode::InvalidArgument);
     EXPECT_EQ(s.addPoint({std::nan(""), 0}).error().code, ErrorCode::InvalidArgument);
-    EXPECT_TRUE(s.entities().empty()); // failed calls change nothing
+    // Only the reference geometry (origin + two axes, F46) is present; failed calls added nothing.
+    EXPECT_EQ(s.entities().size(), 3u);
 }
 
 TEST(SketchEntities, IdsAreNeverReused) {
@@ -699,4 +700,69 @@ TEST(SketchDimensions, DrivenFlagDefaultsOffAndToggles) {
     ASSERT_TRUE(sk.setDimensionDriven(d, false).has_value());
     EXPECT_FALSE(sk.dimensions().at(d).driven);
     EXPECT_FALSE(sk.setDimensionDriven(SketchDimensionId{999}, true).has_value());
+}
+
+// ---- F46: reference geometry (projected origin point + sketch axes) ----------------------------------------------
+
+TEST(SketchReference, EveryNewSketchHoldsFixedConstructionOriginAndAxes) {
+    Sketch s = xySketch();
+    const SketchEntity* o = s.findEntity(kOriginPointId);
+    ASSERT_NE(o, nullptr);
+    EXPECT_TRUE(o->construction);
+    ASSERT_EQ(o->kind(), EntityKind::Point);
+    EXPECT_EQ(std::get<PointGeom>(o->geometry).p, (Point2{0, 0}));
+
+    const SketchEntity* x = s.findEntity(kXAxisId);
+    const SketchEntity* y = s.findEntity(kYAxisId);
+    ASSERT_NE(x, nullptr);
+    ASSERT_NE(y, nullptr);
+    EXPECT_TRUE(x->construction);
+    EXPECT_TRUE(y->construction);
+    const auto& xl = std::get<LineGeom>(x->geometry);
+    const auto& yl = std::get<LineGeom>(y->geometry);
+    EXPECT_NEAR(xl.start.y, 0.0, 1e-12);
+    EXPECT_NEAR(xl.end.y, 0.0, 1e-12);
+    EXPECT_NEAR(xl.start.x, -xl.end.x, 1e-12);
+    EXPECT_NEAR(yl.start.x, 0.0, 1e-12);
+    EXPECT_NEAR(yl.end.x, 0.0, 1e-12);
+    EXPECT_NEAR(yl.start.y, -yl.end.y, 1e-12);
+
+    EXPECT_TRUE(isReferenceEntity(kOriginPointId));
+    EXPECT_TRUE(isReferenceEntity(kXAxisId));
+    EXPECT_TRUE(isReferenceEntity(kYAxisId));
+    EXPECT_FALSE(isReferenceEntity(SketchEntityId{1}));
+}
+
+TEST(SketchReference, ReferenceGeometryIsNotRemovableOrNonConstruction) {
+    Sketch s = xySketch();
+    EXPECT_EQ(s.removeEntity(kOriginPointId).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(s.removeEntity(kXAxisId).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(s.setConstruction(kYAxisId, false).error().code, ErrorCode::InvalidArgument);
+    EXPECT_NE(s.findEntity(kOriginPointId), nullptr);
+    EXPECT_NE(s.findEntity(kXAxisId), nullptr);
+    EXPECT_NE(s.findEntity(kYAxisId), nullptr);
+}
+
+TEST(SketchReference, IdCounterAndUserIdsAreUnaffected) {
+    Sketch s = xySketch();
+    // The reserved ids never move the counter: the first user entity is still id 1.
+    EXPECT_EQ(s.nextId(), 1u);
+    auto p = s.addPoint({1, 2});
+    ASSERT_TRUE(p.has_value());
+    EXPECT_EQ(p->value(), 1u);
+    // A document restoring user entity id 1 loads into a fresh sketch (no clash with the origin), and restoreNextId
+    // ignores the reserved ids.
+    Sketch r = xySketch();
+    ASSERT_TRUE(r.restoreEntity(SketchEntityId{1}, PointGeom{{3, 4}}).has_value());
+    EXPECT_TRUE(r.restoreNextId(2).has_value());
+    // Reference ids cannot be restored over (they are always in use).
+    EXPECT_EQ(r.restoreEntity(kOriginPointId, PointGeom{{5, 5}}).error().code, ErrorCode::InvalidArgument);
+}
+
+TEST(SketchReference, ReferenceEntitiesAreNotProfiles) {
+    // Construction geometry never forms a profile: an empty sketch still has no profiles.
+    Sketch s = xySketch();
+    auto ps = detectProfiles(s);
+    ASSERT_TRUE(ps.has_value());
+    EXPECT_TRUE(ps->empty());
 }
