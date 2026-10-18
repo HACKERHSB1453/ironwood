@@ -24,6 +24,7 @@
 #include "features/sketch_json.hpp"
 #include "kernel/internal/profile_support.hpp"
 #include "kernel/ops.hpp"
+#include "kernel/taper.hpp"
 #include "naming/naming_map.hpp"
 #include "sketch/profile.hpp"
 
@@ -230,9 +231,44 @@ Result<std::shared_ptr<Feature>> ExtrudeFeature::fromJson(FeatureId id, std::str
 
 namespace {
 
+struct Extrusion {
+    kernel::Shape shape;
+    NamingMap naming;
+};
+
+/// One prism of the profile face along `vector`: plain when `taper` is zero, otherwise a draft prism.
+Result<Extrusion> extrudeOne(FeatureId feature, const kernel::Shape& face, const NamingMap& pnaming, const Vec3& vector,
+                             double taper, const char* opTag, const CancelToken& cancel) {
+    auto ext = taper == 0 ? kernel::extrudeProfile(face, vector, cancel) : kernel::extrudeProfileTapered(face, vector, taper, cancel);
+    if (!ext) return std::unexpected(ext.error());
+    auto nm = naming::deriveNamingMap(feature, opTag, ext->shape, {&pnaming}, ext->history);
+    if (!nm) return std::unexpected(nm.error());
+    return Extrusion{std::move(ext->shape), std::move(*nm)};
+}
+
+/// The extrusion of the profile: one prism, or for a tapered two-sided extent one draft prism per side fused together
+/// (both sides start at the sketch plane and lean inward by the same taper).
+Result<Extrusion> extrudeSides(FeatureId feature, const kernel::Shape& face, const NamingMap& pnaming,
+                               const std::vector<Vec3>& vectors, double taper, const CancelToken& cancel) {
+    if (vectors.size() == 1) return extrudeOne(feature, face, pnaming, vectors[0], taper, "extrude", cancel);
+    // The two sides carry distinct op tags so that their side faces (same profile edges) get distinct names.
+    auto a = extrudeOne(feature, face, pnaming, vectors[0], taper, "extrude", cancel);
+    if (!a) return std::unexpected(a.error());
+    auto b = extrudeOne(feature, face, pnaming, vectors[1], taper, "extrude_back", cancel);
+    if (!b) return std::unexpected(b.error());
+    auto fused = kernel::fuse(a->shape, b->shape, cancel);
+    if (!fused) return std::unexpected(fused.error());
+    if (fused->shape.isNull() || fused->shape.subShapeCount(kernel::SubShapeKind::Face) == 0)
+        return makeError(ErrorCode::KernelFailure, "extrude: tapered sides did not fuse into a solid");
+    auto nm = naming::deriveNamingMap(feature, "fuse", fused->shape, {&a->naming, &b->naming}, fused->history);
+    if (!nm) return std::unexpected(nm.error());
+    return Extrusion{std::move(fused->shape), std::move(*nm)};
+}
+
 /// Shared tail: extrude the planar face, then apply the operation to the target body.
 Result<FeatureResult> finishExtrude(FeatureId feature, const ExtrudeParams& p, const EvalContext& ctx, const kernel::Shape& face,
-                                    const NamingMap& pnaming, const Vec3& vector, std::vector<Diagnostic> diags) {
+                                    const NamingMap& pnaming, const std::vector<Vec3>& vectors, double taper,
+                                    std::vector<Diagnostic> diags) {
     const bool combine = p.operation != ExtrudeParams::Operation::NewBody;
     const kernel::Shape* target = nullptr;
     const NamingMap* targetNaming = nullptr;
@@ -244,16 +280,14 @@ Result<FeatureResult> finishExtrude(FeatureId feature, const ExtrudeParams& p, c
     }
     if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "extrude cancelled");
 
-    auto ext = kernel::extrudeProfile(face, vector, ctx.cancel);
+    auto ext = extrudeSides(feature, face, pnaming, vectors, taper, ctx.cancel);
     if (!ext) return std::unexpected(ext.error());
-    auto extNaming = naming::deriveNamingMap(feature, "extrude", ext->shape, {&pnaming}, ext->history);
-    if (!extNaming) return std::unexpected(extNaming.error());
 
     FeatureResult out;
     out.diagnostics = std::move(diags);
     if (!combine) {
         out.bodies.emplace(p.body, std::move(ext->shape));
-        out.namings.emplace(p.body, std::move(*extNaming));
+        out.namings.emplace(p.body, std::move(ext->naming));
         return out;
     }
 
@@ -268,7 +302,7 @@ Result<FeatureResult> finishExtrude(FeatureId feature, const ExtrudeParams& p, c
     if (!combined) return std::unexpected(combined.error());
     if (combined->shape.isNull() || combined->shape.subShapeCount(kernel::SubShapeKind::Face) == 0)
         return makeError(ErrorCode::KernelFailure, std::string("extrude: ") + operationName(p.operation) + " produced no solid");
-    auto combinedNaming = naming::deriveNamingMap(feature, opTag, combined->shape, {targetNaming, &*extNaming}, combined->history);
+    auto combinedNaming = naming::deriveNamingMap(feature, opTag, combined->shape, {targetNaming, &ext->naming}, combined->history);
     if (!combinedNaming) return std::unexpected(combinedNaming.error());
     out.bodies.emplace(p.body, std::move(combined->shape));
     out.namings.emplace(p.body, std::move(*combinedNaming));
@@ -300,7 +334,7 @@ Result<FeatureResult> ExtrudeFeature::compute(const EvalContext& ctx) const {
         if (!face) return std::unexpected(face.error());
         auto pnaming = polygonProfileNaming(id_, *face);
         if (!pnaming) return std::unexpected(pnaming.error());
-        return finishExtrude(id_, p, ctx, *face, *pnaming, poly->vector, {});
+        return finishExtrude(id_, p, ctx, *face, *pnaming, {poly->vector}, 0.0, {});
     }
 
     if (std::holds_alternative<SketchReferenceSource>(p.source))
@@ -317,7 +351,6 @@ Result<FeatureResult> ExtrudeFeature::compute(const EvalContext& ctx) const {
     }
     auto taper = angleOf(ctx.params, p.taper, "taper");
     if (!taper) return std::unexpected(taper.error());
-    if (std::abs(*taper) > 1e-12) return makeError(ErrorCode::NotImplemented, "extrude: non-zero taper is not implemented yet");
 
     auto profiles = sketch::detectProfiles(src.sketch);
     if (!profiles) return std::unexpected(profiles.error());
@@ -327,21 +360,37 @@ Result<FeatureResult> ExtrudeFeature::compute(const EvalContext& ctx) const {
     if (!prof) return makeError(ErrorCode::NotFound, "extrude: sketch has no profile '" + src.profile + "'");
 
     // Start the profile on the side the extent requires; the sweep vector then spans the whole extent.
+    // Untapered extents sweep one vector (the plane moves to the far end for TwoSides/Symmetric). A tapered two-sided
+    // extent keeps the plane and sweeps each side as its own draft prism: forwards by `d1` (Symmetric: d/2) and
+    // backwards by `d2` (Symmetric: d/2).
+    const bool tapered = std::abs(*taper) > 1e-12;
     sketch::SketchPlane plane = src.sketch.plane();
     const Vec3 n = plane.normal;
-    Vec3 vector;
+    std::vector<Vec3> vectors;
     switch (p.extent) {
     case ExtrudeParams::Extent::OneSide:
-        vector = n * *d1;
+        vectors = {n * *d1};
         break;
     case ExtrudeParams::Extent::TwoSides:
-        plane.origin = plane.origin - n * d2;
-        vector = n * (*d1 + d2);
+        if (tapered) {
+            vectors = {n * *d1, n * -d2};
+        } else {
+            plane.origin = plane.origin - n * d2;
+            vectors = {n * (*d1 + d2)};
+        }
         break;
     case ExtrudeParams::Extent::Symmetric:
-        plane.origin = plane.origin - n * (*d1 * 0.5);
-        vector = n * *d1;
+        if (tapered) {
+            vectors = {n * (*d1 * 0.5), n * (*d1 * -0.5)};
+        } else {
+            plane.origin = plane.origin - n * (*d1 * 0.5);
+            vectors = {n * *d1};
+        }
         break;
+    }
+    if (tapered) {
+        std::erase_if(vectors, [](const Vec3& v) { return length(v) < 1e-12; });
+        if (vectors.empty()) return makeError(ErrorCode::InvalidArgument, "extrude: tapered extrude needs a non-zero extent");
     }
     if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "extrude cancelled");
 
@@ -350,7 +399,7 @@ Result<FeatureResult> ExtrudeFeature::compute(const EvalContext& ctx) const {
     std::vector<Diagnostic> diags;
     auto pnaming = sketchProfileNaming(id_, *face, *prof, plane, diags);
     if (!pnaming) return std::unexpected(pnaming.error());
-    return finishExtrude(id_, p, ctx, *face, *pnaming, vector, std::move(diags));
+    return finishExtrude(id_, p, ctx, *face, *pnaming, vectors, *taper, std::move(diags));
 }
 
 void registerExtrudeFeature(FeatureRegistry& registry) {

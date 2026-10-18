@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <numbers>
 #include <fstream>
 #include <random>
 #include <set>
@@ -235,8 +236,8 @@ TEST(FeaturesParams, ExpressionErrorsFailTheFeatureCleanly) {
     run(sketchParams(r.sk, prof, "10"), ErrorCode::InvalidArgument);          // unitless where a length is needed
     run(sketchParams(r.sk, "e9.9", "d1"), ErrorCode::NotFound);               // no such profile
     ExtrudeParams tapered = sketchParams(r.sk, prof, "d1");
-    tapered.taper = "5 deg";
-    run(tapered, ErrorCode::NotImplemented);
+    tapered.taper = "89.5 deg"; // F23: a taper of 5 deg is now built; 89 deg and above is rejected
+    run(tapered, ErrorCode::InvalidArgument);
     ExtrudeParams nonzeroTwo = sketchParams(r.sk, prof, "d1", ExtrudeParams::Operation::NewBody, kB1,
                                             ExtrudeParams::Extent::TwoSides, "-d1");
     run(nonzeroTwo, ErrorCode::InvalidArgument); // d + d2 = 0 gives a zero extrusion vector
@@ -1251,4 +1252,146 @@ TEST(FeaturesRegistry, EveryNewKindRoundTripsThroughRegistryAndIo) {
     ASSERT_TRUE(a && b);
     for (std::size_t i = 0; i < tl.size(); ++i) EXPECT_EQ(a->statuses[i].state, b->statuses[i].state) << tl.at(i)->kind();
     EXPECT_NEAR(volumeOf(a->bodies.at(kB1)), volumeOf(b->bodies.at(kB1)), 1e-9);
+}
+
+// ---- F23: tapered (draft) extrude ------------------------------------------------------------------------------------
+
+namespace {
+
+/// Volume of a square-based frustum: side `s` at the sketch plane, drafted by `taper` radians over height `h`
+/// (positive = inward). Negative taper flares outward.
+double taperedSquareFrustum(double s, double h, double taper) {
+    const double top = s - 2.0 * h * std::tan(taper);
+    return h / 3.0 * (s * s + top * top + s * top);
+}
+
+std::size_t sideFaceCount(const naming::NamingMap& m) {
+    std::size_t n = 0;
+    for (std::uint32_t i = 0; i < m.size(naming::ElementType::Face); ++i) {
+        auto name = m.nameOf(naming::ElementType::Face, i);
+        if (name && name->op == "extrude.side") ++n;
+    }
+    return n;
+}
+
+} // namespace
+
+TEST(FeaturesTaper, OneSideTaperMatchesFrustumAndDirection) {
+    const double t = 5.0 * std::numbers::pi / 180.0;
+    const RectSketch r = makeRect(10, 10);
+    const std::string prof = onlyProfile(r.sk);
+    for (const auto& [text, signedTaper] : {std::pair{"5 deg", t}, std::pair{"-5 deg", -t}}) {
+        ExtrudeParams p = sketchParams(r.sk, prof, "10 mm");
+        p.taper = text;
+        Timeline tl;
+        tl.append(feat(1, p));
+        auto res = Evaluator{}.evaluate(tl);
+        ASSERT_TRUE(res.has_value());
+        ASSERT_EQ(res->statuses[0].state, FeatureStatus::State::Ok) << res->statuses[0].error.message;
+        const double expected = taperedSquareFrustum(10, 10, signedTaper);
+        EXPECT_NEAR(volumeOf(res->bodies.at(kB1)), expected, 1e-6 * expected) << text;
+        const auto [z0, z1] = zRange(res->bodies.at(kB1));
+        EXPECT_NEAR(z0, 0.0, 1e-7);
+        EXPECT_NEAR(z1, 10.0, 1e-6);
+        EXPECT_EQ(sideFaceCount(res->namings.at(kB1)), 4u) << text;
+    }
+}
+
+TEST(FeaturesTaper, TwoSidesAndSymmetricTaperEachSide) {
+    const double t = 5.0 * std::numbers::pi / 180.0;
+    const RectSketch r = makeRect(10, 10);
+    const std::string prof = onlyProfile(r.sk);
+
+    ExtrudeParams tp = sketchParams(r.sk, prof, "6 mm", ExtrudeParams::Operation::NewBody, kB1,
+                                    ExtrudeParams::Extent::TwoSides, "4 mm");
+    tp.taper = "5 deg";
+    Timeline tt;
+    tt.append(feat(1, tp));
+    auto b = Evaluator{}.evaluate(tt);
+    ASSERT_TRUE(b.has_value());
+    ASSERT_EQ(b->statuses[0].state, FeatureStatus::State::Ok) << b->statuses[0].error.message;
+    const double expectTwo = taperedSquareFrustum(10, 6, t) + taperedSquareFrustum(10, 4, t);
+    EXPECT_NEAR(volumeOf(b->bodies.at(kB1)), expectTwo, 1e-6 * expectTwo);
+    EXPECT_NEAR(zRange(b->bodies.at(kB1)).first, -4.0, 1e-6);
+    EXPECT_NEAR(zRange(b->bodies.at(kB1)).second, 6.0, 1e-6);
+
+    ExtrudeParams sp = sketchParams(r.sk, prof, "10 mm", ExtrudeParams::Operation::NewBody, kB1,
+                                    ExtrudeParams::Extent::Symmetric);
+    sp.taper = "5 deg";
+    Timeline st;
+    st.append(feat(1, sp));
+    auto c = Evaluator{}.evaluate(st);
+    ASSERT_TRUE(c.has_value());
+    ASSERT_EQ(c->statuses[0].state, FeatureStatus::State::Ok) << c->statuses[0].error.message;
+    const double expectSym = 2.0 * taperedSquareFrustum(10, 5, t);
+    EXPECT_NEAR(volumeOf(c->bodies.at(kB1)), expectSym, 1e-6 * expectSym);
+    EXPECT_NEAR(zRange(c->bodies.at(kB1)).first, -5.0, 1e-6);
+    EXPECT_NEAR(zRange(c->bodies.at(kB1)).second, 5.0, 1e-6);
+}
+
+TEST(FeaturesTaper, CollapsingTaperFailsTheFeatureCleanly) {
+    const RectSketch r = makeRect(10, 10);
+    ExtrudeParams p = sketchParams(r.sk, onlyProfile(r.sk), "10 mm");
+    p.taper = "60 deg";
+    Timeline t;
+    t.append(feat(1, p));
+    auto res = Evaluator{}.evaluate(t);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->statuses[0].state, FeatureStatus::State::Failed);
+    EXPECT_EQ(res->statuses[0].error.code, ErrorCode::KernelFailure);
+    EXPECT_NE(res->statuses[0].error.message.find("collapses at distance"), std::string::npos) << res->statuses[0].error.message;
+}
+
+TEST(FeaturesTaper, ZeroTaperIsIdenticalToPlainExtrude) {
+    const RectSketch r = makeRect(10, 10);
+    const std::string prof = onlyProfile(r.sk);
+    ExtrudeParams zero = sketchParams(r.sk, prof, "12 mm");
+    zero.taper = "0 deg";
+    Timeline a, b;
+    a.append(feat(1, zero));
+    b.append(feat(1, sketchParams(r.sk, prof, "12 mm")));
+    auto ra = Evaluator{}.evaluate(a);
+    auto rb = Evaluator{}.evaluate(b);
+    ASSERT_TRUE(ra.has_value() && rb.has_value());
+    ASSERT_EQ(ra->statuses[0].state, FeatureStatus::State::Ok) << ra->statuses[0].error.message;
+    ASSERT_EQ(rb->statuses[0].state, FeatureStatus::State::Ok) << rb->statuses[0].error.message;
+    EXPECT_NEAR(volumeOf(ra->bodies.at(kB1)), volumeOf(rb->bodies.at(kB1)), 1e-9);
+    EXPECT_NEAR(volumeOf(ra->bodies.at(kB1)), 1200.0, 1e-6);
+    EXPECT_EQ(faceNames(ra->namings.at(kB1)), faceNames(rb->namings.at(kB1)));
+}
+
+TEST(FeaturesTaper, TaperedExtrudeRoundTripsThroughIo) {
+    const RectSketch r = makeRect(10, 10);
+    io::Document doc;
+    doc.name = "tapered-extrude";
+    doc.nextId = 10;
+    ASSERT_TRUE(doc.parameters.add("d1", "6 mm"));
+    ExtrudeParams tp = sketchParams(r.sk, onlyProfile(r.sk), "d1", ExtrudeParams::Operation::NewBody, kB1,
+                                    ExtrudeParams::Extent::TwoSides, "4 mm");
+    tp.taper = "5 deg";
+    doc.timeline.append(feat(1, tp));
+
+    FeatureRegistry reg;
+    registerFeatures(reg);
+    const auto dir = std::filesystem::temp_directory_path() / ("iw_taper_rt_" + std::to_string(std::random_device{}()) + ".iwd");
+    std::filesystem::remove_all(dir);
+    ASSERT_TRUE(io::saveDocument(dir, doc).has_value());
+    auto loaded = io::loadDocument(dir, reg);
+    std::filesystem::remove_all(dir);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    ASSERT_EQ(loaded->timeline.size(), 1u);
+    EXPECT_EQ(loaded->timeline.at(0)->paramsJson(), doc.timeline.at(0)->paramsJson());
+    EXPECT_NE(loaded->timeline.at(0)->paramsJson().find("\"taper\":\"5 deg\""), std::string::npos);
+    EXPECT_EQ(loaded->timeline.at(0)->paramHash(), doc.timeline.at(0)->paramHash());
+
+    Evaluator e1, e2;
+    auto a = e1.evaluate(doc.timeline, &doc.parameters);
+    auto b = e2.evaluate(loaded->timeline, &loaded->parameters);
+    ASSERT_TRUE(a && b);
+    ASSERT_EQ(a->statuses[0].state, FeatureStatus::State::Ok) << a->statuses[0].error.message;
+    ASSERT_EQ(b->statuses[0].state, FeatureStatus::State::Ok) << b->statuses[0].error.message;
+    const double expected = taperedSquareFrustum(10, 6, 5.0 * std::numbers::pi / 180.0) +
+                            taperedSquareFrustum(10, 4, 5.0 * std::numbers::pi / 180.0);
+    EXPECT_NEAR(volumeOf(a->bodies.at(kB1)), expected, 1e-6 * expected);
+    EXPECT_NEAR(volumeOf(b->bodies.at(kB1)), volumeOf(a->bodies.at(kB1)), 1e-9);
 }

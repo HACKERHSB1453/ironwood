@@ -42,8 +42,9 @@ enum class ConstraintState : std::uint8_t {
     Conflicting,  ///< The solver found conflicting or redundant constraints: those are drawn red.
 };
 
-/// A dimension that does not drive the geometry ("reference"/driven): it only reports the measured value. The sketch
-/// document has no driven flag yet, so these live in the session (and its undo history) only.
+/// A dimension that does not drive the geometry ("reference"/driven): it only reports the measured value. It is kept
+/// apart from the driving dimensions of the session and written back as a driven sketch dimension by toSketch(),
+/// with the same id (ids come from the sketch's id counter, so they never clash with other records).
 struct DrivenDimension {
     std::uint64_t id = 0;
     sketch::DimensionKind kind = sketch::DimensionKind::Distance;
@@ -114,12 +115,19 @@ struct InferenceSettings {
 class SketchSession {
 public:
     explicit SketchSession(sketch::SketchPlane plane);
+    /// Re-enters an existing sketch (Edit Sketch): every entity, constraint and dimension keeps its id. Driven
+    /// dimensions become session-side reference dimensions (same ids) until toSketch() writes them back.
+    explicit SketchSession(sketch::Sketch existing);
     // The undo commands point at the sketch member: the session must not move.
     SketchSession(const SketchSession&) = delete;
     SketchSession& operator=(const SketchSession&) = delete;
     ~SketchSession();
 
+    /// The driving geometry and constraints (reference dimensions are not in it: see toSketch()).
     const sketch::Sketch& sketch() const noexcept { return sketch_; }
+    /// The whole sketch as it should be stored: sketch() plus the reference dimensions as driven sketch dimensions.
+    /// Errors: InvalidArgument / NotFound (internal id clash; should not happen).
+    Result<sketch::Sketch> toSketch() const;
     const sketch::SketchPlane& plane() const noexcept { return sketch_.plane(); }
 
     // ---- operations: each is one undoable edit; on failure the sketch and the undo stack are unchanged ----
@@ -264,7 +272,7 @@ public:
     /// `overConstrains` is set: offer addDrivenDimension. Errors: InvalidArgument (bad expression or refs).
     Result<DimensionTry> addDimension(sketch::DimensionKind kind, std::vector<sketch::SketchRef> refs,
                                       std::string expression = {});
-    /// Adds a driven ("reference") dimension: shown with its measured value, never constrains.
+    /// Adds a driven ("reference") dimension: shown with its measured value, never constrains. One undo step.
     Result<std::uint64_t> addDrivenDimension(sketch::DimensionKind kind, std::vector<sketch::SketchRef> refs);
     /// Edits the expression (parameters allowed) and re-solves. One undo step. Errors: ParseError / InvalidArgument
     /// (does not evaluate, wrong dimension, or the sketch cannot satisfy it); nothing changes then.
@@ -369,7 +377,6 @@ private:
     std::optional<DimensionRef> selDimension_;
     const ParameterTable* params_ = nullptr;
     std::vector<DrivenDimension> driven_;
-    std::uint64_t nextDriven_ = 1;
     std::vector<sketch::SketchRef> dimPicks_;
     std::optional<DimensionEvent> dimEvent_;
     std::optional<DragState> drag_;

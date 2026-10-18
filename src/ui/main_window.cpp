@@ -108,6 +108,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
         if (model_)
             if (auto idx = model_->timeline().indexOf(id)) kind = std::string(model_->timeline().at(*idx)->kind());
         if (!kind) return;
+        if (*kind == "sketch") {
+            editSketch(id);
+            return;
+        }
         if (auto r = startFeature(*kind, id); !r) setStatus(tr("Cannot edit: %1").arg(QString::fromStdString(r.error().message)));
     });
     connect(timeline_, &timeline::TimelineWidget::contextRequested, this,
@@ -255,9 +259,27 @@ void MainWindow::setOverlayFaces(std::vector<render::OverlayFace> faces) {
 
 void MainWindow::startSketch(const sketch::SketchPlane& plane, const QString& name) {
     if (!sketch_) return;
-    // start() finishes a sketch that is still active (its status commits it) before starting the new one.
+    // start() finishes a sketch that is still active (its finish commits it) before starting the new one.
     sketch_->start(plane, name);
-    sketchSession_ = sketch_->activeSession();
+}
+
+void MainWindow::editSketch(FeatureId id) {
+    if (!sketch_ || !model_) return;
+    auto idx = model_->timeline().indexOf(id);
+    if (!idx) return;
+    const std::string kind = std::string(model_->timeline().at(*idx)->kind());
+    if (kind != "sketch") {
+        setStatus(tr("Cannot edit: not a sketch"));
+        return;
+    }
+    auto sk = model_->sketchForEdit(id);
+    if (!sk) {
+        setStatus(tr("Cannot edit sketch: %1").arg(QString::fromStdString(sk.error().message)));
+        return;
+    }
+    // startEdit finishes a sketch that is still active first (its finish is handled before editingSketch_ changes).
+    sketch_->startEdit(std::move(*sk), tr("Sketch %1").arg(static_cast<qulonglong>(id.value())));
+    editingSketch_ = id;
 }
 
 QString MainWindow::bodyTitle(BodyId body) const {
@@ -445,10 +467,30 @@ void MainWindow::commitSketch(SketchSession* session) {
         setStatus(tr("Empty sketch: nothing added to the timeline"));
         return;
     }
-    features::SketchFeatureParams p{session->sketch(), std::nullopt};
+    auto sk = session->toSketch();
+    if (!sk) {
+        setStatus(tr("Sketch not added: %1").arg(QString::fromStdString(sk.error().message)));
+        return;
+    }
+    features::SketchFeatureParams p{std::move(*sk), std::nullopt};
     auto feature = std::make_shared<features::SketchFeature>(model_->allocateFeatureId(), p);
     if (auto r = commitFeature(feature, false); !r)
         setStatus(tr("Sketch not added: %1").arg(QString::fromStdString(r.error().message)));
+}
+
+void MainWindow::commitSketchEdit(FeatureId id, SketchSession* session) {
+    if (!model_ || !session) return;
+    if (!session->canUndo()) {   // nothing was changed in the session: keep the document (and its undo stack) as is
+        setStatus(tr("Sketch unchanged"));
+        return;
+    }
+    auto sk = session->toSketch();
+    if (!sk) {
+        setStatus(tr("Sketch not changed: %1").arg(QString::fromStdString(sk.error().message)));
+        return;
+    }
+    if (auto r = model_->replaceSketch(id, std::move(*sk)); !r)
+        setStatus(tr("Sketch not changed: %1").arg(QString::fromStdString(r.error().message)));
 }
 
 void MainWindow::requestEvaluation() {
@@ -597,15 +639,18 @@ void MainWindow::showTimelineMenu(FeatureId id, QPoint globalPos) {
     const bool suppressed = model_->timeline().isSuppressed(id);
 
     QMenu menu(this);
-    QAction* edit = menu.addAction(tr("Edit..."));
-    edit->setEnabled(kind != "sketch");
+    QAction* edit = menu.addAction(kind == "sketch" ? tr("Edit Sketch") : tr("Edit..."));
     QAction* sup = menu.addAction(suppressed ? tr("Unsuppress") : tr("Suppress"));
     QAction* del = menu.addAction(tr("Delete"));
     QAction* ren = menu.addAction(tr("Rename..."));
     QAction* chosen = menu.exec(globalPos);
     if (!chosen) return;
     if (chosen == edit) {
-        if (auto r = startFeature(kind, id); !r) setStatus(tr("Cannot edit: %1").arg(QString::fromStdString(r.error().message)));
+        if (kind == "sketch") {
+            editSketch(id);
+        } else if (auto r = startFeature(kind, id); !r) {
+            setStatus(tr("Cannot edit: %1").arg(QString::fromStdString(r.error().message)));
+        }
     } else if (chosen == sup) {
         setFeatureSuppressed(id, !suppressed);
     } else if (chosen == del) {
@@ -1013,12 +1058,15 @@ void MainWindow::setupCommands() {
     sketch_->setPanelHost([this](QWidget* panel) { showCommandPanel(panel); });
     sketch_->setParameters(&model_->parameters());
     paramsHash_ = parameterHash();
-    connect(sketch_, &SketchMode::status, this, [this](const QString& text) {
-        status_->setText(text);
-        // Finishing a sketch (Finish Sketch, Esc) leaves sketch mode and emits status: the sketch becomes a feature.
-        if (sketchSession_ && !sketch_->active()) {
-            SketchSession* done = sketchSession_;
-            sketchSession_ = nullptr;
+    connect(sketch_, &SketchMode::status, this, [this](const QString& text) { status_->setText(text); });
+    // Finishing a sketch (Finish Sketch, Esc) leaves sketch mode: a new sketch becomes a feature, an edited one replaces
+    // the sketch of its feature. A cancelled edit changes nothing.
+    connect(sketch_, &SketchMode::sketchFinished, this, [this](SketchSession* done, bool committed) {
+        const std::optional<FeatureId> edited = editingSketch_;
+        editingSketch_.reset();
+        if (edited) {
+            if (committed) commitSketchEdit(*edited, done);
+        } else if (committed) {
             commitSketch(done);
         }
     });

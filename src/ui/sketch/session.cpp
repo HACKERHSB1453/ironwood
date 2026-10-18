@@ -370,6 +370,27 @@ bool keepsOnPiece(ConstraintKind k) {
 
 SketchSession::SketchSession(sketch::SketchPlane plane) : sketch_(std::move(plane)) { refresh(); }
 
+SketchSession::SketchSession(sketch::Sketch existing) : sketch_(std::move(existing)) {
+    // Reference dimensions leave the solver's sketch (it would solve them) and wait in driven_ under their own ids.
+    std::vector<sketch::SketchDimensionId> drivenIds;
+    for (const auto& [id, d] : sketch_.dimensions())
+        if (d.driven) {
+            driven_.push_back(DrivenDimension{id.value(), d.kind, d.refs});
+            drivenIds.push_back(id);
+        }
+    for (sketch::SketchDimensionId id : drivenIds) (void)sketch_.removeDimension(id);
+    refresh();
+}
+
+Result<Sketch> SketchSession::toSketch() const {
+    Sketch out = sketch_;
+    for (const DrivenDimension& d : driven_) {
+        auto r = out.restoreDimension(sketch::SketchDimensionId{d.id}, d.kind, d.refs, std::string{}, true);
+        if (!r) return std::unexpected(r.error());
+    }
+    return out;
+}
+
 SketchSession::~SketchSession() = default;
 
 namespace {
@@ -1466,14 +1487,15 @@ Result<std::uint64_t> SketchSession::addDrivenDimension(sketch::DimensionKind ki
     if (auto m = measure(kind, refs); !m) return std::unexpected(m.error());
     for (const SketchRef& r : refs)
         if (!sketch_.findEntity(r.entity)) return makeError(ErrorCode::NotFound, "no such entity");
-    std::vector<DrivenDimension> next = driven_;
-    DrivenDimension d;
-    d.id = nextDriven_++;
-    d.kind = kind;
-    d.refs = std::move(refs);
-    next.push_back(d);
-    if (auto r = commit("Add Reference Dimension", sketch_, std::move(next)); !r) return std::unexpected(r.error());
-    return d.id;
+    // The id comes from the sketch's counter (shared with every other record); the counter is advanced past it.
+    Sketch next = sketch_;
+    const std::uint64_t id = next.nextId();
+    if (auto r = next.restoreNextId(id + 1); !r) return std::unexpected(r.error());
+    std::vector<DrivenDimension> nextDriven = driven_;
+    nextDriven.push_back(DrivenDimension{id, kind, std::move(refs)});
+    if (auto r = commit("Add Reference Dimension", std::move(next), std::move(nextDriven)); !r)
+        return std::unexpected(r.error());
+    return id;
 }
 
 Result<void> SketchSession::setDimensionExpression(sketch::SketchDimensionId id, std::string expression) {

@@ -291,9 +291,9 @@ void CommandPanel::setText(std::string_view name, const QString& text) {
 }
 
 void CommandPanel::onFieldChanged(const std::string& name) {
-    (void)name;
     refreshValidation();
     requestPreview();
+    if (spec_.fieldChanged) spec_.fieldChanged(name);
 }
 
 void CommandPanel::refreshValidation() {

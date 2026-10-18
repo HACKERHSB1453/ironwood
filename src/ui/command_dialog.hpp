@@ -115,6 +115,8 @@ struct CommandDialogSpec {
     std::vector<InputSpec> inputs;
     PreviewFn preview;   ///< Optional.
     std::function<Result<void>(const DialogModel::Snapshot&)> accept; ///< Called on OK with a valid snapshot.
+    /// Optional: called after a field's text changed (typed, picked, or set with setText) and its preview requested.
+    std::function<void(const std::string& field)> fieldChanged;
 };
 
 /// Right-docked command panel: a form built from the spec, inline errors per field, a live preview line, and

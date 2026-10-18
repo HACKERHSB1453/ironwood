@@ -32,6 +32,7 @@ struct PickResult;
 
 namespace iw::ui {
 class CommandPanel;
+class ManipulatorOverlay;
 
 /// What the dialogs need from the shell. Implemented by MainWindow.
 class FeatureHost {
@@ -56,6 +57,9 @@ public:
     virtual QString bodyTitle(BodyId body) const = 0;
     /// Translucent viewport overlays (the finished sketch profiles while Extrude / Revolve is open). Empty clears.
     virtual void setOverlayFaces(std::vector<render::OverlayFace> faces) = 0;
+    /// The viewport (camera for projecting manipulators) and the manipulator overlay drawn over it.
+    virtual render::Viewport* viewport() const = 0;
+    virtual ManipulatorOverlay* manipulators() const = 0;
 };
 
 /// Opens and drives the modelling command dialogs for one shell.

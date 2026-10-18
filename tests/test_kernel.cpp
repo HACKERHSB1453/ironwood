@@ -18,6 +18,7 @@
 #include "kernel/internal/profile_support.hpp"
 #include "kernel/internal/validate.hpp"
 #include "kernel/ops.hpp"
+#include "kernel/taper.hpp"
 
 using namespace iw;
 using namespace iw::kernel;
@@ -1111,4 +1112,126 @@ TEST(KernelOps, DegenerateEdgesAreRejectedBeforeOcct) {
     auto c = chamferEdges(sphere->shape, ids({*degenerate}), 0.5, 0.5);
     ASSERT_FALSE(c.has_value());
     EXPECT_EQ(c.error().code, ErrorCode::KernelFailure);
+}
+
+// ---- F23: tapered (draft) extrude -----------------------------------------------------------------------------------
+
+namespace {
+
+/// Volume of a frustum with end areas a1, a2 and height h (exact for a planar profile with similar end outlines).
+double frustumVolume(double a1, double a2, double h) { return h / 3.0 * (a1 + a2 + std::sqrt(a1 * a2)); }
+
+Shape squareFace(double s) {
+    const std::array<Vec3, 4> pts{Vec3{0, 0, 0}, Vec3{s, 0, 0}, Vec3{s, s, 0}, Vec3{0, s, 0}};
+    auto f = makePolygonFace(pts);
+    EXPECT_TRUE(f.has_value());
+    return f ? *f : Shape{};
+}
+
+Shape squareWire(double s) {
+    const std::array<Vec3, 4> pts{Vec3{0, 0, 0}, Vec3{s, 0, 0}, Vec3{s, s, 0}, Vec3{0, s, 0}};
+    auto w = makePolygonWire(pts);
+    EXPECT_TRUE(w.has_value());
+    return w ? *w : Shape{};
+}
+
+/// Side of the square profile after `h` mm of a draft at `taper` radians (positive = inward).
+double taperedSide(double s, double h, double taper) { return s - 2.0 * h * std::tan(taper); }
+
+} // namespace
+
+TEST(KernelTaper, TaperedSquareMatchesFrustumFormula) {
+    const double s = 10, h = 10, taper = 5.0 * kPi / 180.0;
+    const double a1 = s * s, a2 = std::pow(taperedSide(s, h, taper), 2);
+    const double expected = frustumVolume(a1, a2, h);
+    auto r = extrudeProfileTapered(squareFace(s), {0, 0, h}, taper);
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    EXPECT_NEAR(volume(r->shape), expected, 1e-6 * expected);
+    EXPECT_TRUE(check::isSolidValid(r->shape));
+    // Direction sign: extruding the other way with the same taper gives the same solid volume.
+    auto back = extrudeProfileTapered(squareFace(s), {0, 0, -h}, taper);
+    ASSERT_TRUE(back.has_value()) << back.error().message;
+    EXPECT_NEAR(volume(back->shape), expected, 1e-6 * expected);
+    // The wire profile builds the same solid as its face.
+    auto wire = extrudeProfileTapered(squareWire(s), {0, 0, h}, taper);
+    ASSERT_TRUE(wire.has_value()) << wire.error().message;
+    EXPECT_NEAR(volume(wire->shape), expected, 1e-6 * expected);
+}
+
+TEST(KernelTaper, InwardShrinksAndOutwardGrows) {
+    const double s = 10, h = 10, taper = 5.0 * kPi / 180.0;
+    const double inward = frustumVolume(s * s, std::pow(taperedSide(s, h, taper), 2), h);
+    const double outward = frustumVolume(s * s, std::pow(taperedSide(s, h, -taper), 2), h);
+    auto in = extrudeProfileTapered(squareFace(s), {0, 0, h}, taper);
+    auto out = extrudeProfileTapered(squareFace(s), {0, 0, h}, -taper);
+    ASSERT_TRUE(in.has_value()) << in.error().message;
+    ASSERT_TRUE(out.has_value()) << out.error().message;
+    EXPECT_LT(volume(in->shape), s * s * h);
+    EXPECT_GT(volume(out->shape), s * s * h);
+    EXPECT_NEAR(volume(in->shape), inward, 1e-6 * inward);
+    EXPECT_NEAR(volume(out->shape), outward, 1e-6 * outward);
+}
+
+TEST(KernelTaper, CollapsingTaperFailsCleanly) {
+    // A 10 mm square drafted 60 degrees inward collapses after 2.89 mm (half width / tan 60).
+    const double taper = 60.0 * kPi / 180.0;
+    auto r = extrudeProfileTapered(squareFace(10), {0, 0, 10}, taper);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().code, ErrorCode::KernelFailure);
+    EXPECT_NE(r.error().message.find("taper too large: profile collapses at distance"), std::string::npos) << r.error().message;
+}
+
+TEST(KernelTaper, RejectsBadArguments) {
+    const Shape f = squareFace(10);
+    const double t = 5.0 * kPi / 180.0;
+    EXPECT_EQ(extrudeProfileTapered(Shape{}, {0, 0, 1}, t).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(extrudeProfileTapered(f, {0, 0, 0}, t).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(extrudeProfileTapered(f, {0, 0, 1}, 89.0 * kPi / 180.0).error().code, ErrorCode::InvalidArgument);
+    EXPECT_EQ(extrudeProfileTapered(f, {0, 0, 1}, std::numeric_limits<double>::quiet_NaN()).error().code, ErrorCode::InvalidArgument);
+    // Oblique direction: a draft prism only exists along the profile normal.
+    EXPECT_EQ(extrudeProfileTapered(f, {1, 0, 1}, t).error().code, ErrorCode::InvalidArgument);
+    // In-plane direction: zero volume.
+    EXPECT_EQ(extrudeProfileTapered(f, {1, 0, 0}, t).error().code, ErrorCode::InvalidArgument);
+}
+
+TEST(KernelTaper, ZeroTaperIsIdenticalToPlainExtrude) {
+    const Shape f = squareFace(10);
+    auto plain = extrudeProfile(f, {0, 0, 7});
+    auto zero = extrudeProfileTapered(f, {0, 0, 7}, 0.0);
+    ASSERT_TRUE(plain.has_value() && zero.has_value());
+    EXPECT_EQ(counts(zero->shape), counts(plain->shape));
+    EXPECT_NEAR(volume(zero->shape), volume(plain->shape), 1e-12);
+    EXPECT_EQ(zero->history.generated.size(), plain->history.generated.size());
+}
+
+TEST(KernelTaper, HistoryMapsEveryProfileEdgeToOneSideFace) {
+    const double taper = 5.0 * kPi / 180.0;
+    auto r = extrudeProfileTapered(squareWire(10), {0, 0, 10}, taper);
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    const ShapeHistory& h = r->history;
+    std::set<std::uint32_t> sides;
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        auto it = h.generated.find(InputSubShape{0, SubShapeKind::Edge, i});
+        ASSERT_TRUE(it != h.generated.end()) << "profile edge " << i << " has no history";
+        ASSERT_EQ(it->second.size(), 1u) << "profile edge " << i << " must generate exactly one side face";
+        EXPECT_EQ(it->second[0].kind, SubShapeKind::Face);
+        sides.insert(it->second[0].index);
+    }
+    EXPECT_EQ(sides.size(), 4u) << "each profile edge must map to its own side face";
+    // The start cap edges are unchanged; a six-face solid results.
+    EXPECT_EQ(r->shape.subShapeCount(SubShapeKind::Face), 6u);
+}
+
+TEST(KernelTaper, FaceProfileHistoryMarksStartCapModifiedAndEndCapGenerated) {
+    const double taper = 5.0 * kPi / 180.0;
+    auto r = extrudeProfileTapered(squareFace(10), {0, 0, 10}, taper);
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    const ShapeHistory& h = r->history;
+    EXPECT_TRUE(h.modified.count(InputSubShape{0, SubShapeKind::Face, 0}) == 1);
+    EXPECT_TRUE(h.generated.count(InputSubShape{0, SubShapeKind::Face, 0}) == 1);
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        auto it = h.generated.find(InputSubShape{0, SubShapeKind::Edge, i});
+        ASSERT_TRUE(it != h.generated.end());
+        EXPECT_EQ(it->second.size(), 1u) << "profile edge " << i;
+    }
 }

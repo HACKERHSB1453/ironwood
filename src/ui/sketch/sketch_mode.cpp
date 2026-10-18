@@ -64,10 +64,25 @@ SketchMode::~SketchMode() = default;
 
 void SketchMode::start(const sketch::SketchPlane& plane, const QString& planeName) {
     if (active_) finish();
+    beginSession(std::make_unique<SketchSession>(plane), planeName,
+                 tr("Sketch on %1 plane. L line, R rectangle, C circle, P point, D dimension, X construction. Esc cancels the tool, "
+                    "Esc again or Finish Sketch exits.")
+                     .arg(planeName));
+}
+
+void SketchMode::startEdit(sketch::Sketch existing, const QString& name) {
+    if (active_) finish();
+    beginSession(std::make_unique<SketchSession>(std::move(existing)), name,
+                 tr("Editing sketch %1. Finish Sketch applies the changes; Esc with no tool pending discards them.").arg(name));
+    editing_ = true;
+}
+
+void SketchMode::beginSession(std::unique_ptr<SketchSession> owned, const QString& planeName, const QString& statusText) {
     closeDimensionEditor();
-    sessions_.push_back(std::make_unique<SketchSession>(plane));
+    sessions_.push_back(std::move(owned));
     active_ = sessions_.back().get();
     active_->setParameters(params_);
+    const sketch::SketchPlane plane = active_->plane();
 
     palette_->setPlaneName(planeName);
     palette_->setTool(SketchTool::Select);
@@ -82,20 +97,29 @@ void SketchMode::start(const sketch::SketchPlane& plane, const QString& planeNam
 
     syncSession();
     refresh();
-    emit status(tr("Sketch on %1 plane. L line, R rectangle, C circle, P point, D dimension, X construction. Esc cancels the tool, "
-                   "Esc again or Finish Sketch exits.")
-                    .arg(planeName));
+    emit status(statusText);
 }
 
-void SketchMode::finish() {
+void SketchMode::finish() { finishWith(true); }
+
+void SketchMode::finishWith(bool committed) {
     if (!active_) return;
     closeDimensionEditor();
     closeOffsetPanel();
-    const std::size_t profiles = active_->profiles().size();
+    SketchSession* done = active_;
+    const std::size_t profiles = done->profiles().size();
+    const bool wasEdit = editing_;
     active_ = nullptr;
+    editing_ = false;
     dock_->hide();
+    // The handler reads the session: an edited session leaves sessions() only after the signal.
+    emit sketchFinished(done, committed);
+    if (wasEdit) {
+        std::erase_if(sessions_, [done](const std::unique_ptr<SketchSession>& s) { return s.get() == done; });
+    }
     refresh();
-    emit status(tr("Sketch finished: %1 profile(s)").arg(profiles));
+    if (!committed) emit status(tr("Sketch edit cancelled: the document is unchanged"));
+    else emit status(tr("Sketch finished: %1 profile(s)").arg(profiles));
 }
 
 void SketchMode::setTool(SketchTool t) {
@@ -163,7 +187,7 @@ bool SketchMode::escape() {
         refresh();
         return true;
     }
-    finish();
+    finishWith(!editing_);   // an edit that is escaped out of is discarded
     return true;
 }
 

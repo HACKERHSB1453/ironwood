@@ -2,10 +2,12 @@
 #include "ui/timeline/feature_dialogs.hpp"
 
 #include <QListWidget>
+#include <QPointF>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <optional>
 #include <map>
 #include <numbers>
 #include <utility>
@@ -23,6 +25,8 @@
 #include "tess/tessellate.hpp"
 #include "render/viewport.hpp"
 #include "ui/command_dialog.hpp"
+#include "ui/manipulators.hpp"
+#include "ui/sketch/view_math.hpp"
 #include "ui/timeline/feature_info.hpp"
 
 namespace iw::ui {
@@ -56,6 +60,8 @@ struct ProfileChoice {
     QString label;
     FeatureId sketch;
     std::string profile;
+    Vec3 anchor{};   ///< Centroid of the profile in world space (where the distance arrow starts).
+    Vec3 normal{};   ///< Plane normal of the sketch (the one-side extrude direction).
 };
 struct AxisChoice {
     QString label;
@@ -661,7 +667,66 @@ struct FeatureDialogs::Impl {
     std::shared_ptr<const DialogCtx> ctx;
     MakeFn make;
     bool profilePicks = false;         ///< Profile overlays are shown: a click on one chooses that profile.
+    bool arrowOn = false;              ///< Extrude is open: the distance arrow follows the profile and the field.
+    std::vector<QMetaObject::Connection> arrowConns;
     explicit Impl(FeatureHost& h) : host(h) {}
+
+    /// Places the distance arrow at the chosen profile's centroid, along its normal, at the current distance.
+    void updateArrow() {
+        ManipulatorOverlay* ov = host.manipulators();
+        if (!arrowOn || !panel || !ctx || !ov) return;
+        const std::string profileText = panel->model().text("profile");
+        const ProfileChoice* prof = nullptr;
+        for (const ProfileChoice& p : ctx->profiles)
+            if (p.label.toStdString() == profileText) prof = &p;
+        const auto value = panel->model().valueOf("distance");
+        if (!prof || !value || value->dim != Dimension::Length) {
+            ov->clear();
+            return;
+        }
+        render::Viewport* vp = host.viewport();
+        if (!vp) return;
+        const render::Camera& cam = vp->camera();
+        const double w = vp->width(), h = vp->height();
+        auto toPx = [&](const Vec3& p) -> std::optional<QPointF> {
+            const auto ndc = cam.project(p);
+            if (!ndc) return std::nullopt;
+            return QPointF((ndc->x + 1.0) * 0.5 * w, (1.0 - ndc->y) * 0.5 * h);
+        };
+        const auto a = toPx(prof->anchor);
+        const auto b = toPx(prof->anchor + prof->normal);
+        if (!a || !b) {
+            ov->clear();
+            return;
+        }
+        const QPointF dir = *b - *a;
+        if (std::hypot(dir.x(), dir.y()) < 1e-6) {
+            ov->clear();
+            return;
+        }
+        ov->showDistance(*a, dir, value->value, sketchPixelsPerMm(cam, h),
+                         QStringLiteral("%1 mm").arg(value->value, 0, 'f', 1));
+    }
+
+    /// Dragging the arrow writes the distance back as a plain number, snapped to 0.1 mm (the expression is replaced).
+    void attachArrow(CommandPanel* dialog) {
+        ManipulatorOverlay* ov = host.manipulators();
+        if (!ov) return;
+        arrowConns.push_back(QObject::connect(ov, &ManipulatorOverlay::distanceChanged, dialog, [this, dialog](double mm) {
+            if (!arrowOn || panel != dialog) return;
+            const double snapped = std::round(mm * 10.0) / 10.0;
+            dialog->setText("distance", QStringLiteral("%1 mm").arg(snapped, 0, 'f', 1));
+        }));
+        if (render::Viewport* vp = host.viewport())
+            arrowConns.push_back(QObject::connect(vp, &render::Viewport::cameraChanged, dialog, [this] { updateArrow(); }));
+    }
+
+    void detachArrow() {
+        for (const QMetaObject::Connection& c : arrowConns) QObject::disconnect(c);
+        arrowConns.clear();
+        arrowOn = false;
+        if (ManipulatorOverlay* ov = host.manipulators()) ov->clear();
+    }
 
     /// Raw expression text of a field of the open panel.
     std::string rawText(std::string_view name) const { return panel ? panel->model().text(name) : std::string(); }
@@ -791,8 +856,10 @@ Result<void> FeatureDialogs::start(const std::string& kind, std::optional<Featur
     }
     for (const auto& [sid, sol] : shown.eval.sketches)
         for (const sketch::SketchProfile& p : sol.profiles) {
-            ctx->profiles.push_back({QString::fromStdString(titleOf(sid) + " / " + p.name), sid, p.name});
-            ctx->profileOverlays.push_back(profileOverlay(sol.sketch.plane(), p));
+            const sketch::SketchPlane& plane = sol.sketch.plane();
+            ctx->profiles.push_back({QString::fromStdString(titleOf(sid) + " / " + p.name), sid, p.name,
+                                     plane.toWorld(p.centroid), plane.normal});
+            ctx->profileOverlays.push_back(profileOverlay(plane, p));
         }
     for (std::size_t i = 0; i < tl.size(); ++i) {
         const Feature& f = *tl.at(i);
@@ -842,6 +909,10 @@ Result<void> FeatureDialogs::start(const std::string& kind, std::optional<Featur
     CommandDialogSpec dlg;
     dlg.title = spec.title;
     dlg.inputs = spec.inputs;
+    // The distance arrow (Extrude) follows the profile and the distance field while the dialog is open.
+    dlg.fieldChanged = [this](const std::string& field) {
+        if (impl_->arrowOn && (field == "distance" || field == "profile")) impl_->updateArrow();
+    };
     dlg.preview = [make, cc](const Snap& s, CancelToken token) -> Result<std::string> {
         const TextFn text = [&s](std::string_view n) { return formatted(s, n); };
         auto cand = make(s, text, *cc);
@@ -885,13 +956,17 @@ Result<void> FeatureDialogs::start(const std::string& kind, std::optional<Featur
     impl_->profilePicks = kind == "extrude" || kind == "revolve";
     host_.setOverlayFaces(impl_->profilePicks ? cc->profileOverlays : std::vector<render::OverlayFace>{});
     host_.setPickHandler([this](const render::PickResult& r) { impl_->onPick(r); });
+    impl_->arrowOn = kind == "extrude";
+    if (impl_->arrowOn) impl_->attachArrow(panel);
     QObject::connect(panel, &CommandPanel::finished, [this](bool) {
         host_.setPickHandler({});
         host_.setOverlayFaces({});
+        impl_->detachArrow();
         impl_->profilePicks = false;
         impl_->panel = nullptr;
     });
     host_.showPanel(panel);
+    impl_->updateArrow();
     return {};
 }
 

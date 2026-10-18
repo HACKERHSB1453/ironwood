@@ -56,9 +56,15 @@ public:
     /// Starts a new sketch on `plane`; the camera animates to look along the plane normal. Finishes a sketch that is
     /// still active first.
     void start(const sketch::SketchPlane& plane, const QString& planeName);
+    /// Re-enters an existing sketch (Edit Sketch from the timeline). Entity, constraint and dimension ids are kept.
+    /// Finishes a sketch that is still active first. Finish Sketch commits it (sketchFinished with committed=true);
+    /// Esc with no tool pending cancels the edit (committed=false) and the caller leaves the document unchanged.
+    void startEdit(sketch::Sketch existing, const QString& name);
     /// Finish Sketch: leaves sketch mode. The sketch stays in sessions() (drawn dimmed) for later features.
     void finish();
     bool active() const noexcept { return active_ != nullptr; }
+    /// True while the active session edits an existing sketch (startEdit) rather than creating one.
+    bool editing() const noexcept { return editing_; }
     SketchSession* activeSession() const noexcept { return active_; }
     const std::vector<std::unique_ptr<SketchSession>>& sessions() const noexcept { return sessions_; }
 
@@ -104,12 +110,18 @@ public:
 
 signals:
     void status(const QString& text);
+    /// A session left sketch mode. Emitted before an edited session is dropped from sessions(), so the handler can
+    /// read its sketch: committed = Finish Sketch (or Esc on a new sketch), false = cancelled edit.
+    void sketchFinished(iw::ui::SketchSession* session, bool committed);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
     bool handleMouse(QEvent* event);
+    /// Shared start of start() / startEdit(): makes `owned` the active session and shows the sketch UI.
+    void beginSession(std::unique_ptr<SketchSession> owned, const QString& planeName, const QString& statusText);
+    void finishWith(bool committed);
     bool handleKey(const QKeyEvent* key);
     /// Pushes the snap settings (radius from view_math) and the offset distance to the active session.
     void syncSession();
@@ -125,6 +137,7 @@ private:
     render::Viewport* vp_;
     std::vector<std::unique_ptr<SketchSession>> sessions_;
     SketchSession* active_ = nullptr;
+    bool editing_ = false;         ///< The active session re-enters an existing sketch.
     SketchOverlay* overlay_ = nullptr;
     SketchPalette* palette_ = nullptr;
     QDockWidget* dock_ = nullptr;

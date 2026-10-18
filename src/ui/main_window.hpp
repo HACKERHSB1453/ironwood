@@ -69,7 +69,7 @@ public:
     RibbonBar* ribbon() const noexcept { return ribbon_; }
     CommandPalette* commandSearch() const noexcept { return palette_; }
     MarkingMenu* markingMenu() const noexcept { return marking_; }
-    ManipulatorOverlay* manipulators() const noexcept { return overlay_; }
+    ManipulatorOverlay* manipulators() const noexcept override { return overlay_; }
     QDockWidget* commandDock() const noexcept { return panelDock_; }
 
     /// Docks a command dialog on the right, replacing the previous one (takes ownership of `panel`).
@@ -83,7 +83,7 @@ public:
     /// Opens the marking menu centred on a viewport-local point.
     void showMarkingMenu(QPoint viewportPos);
 
-    render::Viewport* viewport() const noexcept { return viewport_; }
+    render::Viewport* viewport() const noexcept override { return viewport_; }
     /// Browser tree (Origin, Sketches, Bodies, Construction, and the imported assembly).
     QTreeWidget* browser() const noexcept { return tree_; }
     /// Timeline strip (bottom dock).
@@ -114,6 +114,9 @@ public:
     void modelRedo();
     /// Starts a sketch on `plane` (the sketch becomes a SketchFeature when it finishes).
     void startSketch(const sketch::SketchPlane& plane, const QString& planeName);
+    /// Edit Sketch (timeline double-click / menu): re-enters sketch mode with the sketch feature `id`. Finish Sketch
+    /// replaces its sketch as one undo step; Esc discards the edit. Errors are reported in the status bar.
+    void editSketch(FeatureId id);
     /// Routes a viewport pick as the viewport's picked signal does (to the open dialog, or the browser selection).
     void routePick(const render::PickResult& r);
     /// Suppresses / unsuppresses, deletes, or renames a timeline feature. Same as the timeline menu. A rename is an
@@ -200,6 +203,8 @@ private:
     void applySectionRequest(const kernel::measure::section::RenderRequest& request);
     void updateTitle();
     void commitSketch(SketchSession* session);
+    /// Finish of an edit started by editSketch: replaces the sketch of `id` (one undo step, skipped when nothing changed).
+    void commitSketchEdit(FeatureId id, SketchSession* session);
     void selectTreeForBody(std::optional<std::uint32_t> body);
     void setImportUi(bool active);
     std::optional<BodyId> bodyOfItem(const QTreeWidgetItem* item) const;
@@ -223,7 +228,7 @@ private:
     std::vector<BodyId> sceneIds_;             ///< Body of each scene index.
     std::unique_ptr<FeatureDialogs> dialogs_;
     std::function<void(const render::PickResult&)> pickHandler_;
-    SketchSession* sketchSession_ = nullptr;   ///< The sketch whose finish adds a SketchFeature.
+    std::optional<FeatureId> editingSketch_;   ///< The sketch feature whose sketch edit is open (none: new sketch).
     QString docPath_;
     bool demo_ = true;                         ///< The built-in demo bodies are shown until a document or import exists.
 
