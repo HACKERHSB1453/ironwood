@@ -45,6 +45,8 @@ signals:
     void constraintRequested(sketch::ConstraintKind kind);
     /// Constraint toolbar: Fix / Unfix toggle on the current selection.
     void fixToggleRequested();
+    /// "Look At": face the sketch plane again (orthographic, the distance kept).
+    void lookAtRequested();
 
 private:
     QAbstractButton* toolButton(SketchTool t) const;

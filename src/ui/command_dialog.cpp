@@ -8,6 +8,7 @@
 #include <QFont>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -269,6 +270,9 @@ void CommandPanel::buildForm() {
             break;
         }
         case InputKind::Selection: {
+            auto* count = new QLabel(field);
+            count->setObjectName(QString::fromStdString("count_" + s.name));
+            selectionCounts_[s.name] = count;
             auto* filter = new QLineEdit(field);
             filter->setPlaceholderText(tr("Filter %1").arg(s.label));
             auto* list = new QListWidget(field);
@@ -283,8 +287,16 @@ void CommandPanel::buildForm() {
                 std::vector<std::string> chosen;
                 for (QListWidgetItem* it : list->selectedItems()) chosen.push_back(it->text().toStdString());
                 model_.setSelection(name, std::move(chosen));
+                refreshSelectionState();
                 onFieldChanged(name);
+                emit selectionChanged();
             });
+            // Clicking the field (its list or its filter) makes it the active selection input.
+            list->viewport()->installEventFilter(this);
+            selectionFields_[list->viewport()] = s.name;
+            filter->installEventFilter(this);
+            selectionFields_[filter] = s.name;
+            col->addWidget(count);
             col->addWidget(filter);
             col->addWidget(list);
             break;
@@ -294,6 +306,12 @@ void CommandPanel::buildForm() {
         else form->addRow(s.label, field);
     }
     root->addLayout(form);
+    for (const InputSpec& s : spec_.inputs)
+        if (s.kind == InputKind::Selection) {
+            activeSelection_ = s.name;   // the first selection input is active when the dialog opens
+            break;
+        }
+    refreshSelectionState();
 
     previewLabel_ = new QLabel(this);
     previewLabel_->setObjectName("panelPreview");
@@ -349,7 +367,58 @@ bool CommandPanel::eventFilter(QObject* watched, QEvent* event) {
     if (event->type() == QEvent::Leave && spec_.optionHovered) {
         if (auto it = hoverFields_.find(watched); it != hoverFields_.end()) spec_.optionHovered(it->second, std::string());
     }
+    if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::FocusIn) {
+        if (auto it = selectionFields_.find(watched); it != selectionFields_.end()) activateSelection(it->second);
+    }
     return QWidget::eventFilter(watched, event);
+}
+
+void CommandPanel::refreshSelectionState() {
+    for (const InputSpec& s : spec_.inputs) {
+        if (s.kind != InputKind::Selection) continue;
+        const bool active = s.name == activeSelection_;
+        const std::size_t n = model_.selection(s.name).size();
+        if (auto it = selectionLists_.find(s.name); it != selectionLists_.end())
+            it->second->setStyleSheet(active ? QStringLiteral("QListWidget { border: 2px solid #2d8cff; }") : QString());
+        if (auto it = selectionCounts_.find(s.name); it != selectionCounts_.end()) {
+            QString noun = s.label.toLower();
+            if (n == 1 && noun.endsWith(QLatin1Char('s'))) noun.chop(1);   // "1 edge", "2 edges"
+            it->second->setText(n == 0 ? tr("Select %1").arg(s.label.toLower()) : tr("%1 %2").arg(n).arg(noun));
+            it->second->setStyleSheet(active ? QStringLiteral("font-weight: bold; color: #2d8cff;") : QString());
+        }
+    }
+}
+
+std::string CommandPanel::activeSelection() const { return activeSelection_; }
+
+void CommandPanel::activateSelection(std::string_view name) {
+    bool known = false;
+    for (const InputSpec& s : spec_.inputs) known = known || (s.kind == InputKind::Selection && s.name == name);
+    if (!known) return;
+    activeSelection_ = std::string(name);
+    refreshSelectionState();
+    emit selectionActivated(spec_.selectionHint);
+}
+
+void CommandPanel::keyPressEvent(QKeyEvent* e) {
+    if (e->key() == Qt::Key_Escape) {
+        escape();
+        e->accept();
+        return;
+    }
+    QWidget::keyPressEvent(e);
+}
+
+void CommandPanel::escape() {
+    if (auto it = selectionLists_.find(activeSelection_); it != selectionLists_.end() && !it->second->selectedItems().isEmpty()) {
+        it->second->clearSelection();   // emits itemSelectionChanged -> model, preview, selectionChanged
+        return;
+    }
+    reject();
+}
+
+void CommandPanel::doneWithSelection() {
+    if (okEnabled()) accept();
 }
 
 void CommandPanel::requestPreview() {

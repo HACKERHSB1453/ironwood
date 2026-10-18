@@ -51,6 +51,9 @@ public:
     /// Routes the next viewport picks to `handler` (empty = picks select as usual).
     virtual void setPickHandler(std::function<void(const render::PickResult&)> handler) = 0;
     virtual void setStatus(const QString& text) = 0;
+    /// Hint for the active selection of the open dialog ("Select edges to fillet"); empty clears it. The shell keeps
+    /// it in the status bar, also while the pointer hovers the viewport.
+    virtual void setPickHint(const QString& hint) = 0;
     /// Adds `feature` at the end of the timeline, or replaces the feature with the same id when `editing`. Undoable.
     virtual Result<void> commitFeature(std::shared_ptr<const recompute::Feature> feature, bool editing) = 0;
     /// Name shown for a body ("Body 1", ...).

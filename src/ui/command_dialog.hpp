@@ -25,6 +25,7 @@ class QComboBox;
 class QEvent;
 class QLabel;
 class QLineEdit;
+class QKeyEvent;
 class QListWidget;
 class QPushButton;
 class QTimer;
@@ -148,6 +149,8 @@ struct CommandDialogSpec {
     std::function<void(const PreviewResult&)> previewDelivered;
     /// Optional: a dropdown option under the mouse changed (`option` = its value; empty when none is under the mouse).
     std::function<void(const std::string& field, const std::string& option)> optionHovered;
+    /// Status-bar hint while a selection input is active, e.g. "Select edges to fillet". Empty = no hint.
+    QString selectionHint;
 };
 
 /// Right-docked command panel: a form built from the spec, inline errors per field, a live preview line, and
@@ -171,15 +174,35 @@ public:
     /// Emits finished(false).
     void reject();
 
+    /// The selection input that picks are routed to (the first selection input until the user clicks another one).
+    /// Empty when the dialog has no selection input.
+    std::string activeSelection() const;
+    /// Makes `name` the active selection input (what clicking its field does). Emits selectionActivated.
+    void activateSelection(std::string_view name);
+    /// Escape: clears the active selection when it has items, otherwise cancels the dialog.
+    void escape();
+    /// Right click on the viewport while a selection is open: OK when it can be accepted (no marking menu).
+    void doneWithSelection();
+
 signals:
     void finished(bool accepted);
+    /// The active selection input changed; `hint` is the spec's selectionHint.
+    void selectionActivated(const QString& hint);
+    /// The items of a selection input changed (by click, filter, escape or code).
+    void selectionChanged();
 
 private:
     void buildForm();
     void onFieldChanged(const std::string& name);
     void refreshValidation();
+    void refreshSelectionState();
     void requestPreview();
     bool eventFilter(QObject* watched, QEvent* event) override;
+    void keyPressEvent(QKeyEvent* e) override;
+
+    std::string activeSelection_;                                 ///< Name of the active selection input.
+    std::map<std::string, QLabel*, std::less<>> selectionCounts_; ///< "2 edges" per selection input.
+    std::map<QObject*, std::string, std::less<>> selectionFields_; ///< Click-to-activate widgets of selection inputs.
 
     CommandDialogSpec spec_;
     DialogModel model_;

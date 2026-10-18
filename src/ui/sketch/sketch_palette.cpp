@@ -144,6 +144,11 @@ SketchPalette::SketchPalette(QWidget* parent) : QWidget(parent) {
     status_->setWordWrap(true);
     root->addWidget(status_);
 
+    auto* lookAt = new QPushButton(T("Look At"), this);
+    lookAt->setObjectName("sketchLookAt");
+    connect(lookAt, &QPushButton::clicked, this, [this] { emit lookAtRequested(); });
+    root->addWidget(lookAt);
+
     auto* finish = new QPushButton(T("Finish Sketch"), this);
     finish->setObjectName("finishSketch");
     connect(finish, &QPushButton::clicked, this, [this] { emit finishRequested(); });

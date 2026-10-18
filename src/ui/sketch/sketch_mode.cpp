@@ -55,6 +55,7 @@ SketchMode::SketchMode(render::Viewport* viewport, QMainWindow* window)
     connect(palette_, &SketchPalette::constraintRequested, this,
             [this](sketch::ConstraintKind k) { applyConstraint(k); });
     connect(palette_, &SketchPalette::fixToggleRequested, this, [this] { toggleFix(); });
+    connect(palette_, &SketchPalette::lookAtRequested, this, [this] { faceSketchPlane(kLookAtMs); });
 
     viewport->installEventFilter(this);
     palette_->setOptions(opts_);
@@ -82,17 +83,18 @@ void SketchMode::beginSession(std::unique_ptr<SketchSession> owned, const QStrin
     sessions_.push_back(std::move(owned));
     active_ = sessions_.back().get();
     active_->setParameters(params_);
-    const sketch::SketchPlane plane = active_->plane();
 
     palette_->setPlaneName(planeName);
     palette_->setTool(SketchTool::Select);
     palette_->setSnapEnabled(snapOn_);
     dock_->show();
 
-    // Look along the plane normal, targeting the plane origin; the distance and up direction are kept.
-    render::CameraState pose = vp_->camera().poseForEyeDirection(plane.normal);
-    pose.target = plane.origin;
-    vp_->animateTo(pose, kLookAtMs);
+    // Flat view: the camera is saved for the end of sketch mode, then faces the plane orthographically and stays
+    // there. Left button belongs to the tools; only middle/wheel (and Shift+middle) move the view.
+    if (!savedView_) savedView_ = SavedView{vp_->camera().state(), vp_->projectionMode()};
+    vp_->setProjectionMode(render::Projection::Orthographic);
+    vp_->setFlatViewLocked(true);
+    faceSketchPlane(kLookAtMs);
     vp_->setFocus();
 
     syncSession();
@@ -101,6 +103,16 @@ void SketchMode::beginSession(std::unique_ptr<SketchSession> owned, const QStrin
 }
 
 void SketchMode::finish() { finishWith(true); }
+
+void SketchMode::faceSketchPlane(int ms) {
+    if (!active_) return;
+    const sketch::SketchPlane plane = active_->plane();
+    render::CameraState pose = vp_->camera().poseForEyeDirection(plane.normal);
+    pose.target = plane.origin;
+    vp_->animateTo(pose, ms);
+}
+
+void SketchMode::lookAt() { faceSketchPlane(kLookAtMs); }
 
 void SketchMode::finishWith(bool committed) {
     if (!active_) return;
@@ -112,6 +124,13 @@ void SketchMode::finishWith(bool committed) {
     active_ = nullptr;
     editing_ = false;
     dock_->hide();
+    // Sketch mode ends: the view it saved comes back and the left button is free again.
+    vp_->setFlatViewLocked(false);
+    if (savedView_) {
+        vp_->setProjectionMode(savedView_->projection);
+        vp_->animateTo(savedView_->state, kLookAtMs);
+        savedView_.reset();
+    }
     // The handler reads the session: an edited session leaves sessions() only after the signal.
     emit sketchFinished(done, committed);
     if (wasEdit) {

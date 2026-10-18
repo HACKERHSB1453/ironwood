@@ -12,6 +12,7 @@
 
 #include "core/params.hpp"
 #include "core/result.hpp"
+#include "render/camera.hpp"
 #include "sketch/sketch.hpp"
 #include "ui/sketch/session.hpp"
 #include "ui/sketch/sketch_overlay.hpp"
@@ -62,6 +63,8 @@ public:
     void startEdit(sketch::Sketch existing, const QString& name);
     /// Finish Sketch: leaves sketch mode. The sketch stays in sessions() (drawn dimmed) for later features.
     void finish();
+    /// Faces the active sketch's plane again (the Look At button). No-op when no sketch is active.
+    void lookAt();
     bool active() const noexcept { return active_ != nullptr; }
     /// True while the active session edits an existing sketch (startEdit) rather than creating one.
     bool editing() const noexcept { return editing_; }
@@ -122,6 +125,8 @@ private:
     /// Shared start of start() / startEdit(): makes `owned` the active session and shows the sketch UI.
     void beginSession(std::unique_ptr<SketchSession> owned, const QString& planeName, const QString& statusText);
     void finishWith(bool committed);
+    /// Faces the active sketch's plane (orthographic, target = plane origin, distance and up kept).
+    void faceSketchPlane(int ms);
     bool handleKey(const QKeyEvent* key);
     /// Pushes the snap settings (radius from view_math) and the offset distance to the active session.
     void syncSession();
@@ -137,6 +142,12 @@ private:
     render::Viewport* vp_;
     std::vector<std::unique_ptr<SketchSession>> sessions_;
     SketchSession* active_ = nullptr;
+    /// Camera and projection from before the first sketch of a sketch-mode run; restored when sketch mode ends.
+    struct SavedView {
+        render::CameraState state;
+        render::Projection projection = render::Projection::Perspective;
+    };
+    std::optional<SavedView> savedView_;
     bool editing_ = false;         ///< The active session re-enters an existing sketch.
     SketchOverlay* overlay_ = nullptr;
     SketchPalette* palette_ = nullptr;

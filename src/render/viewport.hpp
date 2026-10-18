@@ -89,6 +89,19 @@ public:
     void setViewCubeVisible(bool visible);
     bool viewCubeVisible() const noexcept;
 
+    /// Left button reserved for the caller (a pick dialog or sketch mode): a left press or drag never orbits or pans,
+    /// but a plain left click still reports a pick. Middle, right and wheel navigation are unchanged.
+    void setLeftButtonReserved(bool reserved);
+    bool leftButtonReserved() const noexcept;
+    /// Flat view lock (sketch mode): reserves the left button like setLeftButtonReserved, and also makes the ViewCube inert and disables
+    /// the Home and F keys. Wheel zoom, middle-drag pan and Shift+middle orbit still work.
+    void setFlatViewLocked(bool locked);
+    bool flatViewLocked() const noexcept;
+    /// Hover filter: a hover hit the filter rejects counts as nothing under the cursor (no highlight, no hoverChanged
+    /// for it). Empty = every hit highlights. Clicks are not filtered; the caller decides what a click means.
+    using HoverFilter = std::function<bool(const PickResult&)>;
+    void setHoverFilter(HoverFilter filter);
+
     /// Up axis (document/camera setting, default Y). Re-frames the home view.
     void setUpAxis(UpAxis axis);
     UpAxis upAxis() const noexcept;

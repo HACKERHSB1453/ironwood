@@ -163,6 +163,7 @@ public:
     void showPanel(QWidget* panel) override { showCommandPanel(panel); }
     void setPickHandler(std::function<void(const render::PickResult&)> handler) override { pickHandler_ = std::move(handler); }
     void setStatus(const QString& text) override;
+    void setPickHint(const QString& hint) override;
     Result<void> commitFeature(std::shared_ptr<const recompute::Feature> feature, bool editing) override;
     QString bodyTitle(BodyId body) const override;
     void setOverlayFaces(std::vector<render::OverlayFace> faces) override;
@@ -233,6 +234,7 @@ private:
     std::vector<BodyId> sceneIds_;             ///< Body of each scene index.
     std::unique_ptr<FeatureDialogs> dialogs_;
     std::function<void(const render::PickResult&)> pickHandler_;
+    QString pickHint_;   ///< Hint of the open dialog's active selection (kept in the status bar while hovering).
     std::optional<FeatureId> editingSketch_;   ///< The sketch feature whose sketch edit is open (none: new sketch).
     QString docPath_;
     bool demo_ = true;                         ///< The built-in demo bodies are shown until a document or import exists.

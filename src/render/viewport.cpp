@@ -48,6 +48,9 @@ struct Viewport::Impl {
     Camera camera;
     NavPreset nav = NavPreset::Fusion;
     bool viewCubeVisible = true;
+    bool leftReserved = false;          ///< Left button never orbits or pans (clicks still pick).
+    bool flatLocked = false;            ///< Sketch flat view: the ViewCube and Home/F are inert.
+    HoverFilter hoverFilter;            ///< Empty = every hover hit highlights.
     ViewCubeWidget* cube = nullptr;
     std::unique_ptr<SceneRenderer> renderer;
     QRhi* rhi = nullptr;
@@ -125,6 +128,7 @@ Viewport::Viewport(QWidget* parent) : QRhiWidget(parent), d_(std::make_unique<Im
             [this](double x, double y, double z) { viewFromDirection({x, y, z}); });
     connect(d_->cube, &ViewCubeWidget::homeRequested, this, [this] { viewHome(); });
     connect(d_->cube, &ViewCubeWidget::orbitDragged, this, [this](double dx, double dy) {
+        if (d_->flatLocked) return;   // flat view: the cube never moves the camera
         d_->animating = false;
         d_->animTimer.stop();
         d_->camera.orbit(dx, dy);
@@ -139,10 +143,11 @@ Viewport::Viewport(QWidget* parent) : QRhiWidget(parent), d_(std::make_unique<Im
         if (d_->gesture != Gesture::None) return;
         const QPointF p = d_->hoverPos;
         pick(static_cast<int>(p.x()), static_cast<int>(p.y()), [this, p](PickResult r) {
+            if (d_->hoverFilter && !d_->hoverFilter(r)) r = PickResult{};
             if (r.point) { d_->hoverPoint = r.point; d_->hoverPointPos = p; }
             else d_->hoverPoint.reset();
             const bool changed = r.bodyIndex != d_->hover.bodyIndex || r.faceIndex != d_->hover.faceIndex ||
-                                 r.edgeIndex != d_->hover.edgeIndex;
+                                 r.edgeIndex != d_->hover.edgeIndex || r.overlayIndex != d_->hover.overlayIndex;
             d_->hover = r;
             if (d_->renderer) d_->renderer->setHover(r);
             if (changed) { update(); emit hoverChanged(r); }
@@ -221,6 +226,33 @@ Camera& Viewport::camera() noexcept { return d_->camera; }
 const Camera& Viewport::camera() const noexcept { return d_->camera; }
 void Viewport::setNavPreset(NavPreset p) { d_->nav = p; }
 NavPreset Viewport::navPreset() const noexcept { return d_->nav; }
+
+void Viewport::setLeftButtonReserved(bool reserved) {
+    d_->leftReserved = reserved;
+}
+bool Viewport::leftButtonReserved() const noexcept { return d_->leftReserved; }
+
+void Viewport::setFlatViewLocked(bool locked) {
+    d_->flatLocked = locked;
+    d_->cube->setAttribute(Qt::WA_TransparentForMouseEvents, locked);
+    if (locked) {
+        d_->animating = false;
+        d_->animTimer.stop();
+    }
+    update();
+}
+bool Viewport::flatViewLocked() const noexcept { return d_->flatLocked; }
+
+void Viewport::setHoverFilter(HoverFilter filter) {
+    d_->hoverFilter = std::move(filter);
+    if (d_->hover.bodyIndex || d_->hover.overlayIndex) {
+        d_->hover = {};
+        d_->hoverPoint.reset();
+        if (d_->renderer) d_->renderer->setHover({});
+        emit hoverChanged({});
+    }
+    update();
+}
 
 void Viewport::setViewCubeVisible(bool v) {
     d_->viewCubeVisible = v;
@@ -447,9 +479,10 @@ void Viewport::mousePressEvent(QMouseEvent* e) {
     const Chord c{buttonOf(e->button()), modifiersOf(e->modifiers())};
     Gesture g = Gesture::None;
     if (c.button != MouseButton::None) {
-        if (c == m.orbit) g = Gesture::Orbit;
-        else if (c == m.pan) g = Gesture::Pan;
-        else if (c == m.zoom) g = Gesture::Zoom;
+        const bool leftNav = (d_->leftReserved || d_->flatLocked) && c.button == MouseButton::Left;
+        if (!leftNav && c == m.orbit) g = Gesture::Orbit;
+        else if (!leftNav && c == m.pan) g = Gesture::Pan;
+        else if (!leftNav && c == m.zoom) g = Gesture::Zoom;
         else if (c.button == MouseButton::Left && c.modifiers == ModNone) g = Gesture::Click;
     }
     d_->gesture = g;
@@ -561,6 +594,7 @@ void Viewport::wheelEvent(QWheelEvent* e) {
 }
 
 void Viewport::keyPressEvent(QKeyEvent* e) {
+    if (d_->flatLocked) { QRhiWidget::keyPressEvent(e); return; }
     if (e->key() == Qt::Key_Home) viewHome();
     else if (e->key() == Qt::Key_F && e->modifiers() == Qt::NoModifier) viewFit();
     else QRhiWidget::keyPressEvent(e);

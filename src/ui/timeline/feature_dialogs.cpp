@@ -889,6 +889,23 @@ struct FeatureDialogs::Impl {
         }
     }
 
+    /// Hover filter of the open dialog: only what the active selection can take is highlighted (faces for Hole,
+    /// edges for Fillet / Chamfer, profile overlays for Extrude / Revolve). Clicks use onPick with the same rules.
+    bool hoverAccepts(const render::PickResult& r) const {
+        if (!panel || !ctx) return false;
+        if (profilePicks) return r.overlayIndex && *r.overlayIndex < ctx->profiles.size();
+        if (!r.bodyIndex) return false;
+        const auto body = host.bodyAtIndex(*r.bodyIndex);
+        if (!body) return false;
+        if (pick == PickMode::Edges && r.edgeIndex)
+            return std::any_of(ctx->edges.begin(), ctx->edges.end(),
+                               [&](const EdgeChoice& e) { return e.body == *body && e.index == *r.edgeIndex; });
+        if ((pick == PickMode::Face || pick == PickMode::FaceUV) && r.faceIndex)
+            return std::any_of(ctx->faces.begin(), ctx->faces.end(),
+                               [&](const FaceChoice& f) { return f.body == *body && f.index == *r.faceIndex; });
+        return false;
+    }
+
     /// Hole placement: the picked point in the face's plane coordinates.
     void setUV(BodyId body, std::uint32_t face, Vec3 point) {
         const timeline::EvalOutput& shown = host.shownEvaluation();
@@ -898,8 +915,9 @@ struct FeatureDialogs::Impl {
         if (!pl) return;
         const Vec3 yDir = cross(pl->normal, pl->xDir);
         const Vec3 d = point - pl->origin;
-        panel->setText("u", QString::number(dot(d, pl->xDir), 'f', 3));
-        panel->setText("v", QString::number(dot(d, yDir), 'f', 3));
+        // Lengths are written with their unit: the feature reads the raw text, and a bare number is not a length there.
+        panel->setText("u", QStringLiteral("%1 mm").arg(dot(d, pl->xDir), 0, 'f', 3));
+        panel->setText("v", QStringLiteral("%1 mm").arg(dot(d, yDir), 0, 'f', 3));
     }
 };
 
@@ -1110,6 +1128,14 @@ Result<void> FeatureDialogs::start(const std::string& kind, std::optional<Featur
         return host_.commitFeature(*cand, cc->editing);
     };
 
+    QString hint;
+    if (kind == "fillet") hint = QStringLiteral("Select edges to fillet");
+    else if (kind == "chamfer") hint = QStringLiteral("Select edges to chamfer");
+    else if (kind == "hole") hint = QStringLiteral("Select a face to place the hole");
+    else if (kind == "extrude") hint = QStringLiteral("Select a profile to extrude");
+    else if (kind == "revolve") hint = QStringLiteral("Select a profile to revolve");
+    dlg.selectionHint = hint;   // before the spec is moved into the panel
+
     // The panel validates expressions against this parameter snapshot; the previous one is retired with its panel.
     params_ = std::make_shared<ParameterTable>(cc->params);
     auto* panel = new CommandPanel(std::move(dlg), params_.get(), host_.jobs());
@@ -1125,9 +1151,38 @@ Result<void> FeatureDialogs::start(const std::string& kind, std::optional<Featur
     impl_->arrowOn = kind == "extrude";
     impl_->ringOn = kind == "revolve";
     if (impl_->arrowOn || impl_->ringOn) impl_->attachManipulators(panel);
+
+    // Pick mode: the first selection input is active at once. Its hint goes to the status bar, the viewport reserves
+    // the left button for picks (a click never orbits or pans), and hovering highlights only what the input accepts.
+    host_.setPickHint(hint);
+    if (render::Viewport* vp = host_.viewport()) {
+        vp->setLeftButtonReserved(true);
+        vp->setHoverFilter([this, gen](const render::PickResult& r) { return gen == impl_->session && impl_->hoverAccepts(r); });
+        // Hovering a profile overlay brightens it (and the dropdown names it), as hovering its dropdown entry does.
+        QObject::connect(vp, &render::Viewport::hoverChanged, panel, [this, gen](const render::PickResult& r) {
+            if (gen != impl_->session || !impl_->panel || !impl_->profilePicks || !impl_->ctx) return;
+            std::string key;
+            if (r.overlayIndex && *r.overlayIndex < impl_->ctx->profiles.size()) key = impl_->ctx->profiles[*r.overlayIndex].key;
+            impl_->setHoveredProfile(key);
+        });
+    }
+    QObject::connect(panel, &CommandPanel::selectionActivated, panel, [this, gen](const QString& h) {
+        if (gen == impl_->session) host_.setPickHint(h);
+    });
+    QObject::connect(panel, &CommandPanel::selectionChanged, panel, [this, gen] {
+        if (gen != impl_->session || !impl_->panel) return;
+        // The viewport's orange pick follows the list: it clears when the active selection is empty.
+        if (impl_->panel->model().selection(impl_->panel->activeSelection()).empty())
+            if (render::Viewport* vp = host_.viewport()) vp->setSelection(render::PickResult{});
+    });
     QObject::connect(panel, &CommandPanel::finished, [this](bool) {
         host_.setPickHandler({});
         ++impl_->session;   // late results of this dialog are ignored
+        host_.setPickHint({});
+        if (render::Viewport* vp = host_.viewport()) {
+            vp->setHoverFilter({});
+            vp->setLeftButtonReserved(false);
+        }
         impl_->profileFaces.clear();
         impl_->previewFaces.clear();
         impl_->hoveredProfile = -1;

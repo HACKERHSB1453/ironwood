@@ -14,6 +14,7 @@
 #include <QLabel>
 #include <QMenu>
 #include <QMenuBar>
+#include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
@@ -168,10 +169,13 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     evalTimer_->setInterval(kEvalPollIntervalMs);
     connect(evalTimer_, &QTimer::timeout, this, [this] { pollEvaluation(); });
 
-    connect(viewport_, &render::Viewport::hoverChanged, this,
-            [this](const render::PickResult& r) { status_->setText(describePick(r)); });
+    connect(viewport_, &render::Viewport::hoverChanged, this, [this](const render::PickResult& r) {
+        // While a dialog waits for a selection the hint stays first; what is under the cursor follows it.
+        if (pickHint_.isEmpty()) status_->setText(describePick(r));
+        else status_->setText(r.bodyIndex ? pickHint_ + QStringLiteral(" - ") + describePick(r) : pickHint_);
+    });
     connect(viewport_, &render::Viewport::picked, this, [this](const render::PickResult& r) {
-        status_->setText(describePick(r));
+        status_->setText(pickHint_.isEmpty() ? describePick(r) : pickHint_);
         routePick(r);
     });
 
@@ -213,6 +217,11 @@ void MainWindow::showDemoScene() {
 }
 
 void MainWindow::setStatus(const QString& text) { status_->setText(text); }
+
+void MainWindow::setPickHint(const QString& hint) {
+    pickHint_ = hint;
+    if (!hint.isEmpty()) status_->setText(hint);
+}
 
 void MainWindow::routePick(const render::PickResult& r) {
     if (pickHandler_) {
@@ -1189,6 +1198,17 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
         case QEvent::Resize:
             if (overlay_) overlay_->setGeometry(viewport_->rect());
             break;
+        case QEvent::KeyPress: {
+            // A dialog that waits for a selection: Escape clears the selection, or cancels the dialog when it is empty.
+            auto* ke = static_cast<QKeyEvent*>(event);
+            if (ke->key() == Qt::Key_Escape && pickHandler_) {
+                if (auto* panel = qobject_cast<CommandPanel*>(panelDock_->widget())) {
+                    panel->escape();
+                    return true;
+                }
+            }
+            break;
+        }
         case QEvent::MouseButtonPress: {
             auto* me = static_cast<QMouseEvent*>(event);
             if (me->button() == Qt::RightButton) {
@@ -1208,7 +1228,12 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
             auto* me = static_cast<QMouseEvent*>(event);
             if (me->button() == Qt::RightButton && rightPressed_) {
                 rightPressed_ = false;
-                showMarkingMenu(me->position().toPoint());
+                if (pickHandler_) {
+                    // A dialog waits for picks: a right click is "done" (OK when it is valid), not the marking menu.
+                    if (auto* panel = qobject_cast<CommandPanel*>(panelDock_->widget())) panel->doneWithSelection();
+                } else {
+                    showMarkingMenu(me->position().toPoint());
+                }
             }
             break;
         }
