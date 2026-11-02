@@ -1326,3 +1326,200 @@ bool boundsWithin(const Box3& input, const Box3& result, double allowance) {
 }
 
 } // namespace iw::kernel::check
+
+// ===================================================================================================== F26
+// Construction geometry helpers (tangent plane, plane/plane line, edge/plane point, circle of an edge).
+// Self-contained: own includes and helpers in namespace f26detail; relies only on occtError/finiteVec above.
+
+#include <numbers>
+#include <utility>
+
+#include <GeomAPI_IntCS.hxx>
+#include <Geom_Curve.hxx>
+#include <Geom_Plane.hxx>
+#include <gp_Circ.hxx>
+#include <gp_Cone.hxx>
+#include <gp_Cylinder.hxx>
+
+namespace iw::kernel {
+namespace f26detail {
+
+Vec3 toVec(const gp_Pnt& p) { return {p.X(), p.Y(), p.Z()}; }
+Vec3 toVec(const gp_Dir& d) { return {d.X(), d.Y(), d.Z()}; }
+
+Vec3 unit(const Vec3& v) { return v * (1.0 / length(v)); }
+
+/// Sub-shape `idx` of `kind`, or InvalidArgument (null shape / out of range).
+Result<TopoDS_Shape> subShape(const Shape& s, SubShapeKind kind, std::uint32_t idx, const char* what) {
+    if (s.isNull()) return makeError(ErrorCode::InvalidArgument, std::string(what) + ": null shape");
+    const std::uint32_t n = s.subShapeCount(kind);
+    if (idx >= n)
+        return makeError(ErrorCode::InvalidArgument, std::string(what) + ": index " + std::to_string(idx) +
+                                                         " out of range (shape has " + std::to_string(n) + ")");
+    return s.impl()->index->map(kind).FindKey(static_cast<int>(idx) + 1);
+}
+
+/// Axis flipped so that its largest-magnitude component is positive (ties resolved x, y, z).
+Vec3 canonicalAxis(const Vec3& k) {
+    const double c[3] = {k.x, k.y, k.z};
+    std::size_t best = 0;
+    for (std::size_t i = 1; i < 3; ++i)
+        if (std::abs(c[i]) > std::abs(c[best]) + 1e-12) best = i;
+    return c[best] < 0 ? k * -1.0 : k;
+}
+
+/// The world axis least aligned with unit `k` (ties x, y, z), projected perpendicular to k and normalised.
+Vec3 referenceDirection(const Vec3& k) {
+    Vec3 ax{1, 0, 0};
+    double best = std::abs(k.x);
+    if (std::abs(k.y) < best) { ax = {0, 1, 0}; best = std::abs(k.y); }
+    if (std::abs(k.z) < best) ax = {0, 0, 1};
+    return unit(ax - k * dot(ax, k));
+}
+
+} // namespace f26detail
+
+Result<EdgeCircle> circleFromEdge(const Shape& shape, std::uint32_t edgeIndex) {
+    try {
+        auto e = f26detail::subShape(shape, SubShapeKind::Edge, edgeIndex, "circleFromEdge");
+        if (!e) return std::unexpected(e.error());
+        const TopoDS_Edge edge = TopoDS::Edge(*e);
+        if (BRep_Tool::Degenerated(edge))
+            return makeError(ErrorCode::InvalidArgument, "circleFromEdge: edge " + std::to_string(edgeIndex) + " is degenerate");
+        BRepAdaptor_Curve ac(edge);
+        if (ac.GetType() != GeomAbs_Circle)
+            return makeError(ErrorCode::InvalidArgument,
+                             "circleFromEdge: edge " + std::to_string(edgeIndex) + " is not a circle or circular arc");
+        const gp_Circ c = ac.Circle();
+        EdgeCircle out;
+        out.centre = f26detail::toVec(c.Location());
+        out.normal = f26detail::toVec(c.Axis().Direction());
+        out.radius = c.Radius();
+        out.fullCircle = (ac.LastParameter() - ac.FirstParameter()) >= 2.0 * std::numbers::pi - 1e-9;
+        return out;
+    } catch (const Standard_Failure& e) {
+        return std::unexpected(occtError(e, "circleFromEdge"));
+    }
+}
+
+Result<Axis> planePlaneIntersection(const Plane& a, const Plane& b) {
+    if (!finiteVec(a.origin) || !finiteVec(a.normal) || !finiteVec(b.origin) || !finiteVec(b.normal))
+        return makeError(ErrorCode::InvalidArgument, "planePlaneIntersection: non-finite plane");
+    if (length(a.normal) < 1e-12 || length(b.normal) < 1e-12)
+        return makeError(ErrorCode::InvalidArgument, "planePlaneIntersection: zero plane normal");
+    const Vec3 na = f26detail::unit(a.normal), nb = f26detail::unit(b.normal);
+    const Vec3 n = cross(na, nb);
+    const double n2 = dot(n, n);
+    if (std::sqrt(n2) < 1e-9)
+        return makeError(ErrorCode::InvalidArgument, "planePlaneIntersection: the planes are parallel and do not define a line");
+    const double ca = dot(na, a.origin), cb = dot(nb, b.origin);
+    // Point on both planes lying in span(na, nb), i.e. the line's point closest to the world origin.
+    const Vec3 p = (cross(nb, n) * ca + cross(n, na) * cb) * (1.0 / n2);
+    return Axis{p, f26detail::unit(n)};
+}
+
+Result<EdgePlaneHit> edgePlaneIntersection(const Shape& shape, std::uint32_t edgeIndex, const Plane& plane) {
+    if (!finiteVec(plane.origin) || !finiteVec(plane.normal) || length(plane.normal) < 1e-12)
+        return makeError(ErrorCode::InvalidArgument, "edgePlaneIntersection: plane needs a finite origin and non-zero normal");
+    const std::string tag = "edgePlaneIntersection: edge " + std::to_string(edgeIndex);
+    try {
+        auto e = f26detail::subShape(shape, SubShapeKind::Edge, edgeIndex, "edgePlaneIntersection");
+        if (!e) return std::unexpected(e.error());
+        const TopoDS_Edge edge = TopoDS::Edge(*e);
+        if (BRep_Tool::Degenerated(edge)) return makeError(ErrorCode::InvalidArgument, tag + " is degenerate");
+        Standard_Real f = 0, l = 0;
+        Handle(Geom_Curve) curve = BRep_Tool::Curve(edge, f, l); // location applied
+        if (curve.IsNull()) return makeError(ErrorCode::InvalidArgument, tag + " has no 3D curve");
+        const Vec3 n = f26detail::unit(plane.normal);
+        const gp_Pln pln(gp_Pnt(plane.origin.x, plane.origin.y, plane.origin.z), gp_Dir(n.x, n.y, n.z));
+        const double tol = std::max(1e-7, BRep_Tool::Tolerance(edge));
+
+        // An edge lying in the plane has infinitely many intersection points.
+        bool allIn = true;
+        for (int i = 0; i <= 8 && allIn; ++i)
+            allIn = pln.Distance(curve->Value(f + (l - f) * i / 8.0)) <= tol;
+        if (allIn) return makeError(ErrorCode::InvalidArgument, tag + " lies in the plane (no single intersection point)");
+
+        Handle(Geom_Plane) gpl = new Geom_Plane(pln);
+        GeomAPI_IntCS inter(curve, gpl);
+        if (!inter.IsDone()) return makeError(ErrorCode::KernelFailure, tag + ": curve/plane intersection failed");
+        if (inter.NbSegments() > 0)
+            return makeError(ErrorCode::InvalidArgument, tag + " lies partly in the plane (no single intersection point)");
+
+        const double ptol = 1e-9 * (1.0 + std::abs(l - f));
+        const bool periodic = curve->IsPeriodic();
+        const double period = periodic ? curve->Period() : 0.0;
+        const double start = edge.Orientation() == TopAbs_REVERSED ? l : f;
+        std::vector<std::pair<double, Vec3>> hits; // (parameter distance from start, point)
+        for (int i = 1; i <= inter.NbPoints(); ++i) {
+            Standard_Real u = 0, v = 0, w = 0;
+            inter.Parameters(i, u, v, w);
+            if (periodic && period > 0) {
+                while (w < f - ptol) w += period;
+                while (w > l + ptol) w -= period;
+            }
+            if (w < f - ptol || w > l + ptol) continue;
+            hits.emplace_back(std::abs(w - start), f26detail::toVec(inter.Point(i)));
+        }
+        std::sort(hits.begin(), hits.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+        std::vector<Vec3> distinct; // in order of distance from the start
+        for (const auto& [d, p] : hits) {
+            bool dup = false;
+            for (const Vec3& q : distinct) dup = dup || length(p - q) <= tol;
+            if (!dup) distinct.push_back(p);
+        }
+        if (distinct.empty()) return makeError(ErrorCode::InvalidArgument, tag + " does not intersect the plane");
+        return EdgePlaneHit{distinct.front(), static_cast<std::uint32_t>(distinct.size())};
+    } catch (const Standard_Failure& e) {
+        return std::unexpected(occtError(e, "edgePlaneIntersection"));
+    }
+}
+
+Result<Plane> tangentPlaneOnFace(const Shape& shape, std::uint32_t faceIndex, double angle) {
+    if (!std::isfinite(angle)) return makeError(ErrorCode::InvalidArgument, "tangentPlaneOnFace: non-finite angle");
+    try {
+        auto s = f26detail::subShape(shape, SubShapeKind::Face, faceIndex, "tangentPlaneOnFace");
+        if (!s) return std::unexpected(s.error());
+        BRepAdaptor_Surface as(TopoDS::Face(*s), Standard_True);
+        Vec3 axisDir, loc;
+        double radius = 0, semi = 0;
+        switch (as.GetType()) {
+        case GeomAbs_Cylinder: {
+            const gp_Cylinder c = as.Cylinder();
+            axisDir = f26detail::toVec(c.Axis().Direction());
+            loc = f26detail::toVec(c.Location());
+            radius = c.Radius();
+            break;
+        }
+        case GeomAbs_Cone: {
+            const gp_Cone c = as.Cone();
+            axisDir = f26detail::toVec(c.Axis().Direction());
+            loc = f26detail::toVec(c.Location());
+            radius = c.RefRadius();
+            semi = c.SemiAngle();
+            break;
+        }
+        default:
+            return makeError(ErrorCode::InvalidArgument,
+                             "tangentPlaneOnFace: face " + std::to_string(faceIndex) + " is not cylindrical or conical");
+        }
+        const Vec3 k = f26detail::canonicalAxis(axisDir);
+        const Vec3 r = f26detail::referenceDirection(k);
+        const Vec3 u = r * std::cos(angle) + cross(k, r) * std::sin(angle);
+        Plane out;
+        out.origin = loc + u * radius;
+        // Surface P(U,V) = loc + (R + V sin a) u + V cos a Z (Z = the surface's own axis): ruling g, normal n.
+        const Vec3 g = u * std::sin(semi) + axisDir * std::cos(semi);
+        const Vec3 nrm = u * std::cos(semi) - axisDir * std::sin(semi);
+        out.normal = f26detail::unit(nrm);
+        // Ruling oriented away from the apex (V increases away from it when the semi-angle is positive).
+        out.xDir = as.GetType() == GeomAbs_Cylinder ? k : f26detail::unit(semi < 0 ? g * -1.0 : g);
+        if (!finiteVec(out.origin) || !finiteVec(out.normal) || !finiteVec(out.xDir))
+            return makeError(ErrorCode::KernelFailure, "tangentPlaneOnFace: non-finite result");
+        return out;
+    } catch (const Standard_Failure& e) {
+        return std::unexpected(occtError(e, "tangentPlaneOnFace"));
+    }
+}
+
+} // namespace iw::kernel

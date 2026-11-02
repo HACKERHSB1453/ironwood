@@ -154,3 +154,54 @@ Result<ShapeResult> scale(const Shape& shape, const Vec3& center, double factor,
 Result<ShapeResult> intersectWith(const Shape& a, const Shape& b, CancelToken cancel = {});
 
 } // namespace iw::kernel
+
+// ---------------------------------------------------------------------------------------------------------------
+// F26 (construction geometry follow-up). Self-contained additive block; nothing above is changed.
+namespace iw::kernel {
+
+/// Circle carried by an edge (`circleFromEdge`). `normal` is the circle's axis direction as stored by the kernel.
+struct EdgeCircle {
+    Vec3 centre;
+    Vec3 normal{0, 0, 1};
+    double radius = 0;
+    bool fullCircle = false; ///< true for a closed (360 deg) circle, false for an arc
+};
+
+/// Centre/axis/radius of a CIRCULAR edge of `shape` (full circle or arc). Any other curve type (line, ellipse,
+/// B-spline, ...), a degenerate edge, a null shape or an out-of-range index -> InvalidArgument.
+Result<EdgeCircle> circleFromEdge(const Shape& shape, std::uint32_t edgeIndex);
+
+/// Intersection line of two planes. direction = normalised(a.normal x b.normal); origin = the point of the line
+/// closest to the world origin (independent of where the planes' origins lie). Parallel (or coincident) planes
+/// (|sin angle| < 1e-9), zero normals or non-finite input -> InvalidArgument.
+Result<Axis> planePlaneIntersection(const Plane& a, const Plane& b);
+
+/// Result of `edgePlaneIntersection`: the chosen point and how many distinct intersection points exist.
+struct EdgePlaneHit {
+    Vec3 point;
+    std::uint32_t count = 0;
+};
+
+/// Intersection of edge `edgeIndex` of `shape` (any curve: line, circle, B-spline, ...) with the infinite `plane`,
+/// restricted to the edge's parameter range. With several distinct intersections the one NEAREST TO THE EDGE START
+/// (smallest parameter distance from the start vertex, honouring the edge orientation) is returned; `count` reports
+/// how many there are. No intersection, an edge lying (partly) in the plane, a degenerate edge, a zero normal, a null
+/// shape or an out-of-range index -> InvalidArgument.
+Result<EdgePlaneHit> edgePlaneIntersection(const Shape& shape, std::uint32_t edgeIndex, const Plane& plane);
+
+/// Plane tangent to the CYLINDRICAL or CONICAL face `faceIndex` of `shape` along the surface ruling at `angle`
+/// (radians) around the face's axis. Angle convention:
+///  * axis k = the surface axis, flipped so that its largest-magnitude component is positive (ties: x before y
+///    before z), so the sense does not depend on how the kernel happened to orient the surface;
+///  * reference direction r = the world axis least aligned with k (x, then y, then z on ties), projected
+///    perpendicular to k and normalised (same rule as planeFromPointNormal);
+///  * the ruling lies in radial direction u = cos(angle) r + sin(angle) (k x r), i.e. the angle is measured
+///    counter-clockwise about k (right-hand rule) from r.
+/// Result: origin = the point of that ruling on the surface's reference circle, normal = the surface normal along
+/// the ruling pointing away from the axis, xDir = the ruling direction (cylinder: k; cone: along the generatrix,
+/// away from the apex). The plane is tangent to the underlying surface; for a partial face the ruling may lie outside
+/// the face's trimmed range. Other surface types, non-finite angle, a null shape or an out-of-range index ->
+/// InvalidArgument.
+Result<Plane> tangentPlaneOnFace(const Shape& shape, std::uint32_t faceIndex, double angle);
+
+} // namespace iw::kernel

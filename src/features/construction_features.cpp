@@ -165,6 +165,11 @@ std::string ConstructionPlaneFeature::paramsJson() const {
         j["axis"] = p.axis.value();
         j["angle"] = p.angle;
         break;
+    case ConstructionPlaneParams::Kind::Tangent:
+        j["kind"] = "tangent";
+        j["base"] = planeRefToJson(p.base);
+        j["angle"] = p.angle;
+        break;
     }
     return j.dump();
 }
@@ -210,6 +215,16 @@ Result<std::shared_ptr<recompute::Feature>> ConstructionPlaneFeature::fromJson(F
         p.base = *base;
         if (!j.contains("axis") || !j["axis"].is_number_unsigned()) return makeError(ErrorCode::ParseError, "plane: 'axis' must be a feature id");
         p.axis = FeatureId{j["axis"].get<std::uint64_t>()};
+        auto a = common::readString(j, "angle");
+        if (!a) return std::unexpected(a.error());
+        if (auto c = common::checkExpression(*a, "angle"); !c) return std::unexpected(c.error());
+        p.angle = *a;
+    } else if (*kind == "tangent") {
+        p.kind = ConstructionPlaneParams::Kind::Tangent;
+        auto base = planeRefFromJson(j, "base");
+        if (!base) return std::unexpected(base.error());
+        if (!base->isFace) return makeError(ErrorCode::ParseError, "plane: tangent 'base' must be a cylindrical or conical face");
+        p.base = *base;
         auto a = common::readString(j, "angle");
         if (!a) return std::unexpected(a.error());
         if (auto c = common::checkExpression(*a, "angle"); !c) return std::unexpected(c.error());
@@ -276,6 +291,23 @@ Result<FeatureResult> ConstructionPlaneFeature::compute(const EvalContext& ctx) 
         g.xDir = common::normalized(rotateVector(base->xDir, k, *angle));
         break;
     }
+    case ConstructionPlaneParams::Kind::Tangent: {
+        if (!p.base.isFace) return makeError(ErrorCode::InvalidArgument, "tangent plane: the reference must be a cylindrical or conical face");
+        auto idx = resolveRef(ctx, p.base.body, p.base.face, ElementType::Face, diags);
+        if (!idx) return std::unexpected(idx.error());
+        auto angle = common::angleOf(ctx.params, p.angle, "tangent plane angle");
+        if (!angle) return std::unexpected(angle.error());
+        auto plane = kernel::tangentPlaneOnFace(*ctx.body(p.base.body), *idx, *angle);
+        if (!plane) {
+            if (plane.error().code == ErrorCode::InvalidArgument)
+                return makeError(ErrorCode::InvalidArgument, "tangent plane: the referenced face is not cylindrical or conical");
+            return std::unexpected(plane.error());
+        }
+        g.origin = plane->origin;
+        g.normal = plane->normal;
+        g.xDir = plane->xDir;
+        break;
+    }
     }
     if (!common::finite(g.origin) || !common::finite(g.normal)) return makeError(ErrorCode::KernelFailure, "plane: non-finite result");
     return geometryOnly(g, std::move(diags));
@@ -285,11 +317,25 @@ Result<FeatureResult> ConstructionPlaneFeature::compute(const EvalContext& ctx) 
 
 std::vector<naming::ElementRef> ConstructionAxisFeature::explicitRefs() const {
     if (params_.kind == ConstructionAxisParams::Kind::TwoPoints) return {};
+    if (params_.kind == ConstructionAxisParams::Kind::TwoPlanes) {
+        std::vector<naming::ElementRef> out;
+        for (const PlaneRef* r : {&params_.planeA, &params_.planeB})
+            if (r->isFace) out.push_back(r->face);
+        return out;
+    }
     return {params_.ref};
 }
 
 std::vector<BodyId> ConstructionAxisFeature::readsBodies() const {
     if (params_.kind == ConstructionAxisParams::Kind::TwoPoints) return {};
+    if (params_.kind == ConstructionAxisParams::Kind::TwoPlanes) {
+        std::vector<BodyId> out;
+        for (const PlaneRef* r : {&params_.planeA, &params_.planeB})
+            if (r->isFace) out.push_back(r->body);
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
     return {params_.body};
 }
 
@@ -312,6 +358,12 @@ std::string ConstructionAxisFeature::paramsJson() const {
     case ConstructionAxisParams::Kind::Cylinder: j["kind"] = "cylinder"; break;
     case ConstructionAxisParams::Kind::TwoPoints: j["kind"] = "two_points"; break;
     case ConstructionAxisParams::Kind::Edge: j["kind"] = "edge"; break;
+    case ConstructionAxisParams::Kind::TwoPlanes: j["kind"] = "two_planes"; break;
+    }
+    if (p.kind == ConstructionAxisParams::Kind::TwoPlanes) {
+        j["plane_a"] = planeRefToJson(p.planeA);
+        j["plane_b"] = planeRefToJson(p.planeB);
+        return j.dump();
     }
     j["body"] = p.body.value();
     if (p.kind != ConstructionAxisParams::Kind::TwoPoints) j["ref"] = common::refToJson(p.ref);
@@ -338,6 +390,15 @@ Result<std::shared_ptr<recompute::Feature>> ConstructionAxisFeature::fromJson(Fe
         if (!b) return std::unexpected(b.error());
         p.a = *a;
         p.b = *b;
+    } else if (*kind == "two_planes") {
+        p.kind = ConstructionAxisParams::Kind::TwoPlanes;
+        auto pa = planeRefFromJson(j, "plane_a");
+        if (!pa) return std::unexpected(pa.error());
+        auto pb = planeRefFromJson(j, "plane_b");
+        if (!pb) return std::unexpected(pb.error());
+        p.planeA = *pa;
+        p.planeB = *pb;
+        return std::shared_ptr<recompute::Feature>(std::make_shared<ConstructionAxisFeature>(id, std::move(p)));
     } else if (*kind == "cylinder" || *kind == "edge") {
         p.kind = *kind == "cylinder" ? ConstructionAxisParams::Kind::Cylinder : ConstructionAxisParams::Kind::Edge;
         auto ref = common::refFromJson(j, "ref");
@@ -391,6 +452,21 @@ Result<FeatureResult> ConstructionAxisFeature::compute(const EvalContext& ctx) c
         g.direction = axis->direction;
         break;
     }
+    case ConstructionAxisParams::Kind::TwoPlanes: {
+        auto a = resolvePlane(ctx, p.planeA, diags);
+        if (!a) return std::unexpected(a.error());
+        auto b = resolvePlane(ctx, p.planeB, diags);
+        if (!b) return std::unexpected(b.error());
+        auto axis = kernel::planePlaneIntersection(*a, *b);
+        if (!axis) {
+            if (axis.error().code == ErrorCode::InvalidArgument)
+                return makeError(ErrorCode::InvalidArgument, "axis: the two planes are parallel and do not intersect in a line");
+            return std::unexpected(axis.error());
+        }
+        g.origin = axis->origin;
+        g.direction = axis->direction;
+        break;
+    }
     }
     if (!common::finite(g.origin) || !common::finite(g.direction)) return makeError(ErrorCode::KernelFailure, "axis: non-finite result");
     return geometryOnly(g, std::move(diags));
@@ -398,13 +474,31 @@ Result<FeatureResult> ConstructionAxisFeature::compute(const EvalContext& ctx) c
 
 // ---- point -----------------------------------------------------------------------------------------------------
 
+std::vector<naming::ElementRef> ConstructionPointFeature::explicitRefs() const {
+    std::vector<naming::ElementRef> out{params_.ref};
+    if (params_.kind == ConstructionPointParams::Kind::EdgePlane && params_.plane.isFace) out.push_back(params_.plane.face);
+    return out;
+}
+
+std::vector<BodyId> ConstructionPointFeature::readsBodies() const {
+    std::vector<BodyId> out{params_.body};
+    if (params_.kind == ConstructionPointParams::Kind::EdgePlane && params_.plane.isFace) out.push_back(params_.plane.body);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 std::uint64_t ConstructionPointFeature::paramHash() const { return hashJson("point/v1:", paramsJson()); }
 
 std::string ConstructionPointFeature::paramsJson() const {
-    json j{{"id", id_.value()},
-           {"kind", params_.kind == ConstructionPointParams::Kind::Vertex ? "vertex" : "circle_centre"},
-           {"body", params_.body.value()},
-           {"ref", common::refToJson(params_.ref)}};
+    const char* kind = "vertex";
+    switch (params_.kind) {
+    case ConstructionPointParams::Kind::Vertex: kind = "vertex"; break;
+    case ConstructionPointParams::Kind::CircleCentre: kind = "circle_centre"; break;
+    case ConstructionPointParams::Kind::EdgePlane: kind = "edge_plane"; break;
+    }
+    json j{{"id", id_.value()}, {"kind", kind}, {"body", params_.body.value()}, {"ref", common::refToJson(params_.ref)}};
+    if (params_.kind == ConstructionPointParams::Kind::EdgePlane) j["plane"] = planeRefToJson(params_.plane);
     return j.dump();
 }
 
@@ -416,6 +510,7 @@ Result<std::shared_ptr<recompute::Feature>> ConstructionPointFeature::fromJson(F
     if (!kind) return std::unexpected(kind.error());
     if (*kind == "vertex") p.kind = ConstructionPointParams::Kind::Vertex;
     else if (*kind == "circle_centre") p.kind = ConstructionPointParams::Kind::CircleCentre;
+    else if (*kind == "edge_plane") p.kind = ConstructionPointParams::Kind::EdgePlane;
     else return makeError(ErrorCode::ParseError, "point: unknown kind '" + *kind + "'");
     if (!j.contains("body") || !j["body"].is_number_unsigned()) return makeError(ErrorCode::ParseError, "point: 'body' must be an unsigned id");
     p.body = BodyId{j["body"].get<std::uint64_t>()};
@@ -424,6 +519,11 @@ Result<std::shared_ptr<recompute::Feature>> ConstructionPointFeature::fromJson(F
     const ElementType want = p.kind == ConstructionPointParams::Kind::Vertex ? ElementType::Vertex : ElementType::Edge;
     if (ref->type != want) return makeError(ErrorCode::ParseError, "point: reference has the wrong element type");
     p.ref = *ref;
+    if (p.kind == ConstructionPointParams::Kind::EdgePlane) {
+        auto plane = planeRefFromJson(j, "plane");
+        if (!plane) return std::unexpected(plane.error());
+        p.plane = *plane;
+    }
     return std::shared_ptr<recompute::Feature>(std::make_shared<ConstructionPointFeature>(id, std::move(p)));
 }
 
@@ -433,17 +533,50 @@ Result<FeatureResult> ConstructionPointFeature::compute(const EvalContext& ctx) 
     std::vector<Diagnostic> diags;
     ConstructionGeometry g;
     g.kind = ConstructionGeometry::Kind::Point;
-    if (p.kind == ConstructionPointParams::Kind::Vertex) {
+    switch (p.kind) {
+    case ConstructionPointParams::Kind::Vertex: {
         auto idx = resolveRef(ctx, p.body, p.ref, ElementType::Vertex, diags);
         if (!idx) return std::unexpected(idx.error());
         const auto k = ctx.body(p.body)->subShapeKey(kernel::SubShapeKind::Vertex, *idx);
         g.origin = {k[0], k[1], k[2]};
-    } else {
+        break;
+    }
+    case ConstructionPointParams::Kind::CircleCentre: {
         auto idx = resolveRef(ctx, p.body, p.ref, ElementType::Edge, diags);
         if (!idx) return std::unexpected(idx.error());
-        const auto k = ctx.body(p.body)->subShapeKey(kernel::SubShapeKind::Edge, *idx);
-        g.origin = {k[0], k[1], k[2]};
+        auto circle = kernel::circleFromEdge(*ctx.body(p.body), *idx);
+        if (!circle) {
+            if (circle.error().code == ErrorCode::InvalidArgument)
+                return makeError(ErrorCode::InvalidArgument, "point: the referenced edge is not a circle or circular arc");
+            return std::unexpected(circle.error());
+        }
+        g.origin = circle->centre;
+        break;
     }
+    case ConstructionPointParams::Kind::EdgePlane: {
+        auto idx = resolveRef(ctx, p.body, p.ref, ElementType::Edge, diags);
+        if (!idx) return std::unexpected(idx.error());
+        auto plane = resolvePlane(ctx, p.plane, diags);
+        if (!plane) return std::unexpected(plane.error());
+        auto hit = kernel::edgePlaneIntersection(*ctx.body(p.body), *idx, *plane);
+        if (!hit) {
+            const std::string& m = hit.error().message;
+            if (m.find("lies") != std::string::npos)
+                return makeError(ErrorCode::InvalidArgument, "point: the edge lies in the plane (no single intersection point)");
+            if (m.find("does not intersect") != std::string::npos)
+                return makeError(ErrorCode::InvalidArgument, "point: the edge does not intersect the plane");
+            return std::unexpected(hit.error());
+        }
+        if (hit->count > 1)
+            diags.push_back(Diagnostic{Diagnostic::Severity::Warning,
+                                       "point: the edge meets the plane " + std::to_string(hit->count) +
+                                           " times; using the intersection nearest to the edge start",
+                                       p.ref});
+        g.origin = hit->point;
+        break;
+    }
+    }
+    if (!common::finite(g.origin)) return makeError(ErrorCode::KernelFailure, "point: non-finite result");
     return geometryOnly(g, std::move(diags));
 }
 
