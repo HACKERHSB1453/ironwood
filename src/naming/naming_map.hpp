@@ -51,6 +51,10 @@ private:
 /// origin (kernel::stableSubShapeKey).
 /// `partOperandFrom`: pieces of a 1:N split whose every origin is an operand >= this value (a tool body whose elements are
 /// named by role, e.g. the hole tool) are named "<source op>.part" instead of "<opTag>.split" (default: never).
+/// `topologicalSiblings` (F42): rank siblings first by the names of their topological neighbours in `output` (edge ->
+/// adjacent faces, vertex -> incident edges; see kernel::Shape::adjacency), then by the (frame) geometric key. Makes e.g.
+/// the "fillet.new" boundary edges of a fillet rotation-invariant even without a frame. Off by default: it changes
+/// ordinals relative to the purely geometric ranking, so only operations that opted in (fillet, chamfer) use it.
 struct SiblingFrame {
     Vec3 origin{0, 0, 0};
     Vec3 xAxis{1, 0, 0};
@@ -61,6 +65,6 @@ struct SiblingFrame {
 Result<NamingMap> deriveNamingMap(FeatureId feature, std::string_view opTag, const kernel::Shape& output,
                                   const std::vector<const NamingMap*>& inputs,
                                   const kernel::ShapeHistory& history, const SiblingFrame* frame = nullptr,
-                                  std::uint32_t partOperandFrom = UINT32_MAX);
+                                  std::uint32_t partOperandFrom = UINT32_MAX, bool topologicalSiblings = false);
 
 } // namespace iw::naming

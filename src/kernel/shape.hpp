@@ -50,7 +50,8 @@ struct FaceGeometry {
     double radius = 0;
 };
 
-/// Curve description of one edge (F31: edge-type filters, construction references). Units mm.
+/// Curve description of one edge (F31: edge-type filters, construction references; F42: edge direction for naming
+/// frames). Units mm.
 ///  * Line:    `point` = the edge's start point (first parameter of its curve), `direction` = unit direction of the
 ///             curve's parametrisation (start -> end of the edge as stored; the sign is NOT meaningful for naming, since
 ///             the sub-shape ordering ignores orientation). The edge length is subShapeKey()[3].
@@ -59,7 +60,11 @@ struct FaceGeometry {
 ///  * Ellipse: `point` = centre, `direction` = unit axis, `radius` = major radius, `minorRadius` = minor radius.
 ///  * BSpline: B-spline or Bezier curve; only `point` (start point) is filled.
 ///  * Other:   any other curve (hyperbola, parabola, offset, ...) or a degenerate edge; only `point` when available.
-/// Vectors not used by a kind are zero. Pure, thread-safe.
+/// Vectors not used by a kind are zero.
+/// F42 fields, filled for every kind: `start`/`end` and the unit tangents there follow the edge's OWN parameterisation
+/// (its forward direction, ignoring the orientation with which a face uses it), so they are a property of the edge: moving
+/// or rotating the body moves and rotates them with it. `length` = curve length. A degenerate edge (no 3D curve or zero
+/// length, e.g. a cone apex) has `degenerate` = true, zero tangents and `start`/`end` at its vertex. Pure, thread-safe.
 struct EdgeGeometry {
     enum class Kind : std::uint8_t { Line, Circle, Ellipse, BSpline, Other };
     Kind kind = Kind::Other;
@@ -68,6 +73,12 @@ struct EdgeGeometry {
     double radius = 0;
     double minorRadius = 0;
     bool closed = false; ///< Start and end vertex coincide (full circle / ellipse / closed spline).
+    Vec3 start;          ///< F42: point at the first parameter.
+    Vec3 end;            ///< F42: point at the last parameter.
+    Vec3 startTangent;   ///< F42: unit tangent at `start` (zero when degenerate).
+    Vec3 endTangent;     ///< F42: unit tangent at `end` (zero when degenerate).
+    double length = 0;   ///< F42: curve length in mm.
+    bool degenerate = false;
 };
 
 /// Immutable value handle to a B-rep shape. Copies are O(1) and share the underlying (never mutated)
@@ -110,14 +121,32 @@ public:
     /// an out-of-range index.
     FaceGeometry faceGeometry(std::uint32_t index) const;
 
-    /// Curve geometry of edge `index` (ordering contract). Default-constructed (Kind::Other, zeros) for a null shape,
-    /// an out-of-range index or a degenerate edge (no 3D curve).
+    /// Curve geometry of edge `index` (ordering contract). Default-constructed (Kind::Other, zeros) for a null shape or
+    /// an out-of-range index; a degenerate edge (no 3D curve) is Kind::Other with only the F42 `start`/`end`/`degenerate`.
     EdgeGeometry edgeGeometry(std::uint32_t index) const;
 
     /// The solids of this shape, each as its own Shape (unstamped), in first-occurrence order of a depth-first walk
     /// (one entry per unique TShape + Location). A Solid returns {itself}; a compound of solids returns its members;
     /// a shape without solids (shell, face, ...) or a null shape returns {}. Locations are kept (world placement).
     std::vector<Shape> solids() const;
+
+    // ---- Topological adjacency (F42). All indices follow the ordering contract; results are sorted ascending and
+    // ---- unique unless stated otherwise. Out-of-range index or null shape -> empty. Pure, thread-safe.
+
+    /// Faces bounded by edge `edge` (2 for a manifold solid edge; 1 for a seam or a free edge).
+    std::vector<std::uint32_t> edgeFaces(std::uint32_t edge) const;
+    /// Edges bounding face `face` (all wires, seams once).
+    std::vector<std::uint32_t> faceEdges(std::uint32_t face) const;
+    /// Vertices of edge `edge` IN ORDER {start, end} of the edge's own parameterisation (see EdgeGeometry); a closed
+    /// edge (start == end vertex) gives one entry. NOT sorted.
+    std::vector<std::uint32_t> edgeVertices(std::uint32_t edge) const;
+    /// Edges incident to vertex `vertex`.
+    std::vector<std::uint32_t> vertexEdges(std::uint32_t vertex) const;
+    /// Whole adjacency table in one pass (O(size of the shape)): entry i lists the `to` sub-shapes related to `from`
+    /// sub-shape i, where "related" means contains (from = higher dimension, e.g. Face -> Edge) or is contained by
+    /// (from = lower dimension, e.g. Edge -> Face). Each entry is sorted and unique. from == to -> {i} per entry.
+    /// Prefer this over the per-element queries when many elements are visited (each of those is O(size) too).
+    std::vector<std::vector<std::uint32_t>> adjacency(SubShapeKind from, SubShapeKind to) const;
 
     /// Axis-aligned bounding box in mm (may be slightly enlarged by tolerance). Empty for null shape.
     Box3 boundingBox() const;

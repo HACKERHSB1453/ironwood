@@ -2,9 +2,11 @@
 #include "naming/naming_map.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 
@@ -84,7 +86,7 @@ Result<NamingMap> deriveFromCounts(FeatureId feature, std::string_view opTag,
                                    const std::array<std::uint32_t, 3>& counts,
                                    const std::vector<const NamingMap*>& inputs,
                                    const kernel::ShapeHistory& history, const SiblingKeyFn& keyFn,
-                                   std::uint32_t partOperandFrom) {
+                                   std::uint32_t partOperandFrom, const NeighbourFn& neighbours) {
     if (!feature.valid()) return makeError(ErrorCode::InvalidArgument, "deriveNamingMap: invalid feature id");
     if (opTag.empty()) return makeError(ErrorCode::InvalidArgument, "deriveNamingMap: empty op tag");
 
@@ -197,30 +199,62 @@ Result<NamingMap> deriveFromCounts(FeatureId feature, std::string_view opTag,
             byIndex[p.index] = &p.name;
             if (!p.keep) groups[p.name].push_back(p.index);
         }
+        const auto type = static_cast<ElementType>(t);
+        // Orders `members` by ascending geometric key (tolerant lexicographic), kernel index as the final tie-break.
+        auto rankByKey = [&](std::vector<std::uint32_t>& members) {
+            if (members.size() < 2) return;
+            std::vector<std::pair<std::array<double, 4>, std::uint32_t>> keyed;
+            bool allKeyed = static_cast<bool>(keyFn);
+            for (auto idx : members) {
+                std::optional<std::array<double, 4>> k;
+                if (allKeyed) k = keyFn(type, idx);
+                if (!k) allKeyed = false;
+                keyed.push_back({k ? *k : std::array<double, 4>{}, idx});
+            }
+            if (allKeyed)
+                std::sort(keyed.begin(), keyed.end(), [](const auto& a, const auto& b) {
+                    // Lexicographic with a tolerance: keys that differ only by floating-point noise (a translated or
+                    // rotated copy of the same geometry) count as equal and fall through to the next component.
+                    for (std::size_t c = 0; c < 4; ++c) {
+                        const double tol = 1e-7 * (1.0 + std::max(std::abs(a.first[c]), std::abs(b.first[c])));
+                        if (std::abs(a.first[c] - b.first[c]) > tol) return a.first[c] < b.first[c];
+                    }
+                    return a.second < b.second;
+                });
+            else
+                std::sort(keyed.begin(), keyed.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+            for (std::size_t k = 0; k < keyed.size(); ++k) members[k] = keyed[k].second;
+        };
+        // Neighbour names (F42): elements of the next-higher-dimension type are already in `map` (t - 1 done).
+        auto neighbourNames = [&](std::uint32_t idx) {
+            std::vector<ElementName> out;
+            if (!neighbours || t == 0) return out;
+            for (std::uint32_t n : neighbours(type, idx))
+                if (auto nm = map.nameOf(static_cast<ElementType>(t - 1), n)) out.push_back(std::move(*nm));
+            std::sort(out.begin(), out.end());
+            return out;
+        };
         for (auto& [proto, members] : groups) {
-            if (members.size() > 1) {
-                std::vector<std::pair<std::array<double, 4>, std::uint32_t>> keyed;
-                bool allKeyed = static_cast<bool>(keyFn);
-                for (auto idx : members) {
-                    std::optional<std::array<double, 4>> k;
-                    if (allKeyed) k = keyFn(static_cast<ElementType>(t), idx);
-                    if (!k) allKeyed = false;
-                    keyed.push_back({k ? *k : std::array<double, 4>{}, idx});
+            if (members.size() > 1 && neighbours && t > 0) {
+                std::vector<std::pair<std::vector<ElementName>, std::uint32_t>> byNeighbours;
+                for (auto idx : members) byNeighbours.push_back({neighbourNames(idx), idx});
+                std::sort(byNeighbours.begin(), byNeighbours.end());
+                // Re-rank only runs of identical neighbour names by the key; then concatenate.
+                std::vector<std::uint32_t> ordered;
+                for (std::size_t a = 0; a < byNeighbours.size();) {
+                    std::size_t b = a + 1;
+                    while (b < byNeighbours.size() && byNeighbours[b].first == byNeighbours[a].first) ++b;
+                    std::vector<std::uint32_t> run;
+                    for (std::size_t k = a; k < b; ++k) run.push_back(byNeighbours[k].second);
+                    rankByKey(run);
+                    ordered.insert(ordered.end(), run.begin(), run.end());
+                    a = b;
                 }
-                if (allKeyed)
-                    std::sort(keyed.begin(), keyed.end(), [](const auto& a, const auto& b) {
-                        // Lexicographic with a tolerance: keys that differ only by floating-point noise (a translated or
-                        // rotated copy of the same geometry) count as equal and fall through to the next component.
-                        for (std::size_t c = 0; c < 4; ++c) {
-                            const double tol = 1e-7 * (1.0 + std::max(std::abs(a.first[c]), std::abs(b.first[c])));
-                            if (std::abs(a.first[c] - b.first[c]) > tol) return a.first[c] < b.first[c];
-                        }
-                        return a.second < b.second;
-                    });
-                else
-                    std::sort(keyed.begin(), keyed.end(),
-                              [](const auto& a, const auto& b) { return a.second < b.second; });
-                for (std::uint32_t ord = 0; ord < keyed.size(); ++ord) byIndex[keyed[ord].second]->ordinal = ord;
+                for (std::uint32_t ord = 0; ord < ordered.size(); ++ord) byIndex[ordered[ord]]->ordinal = ord;
+            } else if (members.size() > 1) {
+                std::vector<std::uint32_t> ordered = members;
+                rankByKey(ordered);
+                for (std::uint32_t ord = 0; ord < ordered.size(); ++ord) byIndex[ordered[ord]]->ordinal = ord;
             }
         }
         std::set<ElementName> seen;
@@ -240,7 +274,7 @@ Result<NamingMap> deriveFromCounts(FeatureId feature, std::string_view opTag,
 Result<NamingMap> deriveNamingMap(FeatureId feature, std::string_view opTag, const kernel::Shape& output,
                                   const std::vector<const NamingMap*>& inputs,
                                   const kernel::ShapeHistory& history, const SiblingFrame* frame,
-                                  std::uint32_t partOperandFrom) {
+                                  std::uint32_t partOperandFrom, bool topologicalSiblings) {
     if (output.isNull()) return makeError(ErrorCode::InvalidArgument, "deriveNamingMap: null output shape");
     const std::array<std::uint32_t, 3> counts{output.subShapeCount(kernel::SubShapeKind::Face),
                                               output.subShapeCount(kernel::SubShapeKind::Edge),
@@ -255,7 +289,19 @@ Result<NamingMap> deriveNamingMap(FeatureId feature, std::string_view opTag, con
         }
         return std::optional<std::array<double, 4>>(k);
     };
-    return detail::deriveFromCounts(feature, opTag, counts, inputs, history, keyFn, partOperandFrom);
+    detail::NeighbourFn neighbours;
+    if (topologicalSiblings) {
+        // One O(size) pass per table; the lambda only indexes into them.
+        auto tables = std::make_shared<std::array<std::vector<std::vector<std::uint32_t>>, 2>>();
+        (*tables)[0] = output.adjacency(kernel::SubShapeKind::Edge, kernel::SubShapeKind::Face);
+        (*tables)[1] = output.adjacency(kernel::SubShapeKind::Vertex, kernel::SubShapeKind::Edge);
+        neighbours = [tables](ElementType t, std::uint32_t i) -> std::vector<std::uint32_t> {
+            if (t == ElementType::Face) return {};
+            const auto& table = (*tables)[t == ElementType::Edge ? 0 : 1];
+            return i < table.size() ? table[i] : std::vector<std::uint32_t>{};
+        };
+    }
+    return detail::deriveFromCounts(feature, opTag, counts, inputs, history, keyFn, partOperandFrom, neighbours);
 }
 
 } // namespace iw::naming

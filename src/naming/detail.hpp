@@ -21,6 +21,11 @@ namespace iw::naming::detail {
 /// kernel::Shape::subShapeKey. nullopt = unavailable (then the siblings fall back to kernel index order).
 using SiblingKeyFn = std::function<std::optional<std::array<double, 4>>(ElementType, std::uint32_t)>;
 
+/// Topological neighbours of element `index` of `type` in the OUTPUT shape (F42), used to rank siblings by identity instead
+/// of position: an Edge -> its adjacent faces, a Vertex -> its incident edges, a Face -> nothing (empty). Indices of the
+/// next-higher-dimension type, i.e. elements that are named before `type` is ranked.
+using NeighbourFn = std::function<std::vector<std::uint32_t>(ElementType, std::uint32_t)>;
+
 /// Core of deriveNamingMap, driven by sub-shape counts of the output and a sibling key function.
 ///
 /// Sibling ordinals: elements that share (feature, op, type, sources) are ranked by ascending key
@@ -29,10 +34,13 @@ using SiblingKeyFn = std::function<std::optional<std::array<double, 4>>(ElementT
 /// `partOperandFrom`: when every origin of a 1:N split comes from an operand >= this value (a tool body, e.g. the hole tool),
 /// the pieces are named "<source op>.part" (sources=[source]) instead of "<opTag>.split", so they read as roles of the tool. If `keyFn` is empty
 /// or returns nullopt for any sibling of a group, that whole group is ranked by kernel index instead.
+/// `neighbours` (F42, optional): when set, siblings are ranked FIRST by the sorted names of their neighbours (faces are
+/// named before edges, edges before vertices), and only siblings with identical neighbour names fall back to the key /
+/// kernel-index order above. Names of neighbours do not depend on placement, so these ordinals are rotation-invariant.
 Result<NamingMap> deriveFromCounts(FeatureId feature, std::string_view opTag,
                                    const std::array<std::uint32_t, 3>& counts,
                                    const std::vector<const NamingMap*>& inputs,
                                    const kernel::ShapeHistory& history, const SiblingKeyFn& keyFn,
-                                   std::uint32_t partOperandFrom = UINT32_MAX);
+                                   std::uint32_t partOperandFrom = UINT32_MAX, const NeighbourFn& neighbours = {});
 
 } // namespace iw::naming::detail

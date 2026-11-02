@@ -2,6 +2,8 @@
 #include "features/edge_features.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <optional>
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -9,6 +11,7 @@
 #include "core/expr.hpp"
 #include "features/feature_json.hpp"
 #include "kernel/ops.hpp"
+#include "naming/naming_map.hpp"
 
 namespace iw::features {
 namespace {
@@ -42,20 +45,88 @@ json edgesToJson(const std::vector<naming::ElementRef>& edges) {
 }
 
 /// Resolves the references to unique edge indices of the body at this position; optionally expands tangent chains.
+/// `anchor` receives the index of the FIRST reference (a name-stable choice, used for the sibling frame).
 Result<std::vector<std::uint32_t>> selectEdges(const EvalContext& ctx, BodyId body, const std::vector<naming::ElementRef>& refs,
-                                               bool chain, std::vector<Diagnostic>& diags) {
+                                               bool chain, std::vector<Diagnostic>& diags, std::uint32_t& anchor) {
     std::vector<std::uint32_t> idx;
     for (const auto& r : refs) {
         auto i = resolveRef(ctx, body, r, ElementType::Edge, diags);
         if (!i) return std::unexpected(i.error());
         idx.push_back(*i);
     }
+    anchor = idx.front();
     std::sort(idx.begin(), idx.end());
     idx.erase(std::unique(idx.begin(), idx.end()), idx.end());
     if (!chain) return idx;
     auto expanded = kernel::tangentChain(*ctx.body(body), idx, ctx.cancel);
     if (!expanded) return std::unexpected(expanded.error());
     return *expanded;
+}
+
+/// Unit component of `v` perpendicular to unit `x`, or nullopt when `v` is (nearly) parallel to `x` or zero.
+std::optional<Vec3> perpendicularPart(const Vec3& v, const Vec3& x) {
+    const Vec3 p = v - x * dot(v, x);
+    const double len = length(p);
+    if (!(len > 1e-6 * std::max(1.0, length(v)))) return std::nullopt;
+    return p * (1.0 / len);
+}
+
+/// F42: sibling frame attached to the anchor edge of the selection, so that sibling ordinals of the result do not change
+/// when the body is moved OR rotated. Origin = the edge's start point, x = its start tangent (both from the edge's own
+/// parameterisation, kernel::EdgeGeometry), z = the part of an adjacent face's normal (or axis) perpendicular to x; the
+/// adjacent faces are tried in NAME order so the choice does not depend on kernel indices. Curved edges without a usable
+/// face fall back to the circle axis / end tangent. nullopt (world keys) when no frame can be built (degenerate edge).
+std::optional<naming::SiblingFrame> edgeFrame(const kernel::Shape& shape, const naming::NamingMap* names, std::uint32_t edge) {
+    const kernel::EdgeGeometry g = shape.edgeGeometry(edge);
+    if (g.degenerate || length(g.startTangent) < 0.5) return std::nullopt;
+    const Vec3 x = g.startTangent;
+    std::vector<std::pair<std::optional<naming::ElementName>, std::uint32_t>> faces;
+    for (std::uint32_t f : shape.edgeFaces(edge)) faces.push_back({names ? names->nameOf(ElementType::Face, f) : std::nullopt, f});
+    std::sort(faces.begin(), faces.end());
+    std::optional<Vec3> z;
+    for (const auto& [name, f] : faces) {
+        const kernel::FaceGeometry fg = shape.faceGeometry(f);
+        if (fg.kind == kernel::FaceGeometry::Kind::Plane) z = perpendicularPart(fg.normal, x);
+        else if (fg.kind != kernel::FaceGeometry::Kind::Other) z = perpendicularPart(fg.direction, x);
+        if (z) break;
+    }
+    if (!z && g.kind == kernel::EdgeGeometry::Kind::Circle) z = perpendicularPart(g.direction, x);
+    if (!z) z = perpendicularPart(g.endTangent, x);
+    if (!z) return std::nullopt;
+    naming::SiblingFrame frame;
+    frame.origin = g.start;
+    frame.xAxis = x;
+    frame.zAxis = *z;
+    frame.yAxis = cross(*z, x);
+    return frame;
+}
+
+/// Names the result of a fillet / chamfer of `body` (as common::modifyBody for a one-operand operation), with sibling
+/// ordinals ranked by topological neighbours first and then in the anchor edge's frame (F42).
+Result<FeatureResult> finishEdgeOp(FeatureId feature, BodyId body, const EvalContext& ctx, const kernel::ShapeResult& result,
+                                   std::string_view opTag, std::uint32_t anchor, std::vector<Diagnostic> diags) {
+    const kernel::Shape* input = ctx.body(body);
+    const naming::NamingMap* inputNaming = ctx.naming(body);
+    if (!input || !inputNaming) return makeError(ErrorCode::NotFound, "body " + std::to_string(body.value()) + " does not exist at this position");
+    if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "feature cancelled");
+    kernel::ShapeHistory own; // operand 0 only (the body); other operands carry no names here
+    for (const auto& [in, out] : result.history.generated)
+        if (in.operand == 0) own.generated.insert({in, out});
+    for (const auto& [in, out] : result.history.modified)
+        if (in.operand == 0) own.modified.insert({in, out});
+    for (const auto& [in, out] : result.history.unchanged)
+        if (in.operand == 0) own.unchanged.insert({in, out});
+    for (const auto& in : result.history.deleted)
+        if (in.operand == 0) own.deleted.insert(in);
+    const auto frame = edgeFrame(*input, inputNaming, anchor);
+    auto names = naming::deriveNamingMap(feature, opTag, result.shape, {inputNaming}, own, frame ? &*frame : nullptr, UINT32_MAX,
+                                         /*topologicalSiblings=*/true);
+    if (!names) return std::unexpected(names.error());
+    FeatureResult out;
+    out.diagnostics = std::move(diags);
+    out.bodies.emplace(body, result.shape);
+    out.namings.emplace(body, std::move(*names));
+    return out;
 }
 
 Result<double> positiveLength(const EvalContext& ctx, const std::string& text, const char* what) {
@@ -122,11 +193,12 @@ Result<FeatureResult> FilletFeature::compute(const EvalContext& ctx) const {
     auto radius = positiveLength(ctx, params_.radius, "fillet radius");
     if (!radius) return std::unexpected(radius.error());
     std::vector<Diagnostic> diags;
-    auto idx = selectEdges(ctx, params_.body, params_.edges, params_.tangentChain, diags);
+    std::uint32_t anchor = 0;
+    auto idx = selectEdges(ctx, params_.body, params_.edges, params_.tangentChain, diags, anchor);
     if (!idx) return std::unexpected(idx.error());
     auto result = kernel::filletEdges(*ctx.body(params_.body), *idx, *radius, ctx.cancel);
     if (!result) return std::unexpected(result.error());
-    return common::modifyBody(id_, params_.body, ctx, *result, "fillet", std::move(diags));
+    return finishEdgeOp(id_, params_.body, ctx, *result, "fillet", anchor, std::move(diags));
 }
 
 // ---- chamfer ---------------------------------------------------------------------------------------------------
@@ -191,7 +263,8 @@ Result<FeatureResult> ChamferFeature::compute(const EvalContext& ctx) const {
     if (params_.edges.empty()) return makeError(ErrorCode::InvalidArgument, "chamfer: no edges selected");
     if (!ctx.body(params_.body)) return makeError(ErrorCode::NotFound, "chamfer: body does not exist at this position");
     std::vector<Diagnostic> diags;
-    auto idx = selectEdges(ctx, params_.body, params_.edges, params_.tangentChain, diags);
+    std::uint32_t anchor = 0;
+    auto idx = selectEdges(ctx, params_.body, params_.edges, params_.tangentChain, diags, anchor);
     if (!idx) return std::unexpected(idx.error());
     const kernel::Shape& shape = *ctx.body(params_.body);
 
@@ -221,7 +294,7 @@ Result<FeatureResult> ChamferFeature::compute(const EvalContext& ctx) const {
     }
     }
     if (!result) return std::unexpected(result.error());
-    return common::modifyBody(id_, params_.body, ctx, *result, "chamfer", std::move(diags));
+    return finishEdgeOp(id_, params_.body, ctx, *result, "chamfer", anchor, std::move(diags));
 }
 
 void registerEdgeFeatures(recompute::FeatureRegistry& registry) {
