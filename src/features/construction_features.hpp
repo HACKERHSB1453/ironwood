@@ -30,34 +30,54 @@ struct PlaneRef {
 ///  * ThreePoints:  through three points (each a triple of length expressions), normal = (b-a) x (c-a).
 ///  * AngleAxis:    `base` orientation rotated by `angle` about the construction axis `axis`; the plane passes through
 ///                  the axis origin. [VERIFY Fusion's exact anchor for the angle plane]
+///  * Tangent (F26): tangent to the cylindrical or conical face `base` (must be a face reference, `isFace`) along the
+///                  surface ruling at `angle` (expression) around the face's axis. Angle convention (see
+///                  kernel::tangentPlaneOnFace): axis k = the surface axis flipped so its largest component is
+///                  positive; reference direction r = the world axis least aligned with k, projected perpendicular to
+///                  k; the ruling is at radial direction cos(angle) r + sin(angle) (k x r), i.e. counter-clockwise
+///                  about k from r. E.g. for a Z-axis cylinder 0 deg touches the +X side, 90 deg the +Y side. The
+///                  normal points away from the axis; xDir runs along the ruling.
 struct ConstructionPlaneParams {
-    enum class Kind { Offset, MidPlane, ThreePoints, AngleAxis };
+    enum class Kind { Offset, MidPlane, ThreePoints, AngleAxis, Tangent };
     Kind kind = Kind::Offset;
-    PlaneRef base;   ///< Offset, AngleAxis
+    PlaneRef base;   ///< Offset, AngleAxis; Tangent: the cylindrical/conical face (isFace = true)
     PlaneRef other;  ///< MidPlane
     std::string distance = "10 mm";
     std::array<std::array<std::string, 3>, 3> points{};
     FeatureId axis;  ///< AngleAxis: id of an Axis construction feature.
-    std::string angle = "45 deg";
+    std::string angle = "45 deg"; ///< AngleAxis, Tangent
 };
 
-/// Construction axis (B1): through a cylinder/cone face, through two points (expressions), or along a linear edge.
+/// Construction axis (B1): through a cylinder/cone face, through two points (expressions), along a linear edge, or
+/// (F26) TwoPlanes: the intersection line of `planeA` and `planeB` (planar faces or Plane construction features).
+/// TwoPlanes: direction = normalised(nA x nB), origin = the line's point closest to the world origin; parallel planes
+/// fail with InvalidArgument ("planes are parallel").
 struct ConstructionAxisParams {
-    enum class Kind { Cylinder, TwoPoints, Edge };
+    enum class Kind { Cylinder, TwoPoints, Edge, TwoPlanes };
     Kind kind = Kind::TwoPoints;
     BodyId body;
     naming::ElementRef ref; ///< Cylinder: face; Edge: edge.
     std::array<std::string, 3> a{"0 mm", "0 mm", "0 mm"};
     std::array<std::string, 3> b{"0 mm", "0 mm", "10 mm"};
+    PlaneRef planeA; ///< TwoPlanes
+    PlaneRef planeB; ///< TwoPlanes
 };
 
-/// Construction point (B1): a vertex, or the centre of a circular edge (centre of mass of a full circle; partial arcs
-/// are NOT validated and give the arc's centroid [limitation]).
+/// Construction point (B1):
+///  * Vertex:       the vertex `ref`.
+///  * CircleCentre: the centre of the circular edge `ref` (full circle or arc: the circle's centre, not the arc's
+///                  centroid). Any non-circular edge fails with InvalidArgument (F26).
+///  * EdgePlane (F26): intersection of the edge `ref` (line, arc, B-spline, ...) with `plane` (a planar face or a Plane
+///                  construction feature; the plane is infinite, the edge is bounded). No intersection, or the edge
+///                  lying in the plane, fails with InvalidArgument. With several intersections the one nearest to the
+///                  edge's start (along the edge, honouring its orientation) is used and a Warning diagnostic reports
+///                  the count.
 struct ConstructionPointParams {
-    enum class Kind { Vertex, CircleCentre };
+    enum class Kind { Vertex, CircleCentre, EdgePlane };
     Kind kind = Kind::Vertex;
     BodyId body;
     naming::ElementRef ref;
+    PlaneRef plane; ///< EdgePlane
 };
 
 class ConstructionPlaneFeature final : public recompute::Feature {
@@ -110,8 +130,8 @@ public:
     /// Parameters as last set (edit them through Document::editConstruction*).
     const ConstructionPointParams& params() const noexcept { return params_; }
     std::string_view kind() const override { return "point"; }
-    std::vector<naming::ElementRef> explicitRefs() const override { return {params_.ref}; }
-    std::vector<BodyId> readsBodies() const override { return {params_.body}; }
+    std::vector<naming::ElementRef> explicitRefs() const override;
+    std::vector<BodyId> readsBodies() const override;
     std::vector<BodyId> writesBodies() const override { return {}; }
     std::uint64_t paramHash() const override;
     std::string paramsJson() const override;
