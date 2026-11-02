@@ -19,8 +19,10 @@ public:
     /// Performs (or re-performs, for redo) the edit. On failure it must leave the document unchanged and
     /// return an Error; the stack then does not record the command.
     virtual Result<void> execute() = 0;
-    /// Reverts exactly what `execute()` did. Must not fail for a command that executed successfully.
-    virtual void undo() = 0;
+    /// Reverts exactly what `execute()` did. Must not fail for a command that executed successfully; it is
+    /// `noexcept`, so an escaping exception terminates instead of leaving the stack half-undone.
+    /// (There is no separate redo hook: redo re-runs `execute()`, which may fail and reports via Result.)
+    virtual void undo() noexcept = 0;
     /// Human-readable label for the Edit menu ("Move Feature", ...). Already translated.
     virtual std::string text() const = 0;
 

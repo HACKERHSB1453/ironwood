@@ -3,9 +3,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "core/cancel.hpp"
@@ -64,7 +68,7 @@ struct AddCmd : Command {
         v_ += d_;
         return {};
     }
-    void undo() override { v_ -= d_; }
+    void undo() noexcept override { v_ -= d_; }
     std::string text() const override { return "add " + std::to_string(d_); }
     int mergeId() const override { return mergeable_ ? 7 : -1; }
     bool mergeWith(const Command& n) override {
@@ -77,10 +81,13 @@ struct AddCmd : Command {
 };
 struct FailCmd : Command {
     Result<void> execute() override { return makeError(ErrorCode::Internal, "no"); }
-    void undo() override {}
+    void undo() noexcept override {}
     std::string text() const override { return "fail"; }
 };
 } // namespace
+
+// F14 / review N2: undo() "must not fail" is part of the type, so every override must be noexcept too.
+static_assert(noexcept(std::declval<Command&>().undo()));
 
 TEST(UndoStack, PushUndoRedo) {
     int v = 0;
@@ -306,4 +313,81 @@ TEST(LatestWins, ThousandRapidSubmitsEndWithNewest) {
             EXPECT_EQ(r.error().code, ErrorCode::Cancelled);
         }
     }
+}
+
+// F14 / review R5 regression: LatestWins::submit must NOT hold its mutex while handing the job to JobSystem
+// (JobSystem may run it inline on a posting failure, so a job touching the LatestWins would self-deadlock).
+// The callable is moved/copied inside JobSystem::submit, i.e. exactly where the old code held the lock, so a
+// probe in its move/copy constructor observes the lock state. The probe asks ANOTHER thread to use the
+// LatestWins and waits with a timeout: with the old inline-under-lock code that thread blocks until submit
+// returns, the timeout fires and the test fails (instead of deadlocking the test binary).
+namespace {
+struct LatestWinsProbe {
+    std::function<void()> onFirstTransfer; ///< run once, on the first move/copy of the callable
+    int value = 0;
+
+    LatestWinsProbe(std::function<void()> fn, int v) : onFirstTransfer(std::move(fn)), value(v) {}
+    LatestWinsProbe(LatestWinsProbe&& o) noexcept : onFirstTransfer(std::move(o.onFirstTransfer)), value(o.value) {
+        fire();
+    }
+    LatestWinsProbe(const LatestWinsProbe& o) : onFirstTransfer(o.onFirstTransfer), value(o.value) { fire(); }
+    LatestWinsProbe& operator=(const LatestWinsProbe&) = delete;
+    LatestWinsProbe& operator=(LatestWinsProbe&&) = delete;
+    ~LatestWinsProbe() = default;
+
+    void fire() {
+        if (auto fn = std::exchange(onFirstTransfer, nullptr)) fn();
+    }
+    Result<int> operator()(CancelToken) const { return value; }
+};
+} // namespace
+
+TEST(LatestWins, SubmitDoesNotHoldLockWhileHandingOffJob) {
+    JobSystem js(2);
+    LatestWins<int> lw(js);
+    std::future<bool> other; // outlives the probe so its destructor never blocks inside submit
+    bool reachedProbe = false;
+    bool otherThreadGotLock = false;
+    LatestWinsProbe probe(
+        [&] {
+            reachedProbe = true;
+            other = std::async(std::launch::async, [&lw] {
+                (void)lw.latest(); // takes LatestWins' mutex
+                lw.cancel();       // ditto
+                return true;
+            });
+            otherThreadGotLock = other.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        },
+        1);
+    auto h = lw.submit(Priority::High, std::move(probe));
+    ASSERT_TRUE(reachedProbe);
+    EXPECT_TRUE(otherThreadGotLock) << "LatestWins::submit held its mutex while submitting to JobSystem";
+    other.wait();
+    EXPECT_EQ(*h.wait(), 1);
+}
+
+// R5 ticketed swap: a submit that started first but finishes handing off after a newer submit must be cancelled
+// and must not replace the newer job as latest().
+TEST(LatestWins, OlderSlowSubmitLosesToNewerOne) {
+    JobSystem js(2);
+    LatestWins<int> lw(js);
+    std::future<JobHandle<int>> newer;
+    LatestWinsProbe older(
+        [&] {
+            // Runs after `older` took its ticket but before it is installed: a concurrent, newer submit completes.
+            newer = std::async(std::launch::async, [&lw] {
+                return lw.submit(Priority::High, [](CancelToken) -> Result<int> { return 2; });
+            });
+            ASSERT_EQ(newer.wait_for(std::chrono::seconds(5)), std::future_status::ready)
+                << "concurrent submit blocked: LatestWins::submit held its mutex while submitting";
+        },
+        1);
+    JobHandle<int> olderHandle = lw.submit(Priority::High, std::move(older));
+    JobHandle<int> newerHandle = newer.get();
+    EXPECT_TRUE(olderHandle.cancelRequested()) << "the superseded (older-ticket) job must be cancelled";
+    EXPECT_FALSE(newerHandle.cancelRequested());
+    js.waitAll();
+    ASSERT_TRUE(lw.latest().valid());
+    EXPECT_EQ(*lw.latest().wait(), 2);
+    EXPECT_FALSE(lw.latest().cancelRequested());
 }

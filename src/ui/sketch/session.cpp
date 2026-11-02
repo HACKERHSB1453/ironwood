@@ -49,7 +49,7 @@ public:
         *drivenTarget_ = after_->driven;
         return {};
     }
-    void undo() override {
+    void undo() noexcept override {
         *target_ = before_->sketch;
         *drivenTarget_ = before_->driven;
     }
