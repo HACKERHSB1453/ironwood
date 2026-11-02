@@ -124,8 +124,10 @@ public:
     bool isClean() const noexcept { return undo_.isClean(); }
 
     // ---- evaluation ----
-    /// Evaluates the active timeline. Sketch references of Extrude / Revolve are resolved here: each sketch feature is
-    /// solved against the state before it, and the dependent feature receives the solved sketch. Errors: Cancelled.
+    /// Evaluates the active timeline in one evaluator pass. Each sketch feature is solved against the state before it and
+    /// publishes the solved sketch on the recompute sketch channel; Extrude / Revolve / Hole sketch references read it
+    /// from there (F30). Unchanged prefixes (sketches included) are served from the evaluator's cache, and a sketch that
+    /// must be recomputed reuses its memoised solve when its plane and used parameters are unchanged. Errors: Cancelled.
     Result<DocumentEvaluation> evaluate(CancelToken cancel = {});
 
     // ---- persistence ----

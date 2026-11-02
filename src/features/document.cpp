@@ -551,56 +551,20 @@ Result<DocumentEvaluation> Document::evaluate(CancelToken cancel) {
     const std::size_t marker = tl.rollbackMarker();
     DocumentEvaluation out;
 
-    // Pass 1: build the timeline the evaluator sees. A sketch feature is solved against the state before it; features
-    // that reference a sketch get an embedded copy of the solved sketch. Positions are processed in order, so a
-    // reference can only see an earlier sketch.
-    recompute::Timeline resolved;
-    for (std::size_t k = 0; k < tl.size(); ++k) {
-        const std::shared_ptr<const Feature>& f = tl.at(k);
-        const bool suppressed = tl.isSuppressed(f->id());
-        const bool active = k < marker && !suppressed;
-
-        if (active) {
-            if (const auto* sf = dynamic_cast<const SketchFeature*>(f.get())) {
-                auto before = evaluator_.evaluate(resolved, &data_.parameters, cancel);
-                if (!before) return std::unexpected(before.error());
-                std::map<FeatureId, recompute::ConstructionGeometry> cons;
-                for (const auto& s : before->statuses)
-                    if (s.state == FeatureStatus::State::Ok && s.construction) cons.emplace(s.id, *s.construction);
-                recompute::EvalContext ctx{before->bodies, before->namings, cancel, &data_.parameters, &cons};
-                auto sol = sf->solve(ctx);
-                if (!sol) {
-                    if (sol.error().code == ErrorCode::Cancelled) return std::unexpected(sol.error());
-                    // A failed solve is reported by the feature's own status; dependents then see no profile.
-                } else {
-                    out.sketches.insert_or_assign(f->id(), std::move(*sol));
-                }
-            }
-        }
-
-        std::shared_ptr<const Feature> entry = f;
-        if (active) {
-            if (auto ref = sketchReferenceOf(*f)) {
-                auto it = out.sketches.find(*ref);
-                if (it != out.sketches.end())
-                    if (auto emb = embedSketchReference(*f, it->second.sketch)) entry = std::move(emb);
-            }
-        }
-        resolved.append(std::move(entry));
-        if (suppressed) resolved.setSuppressed(f->id(), true);
-    }
-    if (marker < tl.size()) resolved.setRollbackMarker(marker);
-
-    // Pass 2: evaluate the resolved timeline (prefix reuse through the evaluator's cache).
-    auto res = evaluator_.evaluate(resolved, &data_.parameters, cancel);
+    // One pass (F30): sketch features publish their solved sketch on the recompute sketch channel and the features that
+    // reference a sketch read it from there, so the evaluator's prefix cache covers sketches like any other feature.
+    auto res = evaluator_.evaluate(tl, &data_.parameters, cancel);
     if (!res) return std::unexpected(res.error());
     out.statuses = std::move(res->statuses);
     out.bodies = std::move(res->bodies);
     out.namings = std::move(res->namings);
     out.computedCount = res->computedCount;
     out.reusedCount = res->reusedCount;
-    for (const FeatureStatus& s : out.statuses)
-        if (s.state == FeatureStatus::State::Ok && s.construction) out.construction.emplace(s.id, *s.construction);
+    for (const FeatureStatus& s : out.statuses) {
+        if (s.state != FeatureStatus::State::Ok) continue;
+        if (s.construction) out.construction.emplace(s.id, *s.construction);
+        if (const auto* solved = dynamic_cast<const SolvedSketchOutput*>(s.sketch.get())) out.sketches.insert_or_assign(s.id, solved->solution);
+    }
 
     // Features after the rollback marker are not evaluated; still report one status per feature.
     for (std::size_t k = marker; k < tl.size(); ++k) {

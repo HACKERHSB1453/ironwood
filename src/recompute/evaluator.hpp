@@ -24,6 +24,8 @@ struct FeatureStatus {
     std::optional<ConstructionGeometry> construction;
     /// Non-geometric attributes published by the feature (FeatureResult::attributes), when Ok.
     std::map<std::string, std::string> attributes;
+    /// Sketch output published by this feature (FeatureResult::sketch), when Ok. Shared with the evaluator's cache.
+    std::shared_ptr<const SketchOutput> sketch;
 };
 
 /// Model state at the evaluated timeline position.

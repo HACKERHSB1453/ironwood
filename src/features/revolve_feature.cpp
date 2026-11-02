@@ -10,6 +10,7 @@
 
 #include "core/expr.hpp"
 #include "features/feature_json.hpp"
+#include "features/sketch_feature.hpp"
 #include "features/sketch_json.hpp"
 #include "kernel/internal/profile_support.hpp"
 #include "kernel/ops.hpp"
@@ -141,7 +142,16 @@ struct Profile {
     naming::NamingMap naming;
 };
 
-Result<Profile> buildProfile(FeatureId id, const std::variant<PolygonSource, SketchSource, SketchReferenceSource>& src, std::vector<Diagnostic>& diags) {
+/// Sketch the profile comes from: embedded (SketchSource) or published by an earlier SketchFeature on the recompute
+/// sketch channel (SketchReferenceSource, F30; its profiles are already detected). Empty for a polygon source.
+struct SketchInput {
+    const sketch::Sketch* sketch = nullptr;
+    const std::string* profile = nullptr;
+    const std::vector<sketch::SketchProfile>* profiles = nullptr; ///< nullptr: detect them here.
+};
+
+Result<Profile> buildProfile(FeatureId id, const std::variant<PolygonSource, SketchSource, SketchReferenceSource>& src, const SketchInput& in,
+                             std::vector<Diagnostic>& diags) {
     if (const auto* poly = std::get_if<PolygonSource>(&src)) {
         if (poly->points.size() < 3) return makeError(ErrorCode::InvalidArgument, "revolve: profile needs >= 3 points");
         if (!common::finite(poly->planeOrigin) || !common::finite(poly->planeNormal) || !common::finite(poly->planeXDir))
@@ -161,19 +171,22 @@ Result<Profile> buildProfile(FeatureId id, const std::variant<PolygonSource, Ske
         if (!names) return std::unexpected(names.error());
         return Profile{*face, std::move(*names)};
     }
-    if (std::holds_alternative<SketchReferenceSource>(src))
-        return makeError(ErrorCode::NotFound, "revolve: sketch feature " + std::to_string(std::get<SketchReferenceSource>(src).sketch.value()) +
-                                                  " has no solved profile at this position (suppressed, failed, or not earlier on the timeline)");
-    const auto& sk = std::get<SketchSource>(src);
-    auto profiles = sketch::detectProfiles(sk.sketch);
-    if (!profiles) return std::unexpected(profiles.error());
+    if (!in.sketch) return makeError(ErrorCode::Internal, "revolve: sketch profile input not resolved");
+    std::vector<sketch::SketchProfile> detected;
+    const std::vector<sketch::SketchProfile>* profiles = in.profiles;
+    if (!profiles) {
+        auto d = sketch::detectProfiles(*in.sketch);
+        if (!d) return std::unexpected(d.error());
+        detected = std::move(*d);
+        profiles = &detected;
+    }
     const sketch::SketchProfile* prof = nullptr;
     for (const auto& pr : *profiles)
-        if (pr.name == sk.profile) prof = &pr;
-    if (!prof) return makeError(ErrorCode::NotFound, "revolve: sketch has no profile '" + sk.profile + "'");
-    auto face = sketch::profileFace(sk.sketch.plane(), *prof);
+        if (pr.name == *in.profile) prof = &pr;
+    if (!prof) return makeError(ErrorCode::NotFound, "revolve: sketch has no profile '" + *in.profile + "'");
+    auto face = sketch::profileFace(in.sketch->plane(), *prof);
     if (!face) return std::unexpected(face.error());
-    auto names = common::sketchProfileNaming(id, *face, *prof, sk.sketch.plane(), diags);
+    auto names = common::sketchProfileNaming(id, *face, *prof, in.sketch->plane(), diags);
     if (!names) return std::unexpected(names.error());
     return Profile{*face, std::move(*names)};
 }
@@ -279,9 +292,16 @@ Result<std::shared_ptr<recompute::Feature>> RevolveFeature::fromJson(FeatureId i
 Result<FeatureResult> RevolveFeature::compute(const EvalContext& ctx) const {
     const RevolveParams& p = params_;
     if (!p.body.valid()) return makeError(ErrorCode::InvalidArgument, "revolve: invalid body id");
-    if (std::holds_alternative<SketchReferenceSource>(p.source))
-        return makeError(ErrorCode::NotFound, "revolve: sketch feature " + std::to_string(std::get<SketchReferenceSource>(p.source).sketch.value()) +
-                                                  " has no solved profile at this position (suppressed, failed, or not earlier on the timeline)");
+    SketchInput skIn;
+    if (const auto* ref = std::get_if<SketchReferenceSource>(&p.source)) {
+        const SketchSolution* sol = solvedSketchAt(ctx, ref->sketch);
+        if (!sol)
+            return makeError(ErrorCode::NotFound, "revolve: sketch feature " + std::to_string(ref->sketch.value()) +
+                                                      " has no solved profile at this position (suppressed, failed, or not earlier on the timeline)");
+        skIn = {&sol->sketch, &ref->profile, &sol->profiles};
+    } else if (const auto* s = std::get_if<SketchSource>(&p.source)) {
+        skIn = {&s->sketch, &s->profile, nullptr};
+    }
     if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "revolve cancelled");
 
     // Angles: total sweep and the rotation that places the profile at the start of the sweep.
@@ -311,13 +331,13 @@ Result<FeatureResult> RevolveFeature::compute(const EvalContext& ctx) const {
     kernel::Axis axis;
     switch (p.axis.kind) {
     case RevolveAxis::Kind::SketchLine: {
-        const auto* sk = std::get_if<SketchSource>(&p.source);
+        const sketch::Sketch* sk = skIn.sketch;
         if (!sk) return makeError(ErrorCode::InvalidArgument, "revolve: a sketch line axis needs a sketch profile");
-        const sketch::SketchEntity* ent = sk->sketch.findEntity(p.axis.line);
+        const sketch::SketchEntity* ent = sk->findEntity(p.axis.line);
         if (!ent) return makeError(ErrorCode::NotFound, "revolve: axis sketch line does not exist");
         const auto* line = std::get_if<sketch::LineGeom>(&ent->geometry);
         if (!line) return makeError(ErrorCode::InvalidArgument, "revolve: axis entity is not a line");
-        auto a = kernel::axisFromPoints(sk->sketch.plane().toWorld(line->start), sk->sketch.plane().toWorld(line->end));
+        auto a = kernel::axisFromPoints(sk->plane().toWorld(line->start), sk->plane().toWorld(line->end));
         if (!a) return std::unexpected(a.error());
         axis = *a;
         break;
@@ -339,7 +359,7 @@ Result<FeatureResult> RevolveFeature::compute(const EvalContext& ctx) const {
     }
     }
 
-    auto profile = buildProfile(id_, p.source, diags);
+    auto profile = buildProfile(id_, p.source, skIn, diags);
     if (!profile) return std::unexpected(profile.error());
     kernel::Shape face = profile->face;
     if (std::abs(offset) > 1e-15) {

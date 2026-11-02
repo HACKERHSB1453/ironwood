@@ -2,6 +2,8 @@
 #include "features/sketch_feature.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -126,7 +128,77 @@ std::uint64_t hashOf(std::string_view tag, const std::string& text) {
     return f.h;
 }
 
+/// Solver runs of SketchFeature::solve (sketchSolverRuns()).
+std::atomic<std::uint64_t> gSolverRuns{0};
+
+/// Solves memoised per SketchFeature instance: enough for undo / redo toggles and a few alternating parameter values.
+constexpr std::size_t kSolveCacheSize = 4;
+
+/// Hashes the object representation of `v` (bit-exact: any change of a value is a cache miss).
+template <class T>
+void hashRaw(common::Fnv& f, const T& v) {
+    f.bytes(std::string_view(reinterpret_cast<const char*>(&v), sizeof v));
+}
+
+void hashDoubles(common::Fnv& f, std::initializer_list<double> values) {
+    for (double v : values) hashRaw(f, v);
+}
+
+/// Driving dimensions solved, driven dimensions measured, profiles detected: everything after the plane resolution.
+/// Diagnostics hold only what the solve itself reports.
+Result<SketchSolution> solveWork(sketch::Sketch work, const EvalContext& ctx) {
+    std::vector<Diagnostic> diags;
+    // Driven (reference) dimensions are measured, never solved: the solver works on a copy without them, and the
+    // solved geometry is then combined with the full record set again.
+    auto driving = buildSketch(work, work, false);
+    if (!driving) return std::unexpected(driving.error());
+    gSolverRuns.fetch_add(1, std::memory_order_relaxed);
+    const sketch::SketchSolveReport rep = sketch::solveSketch(*driving, ctx.params);
+    if (rep.status == sketch::SolverStatus::InvalidInput)
+        return makeError(ErrorCode::InvalidArgument, "sketch: " + rep.message);
+    if (rep.status == sketch::SolverStatus::Failed) return makeError(ErrorCode::InvalidArgument, failureMessage(rep));
+    if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "sketch cancelled");
+    auto solvedWork = buildSketch(*driving, work, true);
+    if (!solvedWork) return std::unexpected(solvedWork.error());
+    work = std::move(*solvedWork);
+    std::map<sketch::SketchDimensionId, double> driven;
+    for (const auto& [id, d] : work.dimensions()) {
+        if (!d.driven) continue;
+        auto m = work.measureDimension(id);
+        if (m) driven.emplace(id, *m);
+        else diags.push_back({Diagnostic::Severity::Warning, "driven dimension " + std::to_string(id.value()) + " cannot be measured: " + m.error().message, std::nullopt});
+    }
+
+    for (auto c : rep.redundantConstraints)
+        diags.push_back({Diagnostic::Severity::Warning, "constraint " + std::to_string(c.value()) + " is redundant", std::nullopt});
+    for (auto d : rep.redundantDimensions)
+        diags.push_back({Diagnostic::Severity::Warning, "dimension " + std::to_string(d.value()) + " is redundant", std::nullopt});
+
+    auto profiles = sketch::detectProfiles(work);
+    if (!profiles) return std::unexpected(profiles.error());
+    return SketchSolution{std::move(work), std::move(*profiles), rep, std::move(diags), std::move(driven)};
+}
+
 } // namespace
+
+// ---- SketchFeature ----------------------------------------------------------------------------------------------
+
+/// Most recently used last. Entries are immutable and shared with the evaluator's cached states.
+struct SketchFeature::SolveCache {
+    std::mutex mutex;
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<const SolvedSketchOutput>>> entries;
+};
+
+SketchFeature::SketchFeature(FeatureId id, SketchFeatureParams params)
+    : id_(id), params_(std::move(params)), cache_(std::make_shared<SolveCache>()) {
+    paramHash_ = hashOf("sketch/v1:", paramsJson());
+    for (const auto& [did, dim] : params_.sketch.dimensions()) {
+        auto r = common::referencesOf(dim.expression);
+        paramRefs_.insert(paramRefs_.end(), r.begin(), r.end());
+    }
+    std::sort(paramRefs_.begin(), paramRefs_.end());
+    paramRefs_.erase(std::unique(paramRefs_.begin(), paramRefs_.end()), paramRefs_.end());
+}
 
 // ---- SketchFeature ----------------------------------------------------------------------------------------------
 
@@ -135,23 +207,14 @@ std::vector<naming::ElementRef> SketchFeature::explicitRefs() const {
     return {};
 }
 
-std::vector<std::string> SketchFeature::parameterReferences() const {
-    std::vector<std::string> out;
-    for (const auto& [id, dim] : params_.sketch.dimensions()) {
-        auto r = common::referencesOf(dim.expression);
-        out.insert(out.end(), r.begin(), r.end());
-    }
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end()), out.end());
-    return out;
-}
+std::vector<std::string> SketchFeature::parameterReferences() const { return paramRefs_; }
 
 std::vector<BodyId> SketchFeature::readsBodies() const {
     if (params_.attach && params_.attach->isFace) return {params_.attach->body};
     return {};
 }
 
-std::uint64_t SketchFeature::paramHash() const { return hashOf("sketch/v1:", paramsJson()); }
+std::uint64_t SketchFeature::paramHash() const { return paramHash_; }
 
 std::string SketchFeature::paramsJson() const {
     json j = json::object();
@@ -177,63 +240,99 @@ Result<std::shared_ptr<Feature>> SketchFeature::fromJson(FeatureId id, std::stri
     return std::shared_ptr<Feature>(std::make_shared<SketchFeature>(id, std::move(p)));
 }
 
-Result<SketchSolution> SketchFeature::solve(const EvalContext& ctx) const {
+Result<std::shared_ptr<const SolvedSketchOutput>> SketchFeature::solveShared(const EvalContext& ctx) const {
     if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "sketch cancelled");
     std::vector<Diagnostic> diags;
 
-    // Built by a lambda (not default-initialised to an error and re-assigned): gcc's release flow analysis cannot see through
-    // the expected<> re-assignment and reports maybe-uninitialized (F40).
-    auto work = [&]() -> Result<sketch::Sketch> {
-        if (!params_.attach) return params_.sketch; // copy: the solver writes back into the working sketch only
-        auto plane = resolvePlane(ctx, *params_.attach, diags);
-        if (!plane) return std::unexpected(plane.error());
-        return rebase(params_.sketch, *plane);
-    }();
-    if (!work) return std::unexpected(work.error());
-
-    // Driven (reference) dimensions are measured, never solved: the solver works on a copy without them, and the
-    // solved geometry is then combined with the full record set again.
-    auto driving = buildSketch(*work, *work, false);
-    if (!driving) return std::unexpected(driving.error());
-    const sketch::SketchSolveReport rep = sketch::solveSketch(*driving, ctx.params);
-    if (rep.status == sketch::SolverStatus::InvalidInput)
-        return makeError(ErrorCode::InvalidArgument, "sketch: " + rep.message);
-    if (rep.status == sketch::SolverStatus::Failed) return makeError(ErrorCode::InvalidArgument, failureMessage(rep));
-    if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "sketch cancelled");
-    auto solvedWork = buildSketch(*driving, *work, true);
-    if (!solvedWork) return std::unexpected(solvedWork.error());
-    *work = std::move(*solvedWork);
-    std::map<sketch::SketchDimensionId, double> driven;
-    for (const auto& [id, d] : work->dimensions()) {
-        if (!d.driven) continue;
-        auto m = work->measureDimension(id);
-        if (m) driven.emplace(id, *m);
-        else diags.push_back({Diagnostic::Severity::Warning, "driven dimension " + std::to_string(id.value()) + " cannot be measured: " + m.error().message, std::nullopt});
+    // The plane is resolved at every call (cheap, and its diagnostics depend on the context); the solve is memoised.
+    std::optional<sketch::SketchPlane> plane;
+    if (params_.attach) {
+        auto pl = resolvePlane(ctx, *params_.attach, diags);
+        if (!pl) return std::unexpected(pl.error());
+        plane = *pl;
     }
 
-    for (auto c : rep.redundantConstraints)
-        diags.push_back({Diagnostic::Severity::Warning, "constraint " + std::to_string(c.value()) + " is redundant", std::nullopt});
-    for (auto d : rep.redundantDimensions)
-        diags.push_back({Diagnostic::Severity::Warning, "dimension " + std::to_string(d.value()) + " is redundant", std::nullopt});
+    // Key: sketch content (paramHash_; also implied by the instance), resolved plane, values of the used parameters.
+    common::Fnv key;
+    hashRaw(key, paramHash_);
+    if (plane) {
+        key.bytes("plane:");
+        hashDoubles(key, {plane->origin.x, plane->origin.y, plane->origin.z, plane->normal.x, plane->normal.y, plane->normal.z,
+                          plane->xDir.x, plane->xDir.y, plane->xDir.z});
+    } else {
+        key.bytes("own:");
+    }
+    if (ctx.params) {
+        const std::uint64_t used = ctx.params->hashOfUsed(paramRefs_);
+        key.bytes("params:");
+        hashRaw(key, used);
+    } else {
+        key.bytes("no-params");
+    }
 
-    auto profiles = sketch::detectProfiles(*work);
-    if (!profiles) return std::unexpected(profiles.error());
-    return SketchSolution{std::move(*work), std::move(*profiles), rep, std::move(diags), std::move(driven)};
+    std::shared_ptr<const SolvedSketchOutput> core;
+    {
+        std::lock_guard lock(cache_->mutex);
+        auto& es = cache_->entries;
+        auto it = std::find_if(es.begin(), es.end(), [&](const auto& e) { return e.first == key.h; });
+        if (it != es.end()) {
+            core = it->second;
+            std::rotate(it, it + 1, es.end()); // most recently used last
+        }
+    }
+    if (!core) {
+        // Built by a lambda (not default-initialised to an error and re-assigned): gcc's release flow analysis cannot see
+        // through the expected<> re-assignment and reports maybe-uninitialized (F40).
+        auto work = [&]() -> Result<sketch::Sketch> {
+            if (!plane) return params_.sketch; // copy: the solver writes back into the working sketch only
+            return rebase(params_.sketch, *plane);
+        }();
+        if (!work) return std::unexpected(work.error());
+        auto sol = solveWork(std::move(*work), ctx);
+        if (!sol) return std::unexpected(sol.error());
+        core = std::make_shared<const SolvedSketchOutput>(std::move(*sol));
+        std::lock_guard lock(cache_->mutex);
+        auto& es = cache_->entries;
+        std::erase_if(es, [&](const auto& e) { return e.first == key.h; }); // a concurrent solve of the same key
+        es.emplace_back(key.h, core);
+        if (es.size() > kSolveCacheSize) es.erase(es.begin());
+    }
+    if (diags.empty()) return core;
+    // Plane diagnostics first, then the solve's own (the order of the uncached implementation).
+    SketchSolution merged = core->solution;
+    diags.insert(diags.end(), merged.diagnostics.begin(), merged.diagnostics.end());
+    merged.diagnostics = std::move(diags);
+    return std::make_shared<const SolvedSketchOutput>(std::move(merged));
+}
+
+Result<SketchSolution> SketchFeature::solve(const EvalContext& ctx) const {
+    auto out = solveShared(ctx);
+    if (!out) return std::unexpected(out.error());
+    return (*out)->solution;
 }
 
 Result<FeatureResult> SketchFeature::compute(const EvalContext& ctx) const {
-    auto sol = solve(ctx);
-    if (!sol) return std::unexpected(sol.error());
+    auto shared = solveShared(ctx);
+    if (!shared) return std::unexpected(shared.error());
+    const SketchSolution& sol = (*shared)->solution;
     FeatureResult out;
-    out.diagnostics = std::move(sol->diagnostics);
-    out.attributes["dof"] = std::to_string(sol->report.dof);
-    out.attributes["profiles"] = std::to_string(sol->profiles.size());
+    out.diagnostics = sol.diagnostics;
+    out.attributes["dof"] = std::to_string(sol.report.dof);
+    out.attributes["profiles"] = std::to_string(sol.profiles.size());
     // Warning for the UI (yellow): an under-constrained sketch still solves, but its free DOFs can drift when a
     // parameter changes. "none" when fully constrained.
-    out.attributes["warning"] = sol->report.dof > 0 ? "underconstrained" : "none";
-    for (const auto& [id, value] : sol->drivenValues) out.attributes["driven." + std::to_string(id.value())] = std::to_string(value);
+    out.attributes["warning"] = sol.report.dof > 0 ? "underconstrained" : "none";
+    for (const auto& [id, value] : sol.drivenValues) out.attributes["driven." + std::to_string(id.value())] = std::to_string(value);
+    out.sketch = std::move(*shared);
     return out;
 }
+
+const SketchSolution* solvedSketchAt(const EvalContext& ctx, FeatureId sketch) {
+    const auto* o = dynamic_cast<const SolvedSketchOutput*>(ctx.sketch(sketch));
+    return o ? &o->solution : nullptr;
+}
+
+std::uint64_t sketchSolverRuns() noexcept { return gSolverRuns.load(std::memory_order_relaxed); }
 
 // ---- references and registration -------------------------------------------------------------------------------
 
@@ -262,9 +361,11 @@ std::shared_ptr<Feature> embedSketchReference(const Feature& f, const sketch::Sk
             return std::make_shared<RevolveFeature>(r->id(), std::move(p));
         }
     } else if (const auto* h = dynamic_cast<const HoleFeature*>(&f)) {
-        if (h->params().sketchPoints) {
+        if (const auto& sp = h->params().sketchPoints) {
+            // The placement is rebuilt whole rather than assigning p.sketchPoints->solved: gcc 13's release flow analysis
+            // reports maybe-uninitialized on the nested optional assignment (same family as F40).
             HoleParams p = h->params();
-            p.sketchPoints->solved = solved;
+            p.sketchPoints.emplace(HoleSketchPlacement{sp->sketch, sp->points, sp->flip, std::optional<sketch::Sketch>(solved)});
             return std::make_shared<HoleFeature>(h->id(), std::move(p));
         }
     }

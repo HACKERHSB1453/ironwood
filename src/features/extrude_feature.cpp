@@ -338,10 +338,24 @@ Result<FeatureResult> ExtrudeFeature::compute(const EvalContext& ctx) const {
         return finishExtrude(id_, p, ctx, *face, *pnaming, {poly->vector}, 0.0, {});
     }
 
-    if (std::holds_alternative<SketchReferenceSource>(p.source))
-        return makeError(ErrorCode::NotFound, "extrude: sketch feature " + std::to_string(std::get<SketchReferenceSource>(p.source).sketch.value()) +
-                                                  " has no solved profile at this position (suppressed, failed, or not earlier on the timeline)");
-    const auto& src = std::get<SketchSource>(p.source);
+    // Sketch profile: embedded (SketchSource), or the solved sketch an earlier SketchFeature published on the recompute
+    // sketch channel (SketchReferenceSource, F30), whose profiles are already detected.
+    const sketch::Sketch* sk = nullptr;
+    const std::string* profileName = nullptr;
+    const std::vector<sketch::SketchProfile>* solvedProfiles = nullptr;
+    if (const auto* ref = std::get_if<SketchReferenceSource>(&p.source)) {
+        const SketchSolution* sol = solvedSketchAt(ctx, ref->sketch);
+        if (!sol)
+            return makeError(ErrorCode::NotFound, "extrude: sketch feature " + std::to_string(ref->sketch.value()) +
+                                                      " has no solved profile at this position (suppressed, failed, or not earlier on the timeline)");
+        sk = &sol->sketch;
+        profileName = &ref->profile;
+        solvedProfiles = &sol->profiles;
+    } else {
+        const auto& src = std::get<SketchSource>(p.source);
+        sk = &src.sketch;
+        profileName = &src.profile;
+    }
     auto d1 = lengthOf(ctx.params, p.distance, "distance");
     if (!d1) return std::unexpected(d1.error());
     double d2 = 0;
@@ -353,19 +367,24 @@ Result<FeatureResult> ExtrudeFeature::compute(const EvalContext& ctx) const {
     auto taper = angleOf(ctx.params, p.taper, "taper");
     if (!taper) return std::unexpected(taper.error());
 
-    auto profiles = sketch::detectProfiles(src.sketch);
-    if (!profiles) return std::unexpected(profiles.error());
+    std::vector<sketch::SketchProfile> detected;
+    if (!solvedProfiles) {
+        auto profiles = sketch::detectProfiles(*sk);
+        if (!profiles) return std::unexpected(profiles.error());
+        detected = std::move(*profiles);
+        solvedProfiles = &detected;
+    }
     const sketch::SketchProfile* prof = nullptr;
-    for (const auto& pr : *profiles)
-        if (pr.name == src.profile) prof = &pr;
-    if (!prof) return makeError(ErrorCode::NotFound, "extrude: sketch has no profile '" + src.profile + "'");
+    for (const auto& pr : *solvedProfiles)
+        if (pr.name == *profileName) prof = &pr;
+    if (!prof) return makeError(ErrorCode::NotFound, "extrude: sketch has no profile '" + *profileName + "'");
 
     // Start the profile on the side the extent requires; the sweep vector then spans the whole extent.
     // Untapered extents sweep one vector (the plane moves to the far end for TwoSides/Symmetric). A tapered two-sided
     // extent keeps the plane and sweeps each side as its own draft prism: forwards by `d1` (Symmetric: d/2) and
     // backwards by `d2` (Symmetric: d/2).
     const bool tapered = std::abs(*taper) > 1e-12;
-    sketch::SketchPlane plane = src.sketch.plane();
+    sketch::SketchPlane plane = sk->plane();
     const Vec3 n = plane.normal;
     std::vector<Vec3> vectors;
     switch (p.extent) {

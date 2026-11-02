@@ -14,6 +14,7 @@
 
 #include "core/expr.hpp"
 #include "features/feature_json.hpp"
+#include "features/sketch_feature.hpp"
 #include "kernel/naming_support.hpp"
 #include "kernel/ops.hpp"
 #include "naming/naming_map.hpp"
@@ -314,10 +315,14 @@ Result<FeatureResult> HoleFeature::computeFromSketch(const EvalContext& ctx, con
     const HoleParams& p = params_;
     const HoleSketchPlacement& sp = *p.sketchPoints;
     const std::string sketchName = "sketch feature " + std::to_string(sp.sketch.value());
-    if (!sp.solved)
+    // An embedded copy (pre-pass callers) wins; otherwise the solved sketch published on the recompute sketch channel.
+    const sketch::Sketch* solved = sp.solved ? &*sp.solved : nullptr;
+    if (!solved)
+        if (const SketchSolution* sol = solvedSketchAt(ctx, sp.sketch)) solved = &sol->sketch;
+    if (!solved)
         return makeError(ErrorCode::NotFound, "hole: " + sketchName + " has no solved sketch at this position (it must precede the hole and solve)");
     if (sp.points.empty()) return makeError(ErrorCode::InvalidArgument, "hole: no sketch points selected");
-    const sketch::Sketch& sk = *sp.solved;
+    const sketch::Sketch& sk = *solved;
     const sketch::SketchPlane& plane = sk.plane();
 
     std::vector<Diagnostic> diags;

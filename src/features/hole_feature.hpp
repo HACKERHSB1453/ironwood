@@ -31,9 +31,10 @@ namespace iw::features {
 ///    to the sketch plane: if the body lies entirely on the +n side the holes run along +n, otherwise (body entirely on
 ///    the -n side, or the plane cuts through the body) along -n, so a sketch on a top face (outward normal) drills
 ///    down into the part, like face placement. `flip` reverses the decided direction.
-///  * The SketchFeature must precede the hole on the timeline. Document::evaluate() embeds the solved sketch into
-///    `solved` before evaluation (the same mechanism as Extrude / Revolve sketch references); evaluated without it the
-///    feature fails with NotFound. `solved` is never serialised.
+///  * The SketchFeature must precede the hole on the timeline. compute() reads its solved sketch from the recompute
+///    sketch channel (EvalContext::sketch, F30), like Extrude / Revolve sketch references; when it published none the
+///    feature fails with NotFound. `solved` is an optional embedded copy (set by pre-pass callers through
+///    embedSketchReference) that takes precedence over the channel; it is never serialised.
 struct HoleSketchPlacement {
     FeatureId sketch;
     std::vector<sketch::SketchEntityId> points;

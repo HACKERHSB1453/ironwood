@@ -31,8 +31,9 @@ struct SketchSource {
 };
 
 /// B1c profile taken from an upstream SketchFeature: stores the sketch feature id and the profile name, not a copy of
-/// the sketch. The Document replaces it with an embedded SketchSource (solved sketch) before evaluation; evaluated
-/// directly it fails with NotFound.
+/// the sketch. compute() reads the solved sketch the SketchFeature published on the recompute sketch channel
+/// (EvalContext::sketch, F30); when none is published at this position (suppressed, failed, later on the timeline, or no
+/// such sketch) it fails with NotFound. Shared by Extrude and Revolve.
 struct SketchReferenceSource {
     FeatureId sketch; ///< Id of the SketchFeature (must precede the referencing feature on the timeline).
     std::string profile;
