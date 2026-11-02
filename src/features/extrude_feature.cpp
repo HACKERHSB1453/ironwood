@@ -17,6 +17,7 @@
 #include "features/edge_features.hpp"
 #include "features/feature_common.hpp"
 #include "features/hole_feature.hpp"
+#include "features/import_feature.hpp"
 #include "features/move_feature.hpp"
 #include "features/revolve_feature.hpp"
 #include "features/feature_json.hpp"
@@ -414,6 +415,7 @@ void registerFeatures(FeatureRegistry& registry) {
     registerMoveFeature(registry);
     registerConstructionFeatures(registry);
     registerSketchFeature(registry);
+    registerImportFeature(registry);
 }
 
 } // namespace iw::features

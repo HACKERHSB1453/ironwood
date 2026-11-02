@@ -42,15 +42,22 @@ d.export("/tmp/bracket.step")          # .step / .stl (one body) / .3mf
 ## Main objects
 
 - `Document`: `add_parameter`, `set_parameter`, `parameters`, `add_sketch`, `extrude`, `revolve`, `fillet`,
-  `chamfer`, `hole`, `move`, `offset_plane`, `suppress`, `delete`, `rollback`, `undo`/`redo`, `timeline`,
-  `evaluate()`, `bodies`, `export`, `save`, `Document.open`.
+  `chamfer`, `hole`, `move`, construction geometry (`offset_plane`, `midplane`, `plane_through_points`,
+  `plane_at_angle`, `axis_through_cylinder`, `axis_through_points`, `axis_along_edge`, `point_at_vertex`,
+  `point_at_circle_centre`; read back with `Feature.construction`), `import_step` (an Import feature with one body
+  per solid, `Feature.bodies`; the STEP file is re-read on recompute and must stay available), `suppress`, `delete`,
+  `rollback`, `undo`/`redo`, `timeline`, `evaluate()`, `bodies`, `export`, `save`, `Document.open`.
 - `Sketch`: `line`, `rect`, `circle`, `arc`, `point`, `constrain`, `dimension`, `solve` (returns `SolveReport`
   with DOF and conflicting record ids), `profile_names`. `Sketch.on_face(face)` sketches on a planar face.
 - `Body`: `volume`, `area`, `centre_of_mass`, `bounding_box`, `face_count`, `edge_count`, `vertex_count`,
-  `faces(filter)`, `edges(filter)`. Filters are callables over `FaceRef` / `EdgeRef`.
-- `iw.import_step(path)` / `iw.import_stl(path)` return standalone `Solid` objects (not on the timeline).
+  `faces(filter)`, `edges(filter)`, `vertices(filter)`. Filters are callables over `FaceRef` / `EdgeRef` /
+  `VertexRef`, or (faces, edges) a kind string: `body.edges("circle")`, `body.edges("line|circle")`,
+  `body.faces("plane")`. `EdgeRef.kind` is `line`, `circle`, `ellipse`, `bspline` or `other`; lines have
+  `direction`, circles / ellipses `center`, `axis`, `radius` (ellipses also `minor_radius`).
+- `iw.import_step(path)` / `iw.import_stl(path)` return standalone `Solid` objects (not on the timeline); use
+  `Document.import_step(path)` to import onto the timeline.
 
 ## Tests
 
-`tests/python/test_ironwood.py` (unittest; the ctest `python_api` runs it). Run manually with
+`tests/python/test_*.py` (unittest; the ctest `python_api` runs it). Run manually with
 `PYTHONPATH=build/<dir>/api python3 -m unittest discover -s tests/python -t tests/python`.

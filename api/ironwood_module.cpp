@@ -30,6 +30,7 @@
 #include "features/edge_features.hpp"
 #include "features/extrude_feature.hpp"
 #include "features/hole_feature.hpp"
+#include "features/import_feature.hpp"
 #include "features/move_feature.hpp"
 #include "features/revolve_feature.hpp"
 #include "features/sketch_feature.hpp"
@@ -116,6 +117,16 @@ struct EdgeH {
     BodyId body;
     std::array<double, 3> centroid{};
     double length = 0;
+    std::string kind; // line / circle / ellipse / bspline / other (kernel::EdgeGeometry)
+    std::array<double, 3> point{}, direction{};
+    double radius = 0, minorRadius = 0;
+    bool closed = false;
+};
+
+struct VertexH {
+    nm::ElementRef ref;
+    BodyId body;
+    std::array<double, 3> position{};
 };
 
 struct FaceH {
@@ -186,6 +197,17 @@ std::string statusName(rc::FeatureStatus::State s) {
     return "unknown";
 }
 
+std::string edgeKindName(kn::EdgeGeometry::Kind k) {
+    switch (k) {
+    case kn::EdgeGeometry::Kind::Line: return "line";
+    case kn::EdgeGeometry::Kind::Circle: return "circle";
+    case kn::EdgeGeometry::Kind::Ellipse: return "ellipse";
+    case kn::EdgeGeometry::Kind::BSpline: return "bspline";
+    case kn::EdgeGeometry::Kind::Other: return "other";
+    }
+    return "other";
+}
+
 const kn::Shape& shapeOf(DocModel& m, BodyId id) {
     const auto& ev = m.evaluated();
     auto it = ev.bodies.find(id);
@@ -209,7 +231,32 @@ std::vector<EdgeH> edgesOf(DocModel& m, BodyId id) {
         auto name = names.nameOf(nm::ElementType::Edge, i);
         if (!name) continue;
         const auto key = s.subShapeKey(kn::SubShapeKind::Edge, i);
-        out.push_back(EdgeH{nm::ElementRef{name->feature, nm::ElementType::Edge, *name}, id, {key[0], key[1], key[2]}, key[3]});
+        EdgeH e;
+        e.ref = nm::ElementRef{name->feature, nm::ElementType::Edge, *name};
+        e.body = id;
+        e.centroid = {key[0], key[1], key[2]};
+        e.length = key[3];
+        const kn::EdgeGeometry g = s.edgeGeometry(i);
+        e.kind = edgeKindName(g.kind);
+        e.point = toArray(g.point);
+        e.direction = toArray(g.direction);
+        e.radius = g.radius;
+        e.minorRadius = g.minorRadius;
+        e.closed = g.closed;
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+std::vector<VertexH> verticesOf(DocModel& m, BodyId id) {
+    const kn::Shape& s = shapeOf(m, id);
+    const nm::NamingMap& names = namesOf(m, id);
+    std::vector<VertexH> out;
+    for (std::uint32_t i = 0; i < s.subShapeCount(kn::SubShapeKind::Vertex); ++i) {
+        auto name = names.nameOf(nm::ElementType::Vertex, i);
+        if (!name) continue;
+        const auto key = s.subShapeKey(kn::SubShapeKind::Vertex, i);
+        out.push_back(VertexH{nm::ElementRef{name->feature, nm::ElementType::Vertex, *name}, id, {key[0], key[1], key[2]}});
     }
     return out;
 }
@@ -358,6 +405,46 @@ const fe::SketchFeature& sketchFeatureOf(DocModel& m, const FeatureH& f) {
     return *sf;
 }
 
+/// Applies a Body.edges() / faces() filter: None keeps everything, a string keeps elements of that kind (several kinds
+/// separated by '|', e.g. "line|circle"), a callable is called with the reference.
+template <class H> bool passesFilter(const py::object& filter, const H& h, const char* what, const std::vector<std::string>& kinds) {
+    if (filter.is_none()) return true;
+    if (py::isinstance<py::str>(filter)) {
+        const std::string spec = filter.cast<std::string>();
+        bool match = false;
+        std::size_t start = 0;
+        for (;;) {
+            const std::size_t bar = spec.find('|', start);
+            const std::string k = spec.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
+            if (std::find(kinds.begin(), kinds.end(), k) == kinds.end())
+                fail(ErrorCode::InvalidArgument, std::string("unknown ") + what + " kind '" + k + "' (use " + joinNames(kinds) + ")");
+            if (k == h.kind) match = true;
+            if (bar == std::string::npos) break;
+            start = bar + 1;
+        }
+        return match;
+    }
+    return filter(h).template cast<bool>();
+}
+
+/// A plane input of a construction feature: a planar FaceRef or a construction Plane feature.
+fe::PlaneRef planeRefOf(const py::object& base, const char* what) {
+    if (py::isinstance<FaceH>(base)) {
+        const FaceH f = base.cast<FaceH>();
+        if (!f.planar) fail(ErrorCode::InvalidArgument, std::string(what) + " must be a planar face");
+        return fe::PlaneRef{true, f.body, f.ref, FeatureId{}};
+    }
+    if (py::isinstance<FeatureH>(base)) return fe::PlaneRef{false, BodyId{}, nm::ElementRef{}, base.cast<FeatureH>().id};
+    fail(ErrorCode::InvalidArgument, std::string(what) + " must be a planar FaceRef or a construction Plane feature");
+}
+
+/// Three length expressions from a 3-sequence of numbers (mm) or expression strings.
+std::array<std::string, 3> pointExprs(const py::handle& h) {
+    const auto seq = h.cast<py::sequence>();
+    if (seq.size() != 3) fail(ErrorCode::InvalidArgument, "a point is (x, y, z)");
+    return {lengthExpr(seq[0]), lengthExpr(seq[1]), lengthExpr(seq[2])};
+}
+
 /// Adds `feature` at the end of the timeline and returns its handle.
 FeatureH append(const ModelPtr& m, std::shared_ptr<const rc::Feature> feature) {
     const FeatureId id = feature->id();
@@ -467,7 +554,7 @@ PYBIND11_MODULE(ironwood, m) {
     m.doc() = R"doc(Headless Python API for Ironwood (no GUI).
 
 Build a model with a Document: parameters, sketches (add_sketch), features (extrude, revolve, fillet, chamfer, hole,
-move, offset_plane), then evaluate() for statuses and bodies. Bodies expose volume, area, centre_of_mass, bounding_box,
+move, offset_plane, midplane, plane_through_points, plane_at_angle, axis_*, point_at_*, import_step), then evaluate() for statuses and bodies. Bodies expose volume, area, centre_of_mass, bounding_box,
 face_count, edge_count, vertex_count, and faces()/edges() queries returning references usable by features.
 Lengths are mm and angles are degrees; pass numbers or expression strings such as "w * 2" or "2 in".)doc";
 
@@ -693,17 +780,84 @@ Lengths are mm and angles are degrees; pass numbers or expression strings such a
                  fe::ConstructionPlaneParams p;
                  p.kind = fe::ConstructionPlaneParams::Kind::Offset;
                  p.distance = lengthExpr(distance);
-                 if (py::isinstance<FaceH>(base)) {
-                     const FaceH f = base.cast<FaceH>();
-                     p.base = fe::PlaneRef{true, f.body, f.ref, FeatureId{}};
-                 } else if (py::isinstance<FeatureH>(base)) {
-                     p.base = fe::PlaneRef{false, BodyId{}, nm::ElementRef{}, base.cast<FeatureH>().id};
-                 } else {
-                     fail(ErrorCode::InvalidArgument, "offset_plane base must be a planar FaceRef or a construction Plane feature");
-                 }
+                 p.base = planeRefOf(base, "offset_plane base");
                  return append(mp, std::make_shared<fe::ConstructionPlaneFeature>(mp->doc.allocateFeatureId(), p));
              },
              py::arg("base"), py::arg("distance"), "Construction plane offset from a planar face or another plane.")
+        .def("midplane", [](const ModelPtr& mp, py::object a, py::object b) {
+                 fe::ConstructionPlaneParams p;
+                 p.kind = fe::ConstructionPlaneParams::Kind::MidPlane;
+                 p.base = planeRefOf(a, "midplane a");
+                 p.other = planeRefOf(b, "midplane b");
+                 return append(mp, std::make_shared<fe::ConstructionPlaneFeature>(mp->doc.allocateFeatureId(), p));
+             },
+             py::arg("a"), py::arg("b"), "Construction plane midway between two parallel planes (planar faces or Plane features).")
+        .def("plane_through_points", [](const ModelPtr& mp, py::object a, py::object b, py::object c) {
+                 fe::ConstructionPlaneParams p;
+                 p.kind = fe::ConstructionPlaneParams::Kind::ThreePoints;
+                 p.points = {pointExprs(a), pointExprs(b), pointExprs(c)};
+                 return append(mp, std::make_shared<fe::ConstructionPlaneFeature>(mp->doc.allocateFeatureId(), p));
+             },
+             py::arg("a"), py::arg("b"), py::arg("c"),
+             "Construction plane through three points (x, y, z); normal = (b - a) x (c - a). Coordinates are mm or expressions.")
+        .def("plane_at_angle", [](const ModelPtr& mp, py::object base, const FeatureH& axis, py::object angle) {
+                 fe::ConstructionPlaneParams p;
+                 p.kind = fe::ConstructionPlaneParams::Kind::AngleAxis;
+                 p.base = planeRefOf(base, "plane_at_angle base");
+                 p.axis = axis.id;
+                 p.angle = angleExpr(angle);
+                 return append(mp, std::make_shared<fe::ConstructionPlaneFeature>(mp->doc.allocateFeatureId(), p));
+             },
+             py::arg("base"), py::arg("axis"), py::arg("angle"),
+             "Construction plane through a construction Axis feature, rotated by `angle` from the base plane's orientation.")
+        .def("axis_through_cylinder", [](const ModelPtr& mp, const FaceH& face) {
+                 fe::ConstructionAxisParams p;
+                 p.kind = fe::ConstructionAxisParams::Kind::Cylinder;
+                 p.body = face.body;
+                 p.ref = face.ref;
+                 return append(mp, std::make_shared<fe::ConstructionAxisFeature>(mp->doc.allocateFeatureId(), p));
+             },
+             py::arg("face"), "Construction axis along a cylindrical or conical face.")
+        .def("axis_through_points", [](const ModelPtr& mp, py::object a, py::object b) {
+                 fe::ConstructionAxisParams p;
+                 p.kind = fe::ConstructionAxisParams::Kind::TwoPoints;
+                 p.a = pointExprs(a);
+                 p.b = pointExprs(b);
+                 return append(mp, std::make_shared<fe::ConstructionAxisFeature>(mp->doc.allocateFeatureId(), p));
+             },
+             py::arg("a"), py::arg("b"), "Construction axis from point a towards point b (mm or expressions).")
+        .def("axis_along_edge", [](const ModelPtr& mp, const EdgeH& edge) {
+                 fe::ConstructionAxisParams p;
+                 p.kind = fe::ConstructionAxisParams::Kind::Edge;
+                 p.body = edge.body;
+                 p.ref = edge.ref;
+                 return append(mp, std::make_shared<fe::ConstructionAxisFeature>(mp->doc.allocateFeatureId(), p));
+             },
+             py::arg("edge"), "Construction axis along a linear edge.")
+        .def("point_at_vertex", [](const ModelPtr& mp, const VertexH& vertex) {
+                 fe::ConstructionPointParams p;
+                 p.kind = fe::ConstructionPointParams::Kind::Vertex;
+                 p.body = vertex.body;
+                 p.ref = vertex.ref;
+                 return append(mp, std::make_shared<fe::ConstructionPointFeature>(mp->doc.allocateFeatureId(), p));
+             },
+             py::arg("vertex"), "Construction point at a vertex (VertexRef from Body.vertices()).")
+        .def("point_at_circle_centre", [](const ModelPtr& mp, const EdgeH& edge) {
+                 fe::ConstructionPointParams p;
+                 p.kind = fe::ConstructionPointParams::Kind::CircleCentre;
+                 p.body = edge.body;
+                 p.ref = edge.ref;
+                 return append(mp, std::make_shared<fe::ConstructionPointFeature>(mp->doc.allocateFeatureId(), p));
+             },
+             py::arg("edge"), "Construction point at the centre of a full circular edge.")
+        // import
+        .def("import_step", [](const ModelPtr& mp, const std::string& path) {
+                 auto params = unwrap(fe::makeImportParams(path, [&] { return mp->doc.allocateBodyId(); }));
+                 return append(mp, std::make_shared<fe::ImportFeature>(mp->doc.allocateFeatureId(), std::move(params)));
+             },
+             py::arg("path"),
+             "Add an Import feature for a STEP file: one body per solid (Feature.bodies). The file is re-read on "
+             "recompute (geometry is not embedded in the document yet), so it must stay available.")
         // timeline
         .def_property_readonly("timeline",
                                [](const ModelPtr& mp) {
@@ -824,6 +978,33 @@ Lengths are mm and angles are degrees; pass numbers or expression strings such a
             if (w.empty()) return std::nullopt;
             return BodyH{f.m, w.front()};
         }, "The body this feature writes (None for sketches and construction features).")
+        .def_property_readonly("bodies", [](const FeatureH& f) {
+            std::vector<BodyH> out;
+            for (BodyId id : featureOf(*f.m, f.id).writesBodies()) out.push_back(BodyH{f.m, id});
+            return out;
+        }, "All bodies this feature writes (an Import writes one per solid).")
+        .def_property_readonly("construction", [](const FeatureH& f) -> std::optional<py::dict> {
+            for (const auto& s : f.m->evaluated().statuses) {
+                if (s.id != f.id || !s.construction) continue;
+                const rc::ConstructionGeometry& g = *s.construction;
+                py::dict d;
+                switch (g.kind) {
+                case rc::ConstructionGeometry::Kind::Plane:
+                    d["kind"] = "plane";
+                    d["normal"] = toArray(g.normal);
+                    d["x_dir"] = toArray(g.xDir);
+                    break;
+                case rc::ConstructionGeometry::Kind::Axis:
+                    d["kind"] = "axis";
+                    d["direction"] = toArray(g.direction);
+                    break;
+                case rc::ConstructionGeometry::Kind::Point: d["kind"] = "point"; break;
+                }
+                d["origin"] = toArray(g.origin);
+                return d;
+            }
+            return std::nullopt;
+        }, "Geometry of a construction feature after evaluation: {'kind', 'origin', ...}; None for other features or on failure.")
         .def_property_readonly("sketch", [](const FeatureH& f) -> std::optional<SketchH> {
             const auto* sf = dynamic_cast<const fe::SketchFeature*>(&featureOf(*f.m, f.id));
             if (!sf) return std::nullopt;
@@ -837,20 +1018,32 @@ Lengths are mm and angles are degrees; pass numbers or expression strings such a
     py::class_<BodyH> body(m, "Body", "A solid body at the end of the timeline. Measurements reflect the current evaluation.");
     body.def_property_readonly("id", [](const BodyH& b) { return b.id.value(); })
         .def("edges", [](const BodyH& b, py::object filter) {
+                 static const std::vector<std::string> kinds{"line", "circle", "ellipse", "bspline", "other"};
                  std::vector<EdgeH> out;
                  for (auto& e : edgesOf(*b.m, b.id))
-                     if (filter.is_none() || filter(e).cast<bool>()) out.push_back(std::move(e));
+                     if (passesFilter(filter, e, "edge", kinds)) out.push_back(std::move(e));
                  return out;
              },
              py::arg("filter") = py::none(),
-             "Edges of the body, optionally filtered by a callable taking an EdgeRef (e.g. lambda e: e.length > 5).")
+             "Edges of the body, optionally filtered by kind ('line', 'circle', 'ellipse', 'bspline', 'other', or several "
+             "joined by '|') or by a callable taking an EdgeRef (e.g. lambda e: e.kind == 'circle' and e.radius > 5).")
         .def("faces", [](const BodyH& b, py::object filter) {
+                 static const std::vector<std::string> kinds{"plane", "cylinder", "cone", "other"};
                  std::vector<FaceH> out;
                  for (auto& f : facesOf(b.m, b.id))
-                     if (filter.is_none() || filter(f).cast<bool>()) out.push_back(std::move(f));
+                     if (passesFilter(filter, f, "face", kinds)) out.push_back(std::move(f));
                  return out;
              },
-             py::arg("filter") = py::none(), "Faces of the body, optionally filtered by a callable taking a FaceRef.")
+             py::arg("filter") = py::none(),
+             "Faces of the body, optionally filtered by kind ('plane', 'cylinder', 'cone', 'other', or several joined by "
+             "'|') or by a callable taking a FaceRef.")
+        .def("vertices", [](const BodyH& b, py::object filter) {
+                 std::vector<VertexH> out;
+                 for (auto& v : verticesOf(*b.m, b.id))
+                     if (filter.is_none() || filter(v).cast<bool>()) out.push_back(std::move(v));
+                 return out;
+             },
+             py::arg("filter") = py::none(), "Vertices of the body, optionally filtered by a callable taking a VertexRef.")
         .def("__repr__", [](const BodyH& b) { return std::format("Body(id={})", b.id.value()); });
     addMeasures(body, [](const BodyH& b) { return shapeOf(*b.m, b.id); });
 
@@ -859,9 +1052,35 @@ Lengths are mm and angles are degrees; pass numbers or expression strings such a
         .def_property_readonly("centroid", [](const EdgeH& e) { return e.centroid; }, "Edge midpoint (mm).")
         .def_property_readonly("length", [](const EdgeH& e) { return e.length; }, "Edge length (mm).")
         .def_property_readonly("body_id", [](const EdgeH& e) { return e.body.value(); })
+        .def_property_readonly("kind", [](const EdgeH& e) { return e.kind; }, "line, circle, ellipse, bspline or other.")
+        .def_property_readonly("closed", [](const EdgeH& e) { return e.closed; }, "True for a full circle / ellipse / closed curve.")
+        .def_property_readonly("direction", [](const EdgeH& e) -> std::optional<std::array<double, 3>> {
+            if (e.kind != "line") return std::nullopt;
+            return e.direction;
+        }, "Unit direction of a line edge (its sign follows the edge's curve and is not meaningful); None for other kinds.")
+        .def_property_readonly("center", [](const EdgeH& e) -> std::optional<std::array<double, 3>> {
+            if (e.kind != "circle" && e.kind != "ellipse") return std::nullopt;
+            return e.point;
+        }, "Centre of a circle / ellipse edge (mm); None for other kinds.")
+        .def_property_readonly("axis", [](const EdgeH& e) -> std::optional<std::array<double, 3>> {
+            if (e.kind != "circle" && e.kind != "ellipse") return std::nullopt;
+            return e.direction;
+        }, "Unit axis (plane normal) of a circle / ellipse edge; None for other kinds.")
+        .def_property_readonly("radius", [](const EdgeH& e) -> std::optional<double> {
+            if (e.kind != "circle" && e.kind != "ellipse") return std::nullopt;
+            return e.radius;
+        }, "Radius of a circle edge (major radius of an ellipse) in mm; None for other kinds.")
+        .def_property_readonly("minor_radius", [](const EdgeH& e) -> std::optional<double> {
+            if (e.kind != "ellipse") return std::nullopt;
+            return e.minorRadius;
+        }, "Minor radius of an ellipse edge (mm); None for other kinds.")
         .def("__repr__", [](const EdgeH& e) {
-            return std::format("EdgeRef(centroid={}, length={:.6g})", vecStr(toVec(e.centroid)), e.length);
+            return std::format("EdgeRef(kind='{}', centroid={}, length={:.6g})", e.kind, vecStr(toVec(e.centroid)), e.length);
         });
+    py::class_<VertexH>(m, "VertexRef", "A reference to a vertex of a body.")
+        .def_property_readonly("position", [](const VertexH& v) { return v.position; }, "Vertex position (mm).")
+        .def_property_readonly("body_id", [](const VertexH& v) { return v.body.value(); })
+        .def("__repr__", [](const VertexH& v) { return std::format("VertexRef(position={})", vecStr(toVec(v.position))); });
     py::class_<FaceH>(m, "FaceRef", "A reference to a face of a body, with its geometry.")
         .def_property_readonly("centroid", [](const FaceH& f) { return f.centroid; }, "Face centroid (mm).")
         .def_property_readonly("area", [](const FaceH& f) { return f.area; }, "Face area (mm^2).")
@@ -1018,7 +1237,9 @@ Lengths are mm and angles are degrees; pass numbers or expression strings such a
         for (const auto& node : unwrap(kn::importStep(path)).nodes)
             if (!node.shape.isNull()) out.push_back(SolidH{node.shape, node.name});
         return out;
-    }, py::arg("path"), "Read a STEP file; returns a Solid per geometric node (not added to any Document).");
+    }, py::arg("path"),
+       "Read a STEP file; returns a Solid per geometric node (not added to any Document). To import into a Document's "
+       "timeline use Document.import_step(path).");
     m.def("import_stl", [](const std::string& path) {
         return SolidH{unwrap(kn::importStl(path)), std::filesystem::path(path).stem().string()};
     }, py::arg("path"), "Read an STL file as one Solid (not added to any Document).");
