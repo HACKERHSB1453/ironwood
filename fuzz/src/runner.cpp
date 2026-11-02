@@ -5,6 +5,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <memory>
 #include <optional>
 #include <set>
 
@@ -60,17 +61,20 @@ Result<EvalResult> evaluatePrefix(Evaluator& ev, const Timeline& t, std::size_t 
     return ev.evaluate(c);
 }
 
-/// True when features [0, upto] are identical (id, kind, parameters, suppression) in both timelines. The geometry
-/// of an element of feature k depends only on that prefix, so an identical prefix means an unchanged result.
-bool prefixIdentical(const Timeline& a, const Timeline& b, std::size_t upto) {
-    if (a.size() <= upto || b.size() <= upto) return false;
-    for (std::size_t k = 0; k <= upto; ++k) {
+/// Length of the longest common prefix of two timelines: features identical in id, kind, parameters and suppression.
+/// The geometry of an element of feature k depends only on features [0, k], so "prefix [0, k] identical" is
+/// `k < commonPrefix(a, b)`. Computed once per step: paramHash() serialises the parameters, and re-testing the prefix
+/// for every captured reference made the oracle quadratic in it (~15% of a campaign).
+std::size_t commonPrefix(const Timeline& a, const Timeline& b) {
+    const std::size_t n = std::min(a.size(), b.size());
+    for (std::size_t k = 0; k < n; ++k) {
         const auto& fa = a.at(k);
         const auto& fb = b.at(k);
-        if (fa->id() != fb->id() || fa->kind() != fb->kind() || fa->paramHash() != fb->paramHash()) return false;
-        if (a.isSuppressed(fa->id()) != b.isSuppressed(fb->id())) return false;
+        // Features are immutable, so the same object is trivially identical (most of a timeline survives an edit).
+        if (fa != fb && (fa->id() != fb->id() || fa->kind() != fb->kind() || fa->paramHash() != fb->paramHash())) return k;
+        if (a.isSuppressed(fa->id()) != b.isSuppressed(fb->id())) return k;
     }
-    return true;
+    return n;
 }
 
 std::optional<std::size_t> positionOf(const Timeline& t, FeatureId id) {
@@ -178,15 +182,22 @@ std::optional<std::vector<Expected>> predictFor(const FeatureGenerator& g, const
 }
 
 /// Checks one edit (or the baseline when before == after). Captures refs on `before`, resolves them on `after`.
-void checkStep(Evaluator& ev, const Timeline& before, const Timeline& after, int stepIndex,
+/// `evBefore` evaluates only `before` and `evAfter` only `after` (pass the same evaluator for the baseline): an
+/// evaluator caches ONE timeline's prefix chain, so sharing one between the two timelines made every alternation
+/// between them recompute everything after the edit (the dominant avoidable cost of a campaign).
+void checkStep(Evaluator& evBefore, Evaluator& evAfter, const Timeline& before, const Timeline& after, int stepIndex,
                const GeneratorRegistry& reg, const ResolveFn& resolve, ScenarioOutcome& out) {
     auto fail = [&](std::string category, std::string detail, const std::string& kind = {}) {
         out.failures.push_back({std::move(category), stepIndex, std::move(detail)});
         if (!kind.empty()) ++out.counts.perKind[kind].failures;
     };
 
-    auto preFull = ev.evaluate(before);
-    auto postFull = ev.evaluate(after);
+    const auto evalOf = [&](const Timeline& t) -> Evaluator& { return &t == &before ? evBefore : evAfter; };
+    const std::size_t samePrefix = commonPrefix(before, after);
+    const auto prefixIdentical = [samePrefix](std::size_t upto) { return upto < samePrefix; };
+
+    auto preFull = evBefore.evaluate(before);
+    auto postFull = evAfter.evaluate(after);
     if (!preFull || !postFull) {
         fail("internal_evaluation_error", !preFull ? preFull.error().message : postFull.error().message);
         return;
@@ -204,8 +215,8 @@ void checkStep(Evaluator& ev, const Timeline& before, const Timeline& after, int
         auto it = cache.find(p);
         if (it != cache.end()) return it->second;
         auto m = std::make_shared<PositionModel>();
-        if (auto in = evaluatePrefix(ev, t, p)) m->in = ModelState::from(*in);
-        if (auto post = evaluatePrefix(ev, t, p + 1)) m->post = std::make_shared<EvalResult>(std::move(*post));
+        if (auto in = evaluatePrefix(evalOf(t), t, p)) m->in = ModelState::from(*in);
+        if (auto post = evaluatePrefix(evalOf(t), t, p + 1)) m->post = std::make_shared<EvalResult>(std::move(*post));
         cache.emplace(p, m);
         return m;
     };
@@ -348,7 +359,7 @@ void checkStep(Evaluator& ev, const Timeline& before, const Timeline& after, int
     for (std::size_t q = 0; q < after.size(); ++q) {
         const auto& fa = after.at(q);
         if (postFull->statuses[q].state != FeatureStatus::State::Ok || after.isSuppressed(fa->id())) continue;
-        if (&before != &after && prefixIdentical(before, after, q)) continue; // already checked by an earlier step
+        if (&before != &after && prefixIdentical(q)) continue; // already checked by an earlier step
         const FeatureGenerator* g = reg.find(fa->kind());
         const int rel = g ? g->volumeRelation(*fa) : 0;
         if (rel == 0 || fa->writesBodies().size() != 1) continue;
@@ -434,7 +445,7 @@ void checkStep(Evaluator& ev, const Timeline& before, const Timeline& after, int
             ++out.counts.skippedOwnerInactive;
             continue;
         }
-        const bool affected = !prefixIdentical(before, after, *q);
+        const bool affected = !prefixIdentical(*q);
         auto m = modelOf(after, afterModels, *q);
         if (!m->post) continue;
         const EvalResult& post = *m->post;
@@ -594,19 +605,23 @@ Counters& Counters::operator+=(const Counters& o) {
 
 ScenarioOutcome runScenario(const Scenario& scenario, const GeneratorRegistry& registry, const ResolveFn& resolve) {
     ScenarioOutcome out;
-    Evaluator ev;
+    // Two evaluators, one per side of the step being checked (see checkStep). After a step the "after" evaluator holds
+    // the new current timeline's cache, so the roles swap instead of re-evaluating it.
+    auto evCurrent = std::make_unique<Evaluator>();
+    auto evNext = std::make_unique<Evaluator>();
     Timeline tl;
     for (const auto& f : scenario.base) tl.append(f);
 
     // Baseline: an unedited timeline must resolve every name back to the same geometry.
-    checkStep(ev, tl, tl, -1, registry, resolve, out);
+    checkStep(*evCurrent, *evCurrent, tl, tl, -1, registry, resolve, out);
 
     for (std::size_t k = 0; k < scenario.steps.size(); ++k) {
         Timeline after = tl;
         if (auto r = applyStep(after, scenario.steps[k]); !r) continue; // inapplicable step: a no-op
         ++out.counts.stepsChecked;
-        checkStep(ev, tl, after, static_cast<int>(k), registry, resolve, out);
+        checkStep(*evCurrent, *evNext, tl, after, static_cast<int>(k), registry, resolve, out);
         tl = std::move(after);
+        std::swap(evCurrent, evNext);
     }
     return out;
 }
@@ -851,7 +866,9 @@ FuzzSummary runFuzz(const FuzzConfig& config, const GeneratorRegistry& registry,
         Scenario sc;
         if (config.isolate) {
             out = runSeedIsolated(seed, registry, config.scenario, resolve, generated);
-            if (generated) sc = generateScenario(seed, registry, config.scenario); // safe: the worker got through it
+            // The scenario itself is only needed to shrink a failure; regenerating every passing one in the parent doubled
+            // the generation cost of a campaign. Safe when the worker got through generation (deterministic in the seed).
+            if (generated && !out.failures.empty()) sc = generateScenario(seed, registry, config.scenario);
         } else {
             sc = generateScenario(seed, registry, config.scenario);
             out = runScenario(sc, registry, resolve);

@@ -51,7 +51,17 @@ struct SketchProfile {
 /// classified by even-odd containment (a loop directly inside a region is a hole of it, one inside a hole is a
 /// new region). Result is sorted by name. Points and construction entities are ignored.
 /// Errors: none expected for a valid sketch; reserved for internal failures (ErrorCode::Internal).
+/// Complexity: candidate curve pairs come from a bounding-box sort-and-sweep broad phase, so sketches with many
+/// mostly-disjoint curves cost ~O(n log n + k) pair tests (k = overlapping pairs) instead of O(n^2); hole
+/// classification skips containers whose bounding box cannot contain the probe point.
 Result<std::vector<SketchProfile>> detectProfiles(const Sketch& sketch);
+
+namespace detail {
+/// Testing hook only: `bruteForce = true` disables both broad phases (curve-pair sort-and-sweep and the loop-box
+/// prefilter of hole classification), i.e. runs the original O(n^2) algorithm.
+/// Both paths must return identical results; `detectProfiles(s)` == `detectProfilesWith(s, false)`.
+Result<std::vector<SketchProfile>> detectProfilesWith(const Sketch& sketch, bool bruteForce);
+} // namespace detail
 
 /// Builds a planar kernel face (outer wire + hole wires) for `profile` on `plane`. Errors: KernelFailure.
 Result<kernel::Shape> profileFace(const SketchPlane& plane, const SketchProfile& profile);

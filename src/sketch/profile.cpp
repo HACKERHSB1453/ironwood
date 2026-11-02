@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <map>
 #include <numbers>
 #include <set>
@@ -120,6 +121,74 @@ void candidates(const Curve& A, const Curve& B, std::vector<Point2>& out) {
 void endpoints(const Curve& c, std::vector<Point2>& out) {
     out.push_back(c.a);
     if (!c.isCircle) out.push_back(c.b);
+}
+
+// ---- broad phase ----------------------------------------------------------------------------------------------
+
+struct Box {
+    double x0, y0, x1, y1;
+};
+
+/// Axis-aligned box of a curve, inflated by a margin that covers every tolerance `onCurve` accepts (kVertexTol
+/// off the curve, kAngleTol past an arc end). Two curves whose boxes are disjoint can share no split point:
+/// every split point found for a pair lies within kVertexTol of both curves.
+Box curveBox(const Curve& c) {
+    Box b{};
+    if (c.isLine) {
+        b = {std::min(c.a.x, c.b.x), std::min(c.a.y, c.b.y), std::max(c.a.x, c.b.x), std::max(c.a.y, c.b.y)};
+    } else {
+        b = {c.c.x - c.r, c.c.y - c.r, c.c.x + c.r, c.c.y + c.r};
+        if (!c.isCircle) {
+            // Arc: endpoints plus the axis extremes inside the sweep (with slack, so the box stays conservative).
+            Box t{std::min(c.a.x, c.b.x), std::min(c.a.y, c.b.y), std::max(c.a.x, c.b.x), std::max(c.a.y, c.b.y)};
+            for (int k = 0; k < 4; ++k) {
+                const double th = k * (kPi / 2);
+                if (normAngle(th - c.a0) <= c.sweep + 1e-6 || normAngle(th - c.a0) >= kTwoPi - 1e-6) {
+                    const Point2 p{c.c.x + c.r * std::cos(th), c.c.y + c.r * std::sin(th)};
+                    t = {std::min(t.x0, p.x), std::min(t.y0, p.y), std::max(t.x1, p.x), std::max(t.y1, p.y)};
+                }
+            }
+            b = t;
+        }
+    }
+    const double scale = std::max({std::abs(b.x0), std::abs(b.y0), std::abs(b.x1), std::abs(b.y1), c.r});
+    const double m = 10.0 * kVertexTol + 1e-6 * c.r + 1e-12 * scale;
+    return {b.x0 - m, b.y0 - m, b.x1 + m, b.y1 + m};
+}
+
+/// Candidate pairs (i < j), sorted lexicographically so the narrow phase visits them in the same order as the
+/// brute-force double loop (vertex merging is order-dependent, so this keeps results bit-identical).
+std::vector<std::pair<std::size_t, std::size_t>> candidatePairs(const std::vector<Curve>& curves, bool bruteForce) {
+    const std::size_t n = curves.size();
+    std::vector<std::pair<std::size_t, std::size_t>> pairs;
+    if (bruteForce) {
+        for (std::size_t i = 0; i < n; ++i)
+            for (std::size_t j = i + 1; j < n; ++j) pairs.emplace_back(i, j);
+        return pairs;
+    }
+    std::vector<Box> boxes(n);
+    for (std::size_t i = 0; i < n; ++i) boxes[i] = curveBox(curves[i]);
+    std::vector<std::size_t> order(n);
+    for (std::size_t i = 0; i < n; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return std::tie(boxes[a].x0, a) < std::tie(boxes[b].x0, b);
+    });
+    // Sort-and-sweep along x; the active list holds boxes whose x-interval still reaches the sweep position.
+    std::vector<std::size_t> active;
+    for (const std::size_t i : order) {
+        const Box& bi = boxes[i];
+        std::size_t keep = 0;
+        for (const std::size_t j : active) {
+            const Box& bj = boxes[j];
+            if (bj.x1 < bi.x0) continue; // can no longer overlap anything later in the sweep
+            active[keep++] = j;
+            if (bj.y1 >= bi.y0 && bi.y1 >= bj.y0) pairs.emplace_back(std::min(i, j), std::max(i, j));
+        }
+        active.resize(keep);
+        active.push_back(i);
+    }
+    std::sort(pairs.begin(), pairs.end());
+    return pairs;
 }
 
 // ---- vertices -------------------------------------------------------------------------------------------------
@@ -340,6 +409,10 @@ std::string tokenName(const std::vector<Token>& tokens) {
 } // namespace
 
 Result<std::vector<SketchProfile>> detectProfiles(const Sketch& sketch) {
+    return detail::detectProfilesWith(sketch, false);
+}
+
+Result<std::vector<SketchProfile>> detail::detectProfilesWith(const Sketch& sketch, bool bruteForce) {
     // 1. Curves of non-construction line / arc / circle entities (points and construction geometry are skipped).
     std::vector<Curve> curves;
     for (const auto& [id, e] : sketch.entities()) {
@@ -376,26 +449,26 @@ Result<std::vector<SketchProfile>> detectProfiles(const Sketch& sketch) {
     std::vector<std::vector<Point2>> splits(n);
     for (std::size_t i = 0; i < n; ++i) endpoints(curves[i], splits[i]);
     std::vector<Point2> cand;
-    for (std::size_t i = 0; i < n; ++i)
-        for (std::size_t j = i + 1; j < n; ++j) {
-            const Curve& A = curves[i];
-            const Curve& B = curves[j];
-            cand.clear();
-            candidates(A, B, cand);
-            for (const Point2 p : cand)
-                if (onCurve(A, p) && onCurve(B, p)) {
-                    splits[i].push_back(p);
-                    splits[j].push_back(p);
-                }
-            std::vector<Point2> ends;
-            endpoints(A, ends);
-            for (const Point2 p : ends)
-                if (onCurve(B, p)) splits[j].push_back(p);
-            ends.clear();
-            endpoints(B, ends);
-            for (const Point2 p : ends)
-                if (onCurve(A, p)) splits[i].push_back(p);
-        }
+    std::vector<Point2> ends;
+    for (const auto& [i, j] : candidatePairs(curves, bruteForce)) {
+        const Curve& A = curves[i];
+        const Curve& B = curves[j];
+        cand.clear();
+        candidates(A, B, cand);
+        for (const Point2 p : cand)
+            if (onCurve(A, p) && onCurve(B, p)) {
+                splits[i].push_back(p);
+                splits[j].push_back(p);
+            }
+        ends.clear();
+        endpoints(A, ends);
+        for (const Point2 p : ends)
+            if (onCurve(B, p)) splits[j].push_back(p);
+        ends.clear();
+        endpoints(B, ends);
+        for (const Point2 p : ends)
+            if (onCurve(A, p)) splits[i].push_back(p);
+    }
 
     // 3. Vertices and per-curve ordered split lists.
     VertexStore store;
@@ -446,21 +519,19 @@ Result<std::vector<SketchProfile>> detectProfiles(const Sketch& sketch) {
     }
 
     // Drop geometric duplicates (identical piece listed twice, e.g. overlapping collinear lines): same vertex
-    // pair and same midpoint.
+    // pair and same midpoint. Kept edges are bucketed by vertex pair, so only same-pair edges are compared.
     {
         std::vector<Edge> kept;
-        std::vector<Point2> keptMid;
+        std::map<std::pair<int, int>, std::vector<Point2>> keptMids; // (lo, hi) vertex pair -> kept midpoints
         for (const Edge& e : edges) {
             Point2 left;
             const Point2 mid = midpointAndLeft(directed(e, false, store), left);
-            const int lo = std::min(e.u, e.v), hi = std::max(e.u, e.v);
-            bool dup = false;
-            for (std::size_t k = 0; k < kept.size() && !dup; ++k)
-                dup = std::min(kept[k].u, kept[k].v) == lo && std::max(kept[k].u, kept[k].v) == hi &&
-                      distance(mid, keptMid[k]) <= kVertexTol;
+            auto& mids = keptMids[{std::min(e.u, e.v), std::max(e.u, e.v)}];
+            const bool dup = std::any_of(mids.begin(), mids.end(),
+                                         [&](Point2 m) { return distance(mid, m) <= kVertexTol; });
             if (!dup) {
                 kept.push_back(e);
-                keptMid.push_back(mid);
+                mids.push_back(mid);
             }
         }
         edges = std::move(kept);
@@ -535,6 +606,26 @@ Result<std::vector<SketchProfile>> detectProfiles(const Sketch& sketch) {
     std::vector<std::size_t> positive, negative;
     for (std::size_t i = 0; i < loops.size(); ++i) (loops[i].area > 0 ? positive : negative).push_back(i);
 
+    // Box of each positive loop (arcs contribute their full circle box). A probe below, above or right of the box
+    // gets no crossing from any piece (pieceWinding only counts crossings strictly right of the probe), so skipping
+    // the winding test there is exact; the margin absorbs rounding in the crossing computations.
+    std::vector<Box> loopBox(loops.size());
+    for (const std::size_t pi : positive) {
+        Box b{std::numeric_limits<double>::max(), std::numeric_limits<double>::max(),
+              std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest()};
+        const auto grow = [&b](double x0, double y0, double x1, double y1) {
+            b = {std::min(b.x0, x0), std::min(b.y0, y0), std::max(b.x1, x1), std::max(b.y1, y1)};
+        };
+        for (const int hh : loops[pi].halfEdges) {
+            const Directed& d = dir[static_cast<std::size_t>(hh)];
+            grow(std::min(d.from.x, d.to.x), std::min(d.from.y, d.to.y), std::max(d.from.x, d.to.x),
+                 std::max(d.from.y, d.to.y));
+            if (d.isArc) grow(d.c.x - d.r, d.c.y - d.r, d.c.x + d.r, d.c.y + d.r);
+        }
+        const double m = 1e-6 + 1e-9 * std::max({std::abs(b.x0), std::abs(b.y0), std::abs(b.x1), std::abs(b.y1)});
+        loopBox[pi] = {b.x0 - m, b.y0 - m, b.x1 + m, b.y1 + m};
+    }
+
     std::map<std::size_t, std::vector<std::size_t>> holesOf; // positive loop index -> negative loop indices
     for (const std::size_t ni : negative) {
         const Loop& N = loops[ni];
@@ -547,6 +638,8 @@ Result<std::vector<SketchProfile>> detectProfiles(const Sketch& sketch) {
         std::size_t best = loops.size();
         double bestArea = 0;
         for (const std::size_t pi : positive) {
+            const Box& lb = loopBox[pi];
+            if (!bruteForce && (probe.y < lb.y0 || probe.y > lb.y1 || probe.x > lb.x1)) continue; // w == 0
             int w = 0;
             for (const int hh : loops[pi].halfEdges) w += pieceWinding(dir[static_cast<std::size_t>(hh)], probe);
             if (w == 0) continue;

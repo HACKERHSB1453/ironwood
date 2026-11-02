@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <numbers>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -765,4 +766,121 @@ TEST(SketchReference, ReferenceEntitiesAreNotProfiles) {
     auto ps = detectProfiles(s);
     ASSERT_TRUE(ps.has_value());
     EXPECT_TRUE(ps->empty());
+}
+
+// ---- F18: bbox broad phase ----------------------------------------------------------------------------------------
+
+namespace {
+
+/// Exact (bitwise) comparison of two profile lists: the broad phase must not change a single bit of the output.
+void expectIdenticalProfiles(const std::vector<SketchProfile>& a, const std::vector<SketchProfile>& b,
+                             const std::string& ctx) {
+    ASSERT_EQ(a.size(), b.size()) << ctx;
+    const auto sameLoop = [&](const ProfileLoop& x, const ProfileLoop& y, const std::string& where) {
+        ASSERT_EQ(x.edges.size(), y.edges.size()) << where;
+        EXPECT_EQ(x.area, y.area) << where;
+        for (std::size_t k = 0; k < x.edges.size(); ++k) {
+            const ProfileEdge& p = x.edges[k];
+            const ProfileEdge& q = y.edges[k];
+            EXPECT_EQ(p.entity, q.entity) << where;
+            EXPECT_EQ(p.subIndex, q.subIndex) << where;
+            EXPECT_EQ(p.isArc, q.isArc) << where;
+            EXPECT_TRUE(p.start.x == q.start.x && p.start.y == q.start.y && p.end.x == q.end.x && p.end.y == q.end.y &&
+                        p.center.x == q.center.x && p.center.y == q.center.y && p.radius == q.radius &&
+                        p.startAngle == q.startAngle && p.sweep == q.sweep)
+                << where << " edge " << k;
+        }
+    };
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const std::string where = ctx + " profile " + a[i].name;
+        EXPECT_EQ(a[i].name, b[i].name) << ctx;
+        EXPECT_EQ(a[i].area, b[i].area) << where;
+        EXPECT_EQ(a[i].centroid.x, b[i].centroid.x) << where;
+        EXPECT_EQ(a[i].centroid.y, b[i].centroid.y) << where;
+        sameLoop(a[i].outer, b[i].outer, where + " outer");
+        ASSERT_EQ(a[i].holes.size(), b[i].holes.size()) << where;
+        for (std::size_t h = 0; h < a[i].holes.size(); ++h) sameLoop(a[i].holes[h], b[i].holes[h], where + " hole");
+    }
+}
+
+std::vector<SketchProfile> detectBrute(const Sketch& s) {
+    auto r = detail::detectProfilesWith(s, true);
+    EXPECT_TRUE(r.has_value());
+    return r.value_or(std::vector<SketchProfile>{});
+}
+
+} // namespace
+
+TEST(ProfilesBroadPhase, MatchesBruteForceOnRandomSmallSketches) {
+    // Coordinates are mostly on a coarse grid so coincident endpoints, T-junctions, shared/collinear edges and
+    // tangencies actually occur; some are off-grid reals for generic crossings.
+    std::mt19937 rng(20261102);
+    std::uniform_int_distribution<int> gridCoord(0, 8);
+    std::uniform_real_distribution<double> realCoord(0.0, 8.0);
+    std::uniform_int_distribution<int> kind(0, 9);
+    std::uniform_int_distribution<int> count(1, 24);
+    std::uniform_int_distribution<int> quarter(0, 7);
+    std::size_t totalProfiles = 0;
+    for (int iter = 0; iter < 300; ++iter) {
+        Sketch s = xySketch();
+        const bool onGrid = iter % 3 != 0;
+        const auto coord = [&] { return onGrid ? static_cast<double>(gridCoord(rng)) : realCoord(rng); };
+        const int n = count(rng);
+        for (int e = 0; e < n; ++e) {
+            const int k = kind(rng);
+            if (k < 6) {
+                const Point2 a{coord(), coord()};
+                const Point2 b{coord(), coord()};
+                if (distance(a, b) > 1e-6) (void)s.addLine(a, b);
+            } else if (k < 8) {
+                const double r = onGrid ? 1.0 + gridCoord(rng) % 4 : 0.5 + realCoord(rng) / 2;
+                const Point2 c{coord(), coord()};
+                (void)s.addCircle(c, r);
+            } else {
+                const double r = onGrid ? 1.0 + gridCoord(rng) % 4 : 0.5 + realCoord(rng) / 2;
+                const double a0 = onGrid ? quarter(rng) * kPi / 4 : realCoord(rng);
+                const double sw = onGrid ? (1 + quarter(rng)) * kPi / 4 : 0.2 + realCoord(rng) * 0.7;
+                const Point2 c{coord(), coord()};
+                (void)s.addArc(c, r, a0, sw);
+            }
+        }
+        const auto fast = detect(s);
+        const auto brute = detectBrute(s);
+        expectIdenticalProfiles(fast, brute, "iteration " + std::to_string(iter));
+        totalProfiles += fast.size();
+        if (HasFatalFailure()) return;
+    }
+    EXPECT_GT(totalProfiles, 100u) << "random sketches should produce plenty of regions to compare";
+}
+
+TEST(ProfilesBroadPhase, ThousandEntitySketchIsFastAndMatchesBruteForce) {
+    // 20 x 10 cells, each a 2x2 square (4 lines) with a circle inside, plus one long line per row crossing every
+    // square below its circle: 200 * 5 + 10 = 1010 entities.
+    Sketch s = xySketch();
+    constexpr int NX = 20, NY = 10;
+    for (int i = 0; i < NX; ++i)
+        for (int j = 0; j < NY; ++j) {
+            addRect(s, i * 3.0, j * 3.0, 2.0, 2.0);
+            addCircle(s, i * 3.0 + 1.0, j * 3.0 + 1.2, 0.6);
+        }
+    for (int j = 0; j < NY; ++j) ASSERT_TRUE(s.addLine({-1.0, j * 3.0 + 0.4}, {NX * 3.0, j * 3.0 + 0.4}).has_value());
+    ASSERT_GE(s.entities().size(), 1000u);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto ps = detect(s);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+    // Per cell: the strip below the crossing line, the part above it with the circle as a hole, and the disc.
+    EXPECT_EQ(ps.size(), static_cast<std::size_t>(NX * NY * 3));
+    double total = 0;
+    for (const auto& p : ps) total += p.area;
+    expectRel(total, NX * NY * 4.0, 1e-9);
+    // Generous bound for a debug build on a slow shared box (measured: see docs/P0_FOLLOWUPS.md F18).
+    EXPECT_LT(ms.count(), 3000) << "profile detection on a 1000-entity sketch took " << ms.count() << " ms";
+
+    const auto t1 = std::chrono::steady_clock::now();
+    const auto brute = detectBrute(s);
+    const auto bruteMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t1);
+    RecordProperty("broad_phase_ms", static_cast<int>(ms.count()));
+    RecordProperty("brute_force_ms", static_cast<int>(bruteMs.count()));
+    expectIdenticalProfiles(ps, brute, "1000-entity grid");
 }

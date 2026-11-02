@@ -99,7 +99,7 @@ struct Document::Ops {
             if (f_->id().value() >= d_.data_.nextId) d_.data_.nextId = f_->id().value() + 1;
             return {};
         }
-        void undo() override { (void)d_.data_.timeline.remove(f_->id()); }
+        void undo() noexcept override { (void)d_.data_.timeline.remove(f_->id()); }
         std::string text() const override { return "Add Feature"; }
 
     private:
@@ -118,7 +118,7 @@ struct Document::Ops {
             old_ = tl.at(*idx);
             return tl.replace(f_);
         }
-        void undo() override { (void)d_.data_.timeline.replace(old_); }
+        void undo() noexcept override { (void)d_.data_.timeline.replace(old_); }
         std::string text() const override { return "Edit Feature"; }
 
     private:
@@ -136,7 +136,7 @@ struct Document::Ops {
             d_.data_.timeline.setSuppressed(id_, value_);
             return {};
         }
-        void undo() override { d_.data_.timeline.setSuppressed(id_, prev_); }
+        void undo() noexcept override { d_.data_.timeline.setSuppressed(id_, prev_); }
         std::string text() const override { return value_ ? "Suppress Feature" : "Unsuppress Feature"; }
 
     private:
@@ -159,7 +159,7 @@ struct Document::Ops {
             tl.setSuppressed(id_, false);
             return tl.remove(id_);
         }
-        void undo() override {
+        void undo() noexcept override {
             auto& tl = d_.data_.timeline;
             tl.insert(index_, feature_);
             tl.setSuppressed(id_, wasSuppressed_);
@@ -185,7 +185,7 @@ struct Document::Ops {
             else tl.clearRollbackMarker();
             return {};
         }
-        void undo() override {
+        void undo() noexcept override {
             auto& tl = d_.data_.timeline;
             if (prev_ >= tl.size()) tl.clearRollbackMarker();
             else tl.setRollbackMarker(prev_);
@@ -203,7 +203,7 @@ struct Document::Ops {
         AddParameter(Document& d, std::string name, std::string expr, std::string unit, std::string comment)
             : d_(d), name_(std::move(name)), expr_(std::move(expr)), unit_(std::move(unit)), comment_(std::move(comment)) {}
         Result<void> execute() override { return d_.data_.parameters.add(name_, expr_, unit_, comment_); }
-        void undo() override { (void)d_.data_.parameters.remove(name_); }
+        void undo() noexcept override { (void)d_.data_.parameters.remove(name_); }
         std::string text() const override { return "Add Parameter"; }
 
     private:
@@ -220,7 +220,7 @@ struct Document::Ops {
             prev_ = p->expression.source();
             return d_.data_.parameters.setExpression(name_, expr_);
         }
-        void undo() override { (void)d_.data_.parameters.setExpression(name_, prev_); }
+        void undo() noexcept override { (void)d_.data_.parameters.setExpression(name_, prev_); }
         std::string text() const override { return "Edit Parameter"; }
 
     private:
@@ -250,7 +250,7 @@ struct Document::Ops {
                 if (auto r = tl.replace(f); !r) return r;
             return {};
         }
-        void undo() override {
+        void undo() noexcept override {
             auto& tl = d_.data_.timeline;
             for (const auto& f : beforeFeatures_) (void)tl.replace(f);
             if (params_) d_.data_.parameters = beforeParams_;
