@@ -204,7 +204,7 @@ Result<std::shared_ptr<recompute::Feature>> ConstructionPlaneFeature::fromJson(F
         auto pts = j.find("points");
         if (pts == j.end() || !pts->is_array() || pts->size() != 3) return makeError(ErrorCode::ParseError, "plane: 'points' needs 3 points");
         for (std::size_t i = 0; i < 3; ++i) {
-            auto t = triple((*pts)[i], "point");
+            auto t = triple(json{{"point", (*pts)[i]}}, "point");
             if (!t) return std::unexpected(t.error());
             p.points[i] = *t;
         }

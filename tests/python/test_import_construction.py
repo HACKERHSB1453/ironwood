@@ -159,11 +159,6 @@ class ConstructionKinds(unittest.TestCase):
         self.assertAlmostEqual(abs(g["normal"][0]), 1, places=9)
         self.assertAlmostEqual(g["origin"][0], 20, places=6)
 
-    # Known core bug (not in the bindings): ConstructionPlaneFeature::fromJson reads each three_points entry with
-    # triple(entry, "point"), i.e. looks for a "point" key inside the array, so the feature cannot round-trip through
-    # the registry and Document.addFeature rejects it with ParseError. Remove the decorator once that is fixed in
-    # src/features/construction_features.cpp.
-    @unittest.expectedFailure
     def test_plane_through_three_points(self):
         p = self.d.plane_through_points((0, 0, 5), (1, 0, 5), ("0 mm", "1 mm", "5 mm"))
         ev = self.d.evaluate()
