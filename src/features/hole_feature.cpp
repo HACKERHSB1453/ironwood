@@ -3,8 +3,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
+#include <map>
 #include <numbers>
+#include <type_traits>
 #include <utility>
+#include <variant>
 
 #include <nlohmann/json.hpp>
 
@@ -55,7 +59,10 @@ bool validThread(const std::string& s) {
 ///   segment it starts>"; the tool's own elements then derive from those through the revolve history (ops "holetool.<...>").
 /// Ops "hole.*" are what the cut itself creates where the tool meets the body (rim edges and vertices), named from the
 /// body face and the tool face they lie between.
-Result<naming::NamingMap> holeToolNaming(FeatureId id, const kernel::HoleDetail& hd, const naming::SiblingFrame& frame) {
+/// `tag` is "holetool" for a face-placed hole and "holetool.e<sketch entity id>" for each hole placed from a sketch point,
+/// so the holes of one multi-hole feature never share names.
+Result<naming::NamingMap> holeToolNaming(FeatureId id, const kernel::HoleDetail& hd, const naming::SiblingFrame& frame,
+                                         const std::string& tag = "holetool") {
     const auto& pts = hd.profile.points;
     const auto& roles = hd.profile.segmentRoles;
     const std::size_t n = pts.size();
@@ -70,7 +77,7 @@ Result<naming::NamingMap> holeToolNaming(FeatureId id, const kernel::HoleDetail&
         return nm;
     };
     for (std::uint32_t i = 0; i < prof.size(ElementType::Face); ++i)
-        if (auto r = prof.set(ElementType::Face, i, make(ElementType::Face, "holetool.profile")); !r) return std::unexpected(r.error());
+        if (auto r = prof.set(ElementType::Face, i, make(ElementType::Face, tag + ".profile")); !r) return std::unexpected(r.error());
     auto close = [](const Vec3& a, const Vec3& b) {
         return length(a - b) <= 1e-6 * (1.0 + std::max(length(a), length(b)));
     };
@@ -81,7 +88,7 @@ Result<naming::NamingMap> holeToolNaming(FeatureId id, const kernel::HoleDetail&
             const Vec3 mid = (pts[s] + pts[(s + 1) % n]) * 0.5;
             if (!close(mid, Vec3{k[0], k[1], k[2]})) continue;
             found = true;
-            if (auto r = prof.set(ElementType::Edge, i, make(ElementType::Edge, "holetool." + roles[s])); !r) return std::unexpected(r.error());
+            if (auto r = prof.set(ElementType::Edge, i, make(ElementType::Edge, tag + "." + roles[s])); !r) return std::unexpected(r.error());
         }
         if (!found) return makeError(ErrorCode::Internal, "hole: tool profile edge does not match a profile segment");
     }
@@ -91,11 +98,11 @@ Result<naming::NamingMap> holeToolNaming(FeatureId id, const kernel::HoleDetail&
         for (std::size_t s = 0; s < n && !found; ++s) {
             if (!close(pts[s], Vec3{k[0], k[1], k[2]})) continue;
             found = true;
-            if (auto r = prof.set(ElementType::Vertex, i, make(ElementType::Vertex, "holetool.v_" + roles[s])); !r) return std::unexpected(r.error());
+            if (auto r = prof.set(ElementType::Vertex, i, make(ElementType::Vertex, tag + ".v_" + roles[s])); !r) return std::unexpected(r.error());
         }
         if (!found) return makeError(ErrorCode::Internal, "hole: tool profile vertex does not match a profile point");
     }
-    return naming::deriveNamingMap(id, "holetool", hd.tool.shape, {&prof}, hd.tool.history, &frame);
+    return naming::deriveNamingMap(id, tag, hd.tool.shape, {&prof}, hd.tool.history, &frame);
 }
 
 } // namespace
@@ -116,15 +123,59 @@ std::uint64_t HoleFeature::paramHash() const {
     common::Fnv f;
     f.bytes("hole/v1:");
     f.bytes(paramsJson());
+    // The embedded solved sketch (sketch placement) is not serialised but decides the geometry: hash the plane and the
+    // position of every referenced entity, so editing the sketch invalidates the cached result.
+    if (params_.sketchPoints && params_.sketchPoints->solved) {
+        const sketch::Sketch& sk = *params_.sketchPoints->solved;
+        const sketch::SketchPlane& pl = sk.plane();
+        json h = json::array({pl.origin.x, pl.origin.y, pl.origin.z, pl.normal.x, pl.normal.y, pl.normal.z, pl.xDir.x, pl.xDir.y,
+                              pl.xDir.z});
+        for (sketch::SketchEntityId e : params_.sketchPoints->points) {
+            const sketch::SketchEntity* ent = sk.findEntity(e);
+            if (!ent) {
+                h.push_back("missing");
+                continue;
+            }
+            h.push_back(static_cast<int>(ent->kind()));
+            std::visit(
+                [&](const auto& g) {
+                    using G = std::decay_t<decltype(g)>;
+                    if constexpr (std::is_same_v<G, sketch::PointGeom>) {
+                        h.push_back(g.p.x);
+                        h.push_back(g.p.y);
+                    } else if constexpr (std::is_same_v<G, sketch::LineGeom>) {
+                        h.push_back(g.start.x);
+                        h.push_back(g.start.y);
+                    } else {
+                        h.push_back(g.center.x);
+                        h.push_back(g.center.y);
+                    }
+                },
+                ent->geometry);
+        }
+        f.bytes(":solved:");
+        f.bytes(h.dump());
+    }
     return f.h;
 }
 
 std::string HoleFeature::paramsJson() const {
     const HoleParams& p = params_;
-    json j{{"body", p.body.value()}, {"face", common::refToJson(p.face)}, {"u", p.u}, {"v", p.v}, {"kind", kindName(p.kind)},
+    json j{{"body", p.body.value()}, {"u", p.u}, {"v", p.v}, {"kind", kindName(p.kind)},
            {"diameter", p.diameter}, {"depth", p.depth}, {"through", p.through}, {"drill_angle", p.drillAngle},
            {"cb_diameter", p.counterboreDiameter}, {"cb_depth", p.counterboreDepth}, {"cs_diameter", p.countersinkDiameter},
            {"cs_angle", p.countersinkAngle}, {"thread", p.thread}};
+    if (p.sketchPoints) {
+        // Sketch placement: no face reference. The face form keeps exactly its earlier keys (no "placement" key).
+        j["placement"] = "sketch_points";
+        j["sketch_feature"] = p.sketchPoints->sketch.value();
+        json pts = json::array();
+        for (sketch::SketchEntityId e : p.sketchPoints->points) pts.push_back(e.value());
+        j["points"] = std::move(pts);
+        j["flip"] = p.sketchPoints->flip;
+    } else {
+        j["face"] = common::refToJson(p.face);
+    }
     return j.dump();
 }
 
@@ -132,10 +183,32 @@ Result<std::shared_ptr<recompute::Feature>> HoleFeature::fromJson(FeatureId id, 
     json j = json::parse(text, nullptr, false);
     if (j.is_discarded() || !j.is_object()) return makeError(ErrorCode::ParseError, "hole: params are not a JSON object");
     HoleParams p;
-    auto face = common::refFromJson(j, "face");
-    if (!face) return std::unexpected(face.error());
-    if (face->type != ElementType::Face) return makeError(ErrorCode::ParseError, "hole: placement reference is not a face");
-    p.face = *face;
+    auto placement = common::readString(j, "placement", std::string("face"));
+    if (!placement) return std::unexpected(placement.error());
+    if (*placement == "sketch_points") {
+        HoleSketchPlacement sp;
+        auto sf = j.find("sketch_feature");
+        if (sf == j.end() || !sf->is_number_unsigned()) return makeError(ErrorCode::ParseError, "hole: 'sketch_feature' must be an unsigned id");
+        sp.sketch = FeatureId{sf->get<std::uint64_t>()};
+        auto pts = j.find("points");
+        if (pts == j.end() || !pts->is_array() || pts->empty())
+            return makeError(ErrorCode::ParseError, "hole: 'points' must be a non-empty array of sketch entity ids");
+        for (const json& e : *pts) {
+            if (!e.is_number_unsigned()) return makeError(ErrorCode::ParseError, "hole: sketch point ids must be unsigned integers");
+            sp.points.push_back(sketch::SketchEntityId{e.get<std::uint64_t>()});
+        }
+        auto flip = j.find("flip");
+        if (flip != j.end() && !flip->is_boolean()) return makeError(ErrorCode::ParseError, "hole: 'flip' must be a boolean");
+        sp.flip = flip != j.end() && flip->get<bool>();
+        p.sketchPoints = std::move(sp);
+    } else if (*placement == "face") {
+        auto face = common::refFromJson(j, "face");
+        if (!face) return std::unexpected(face.error());
+        if (face->type != ElementType::Face) return makeError(ErrorCode::ParseError, "hole: placement reference is not a face");
+        p.face = *face;
+    } else {
+        return makeError(ErrorCode::ParseError, "hole: unknown placement '" + *placement + "'");
+    }
 
     struct Field { std::string* dst; const char* key; const char* fallback; };
     const Field fields[] = {{&p.u, "u", "0 mm"}, {&p.v, "v", "0 mm"}, {&p.diameter, "diameter", "6 mm"}, {&p.depth, "depth", "10 mm"},
@@ -170,19 +243,6 @@ Result<FeatureResult> HoleFeature::compute(const EvalContext& ctx) const {
     if (!p.thread.empty() && !validThread(p.thread))
         return makeError(ErrorCode::InvalidArgument, "hole: thread '" + p.thread + "' is not a designation such as M6 or M6x1.0");
 
-    std::vector<Diagnostic> diags;
-    auto faceIdx = common::resolveRef(ctx, p.body, p.face, ElementType::Face, diags);
-    if (!faceIdx) return std::unexpected(faceIdx.error());
-    auto plane = kernel::planeFromFace(*body, *faceIdx);
-    if (!plane) return makeError(ErrorCode::InvalidArgument, "hole: the placement face is not planar");
-
-    auto u = common::lengthOf(ctx.params, p.u, "hole placement u");
-    if (!u) return std::unexpected(u.error());
-    auto v = common::lengthOf(ctx.params, p.v, "hole placement v");
-    if (!v) return std::unexpected(v.error());
-    const Vec3 yDir = cross(plane->normal, plane->xDir);
-    const Vec3 entry = plane->origin + plane->xDir * *u + yDir * *v;
-
     kernel::HoleSpec spec;
     spec.kind = p.kind;
     auto dia = common::lengthOf(ctx.params, p.diameter, "hole diameter");
@@ -213,6 +273,24 @@ Result<FeatureResult> HoleFeature::compute(const EvalContext& ctx) const {
         spec.countersinkAngle = *ca;
     }
     if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "hole cancelled");
+    if (p.sketchPoints) {
+        auto out = computeFromSketch(ctx, spec);
+        if (out && !p.thread.empty()) out->attributes["thread"] = p.thread;
+        return out;
+    }
+
+    std::vector<Diagnostic> diags;
+    auto faceIdx = common::resolveRef(ctx, p.body, p.face, ElementType::Face, diags);
+    if (!faceIdx) return std::unexpected(faceIdx.error());
+    auto plane = kernel::planeFromFace(*body, *faceIdx);
+    if (!plane) return makeError(ErrorCode::InvalidArgument, "hole: the placement face is not planar");
+
+    auto u = common::lengthOf(ctx.params, p.u, "hole placement u");
+    if (!u) return std::unexpected(u.error());
+    auto v = common::lengthOf(ctx.params, p.v, "hole placement v");
+    if (!v) return std::unexpected(v.error());
+    const Vec3 yDir = cross(plane->normal, plane->xDir);
+    const Vec3 entry = plane->origin + plane->xDir * *u + yDir * *v;
 
     const kernel::Axis placement{entry, plane->normal * -1.0};
     auto detail = kernel::holeWithTool(*body, placement, spec, ctx.cancel);
@@ -230,6 +308,89 @@ Result<FeatureResult> HoleFeature::compute(const EvalContext& ctx) const {
     if (!out) return std::unexpected(out.error());
     if (!p.thread.empty()) out->attributes["thread"] = p.thread;
     return out;
+}
+
+Result<FeatureResult> HoleFeature::computeFromSketch(const EvalContext& ctx, const kernel::HoleSpec& spec) const {
+    const HoleParams& p = params_;
+    const HoleSketchPlacement& sp = *p.sketchPoints;
+    const std::string sketchName = "sketch feature " + std::to_string(sp.sketch.value());
+    if (!sp.solved)
+        return makeError(ErrorCode::NotFound, "hole: " + sketchName + " has no solved sketch at this position (it must precede the hole and solve)");
+    if (sp.points.empty()) return makeError(ErrorCode::InvalidArgument, "hole: no sketch points selected");
+    const sketch::Sketch& sk = *sp.solved;
+    const sketch::SketchPlane& plane = sk.plane();
+
+    std::vector<Diagnostic> diags;
+    struct Site {
+        sketch::SketchEntityId id;
+        Vec3 entry;
+    };
+    std::vector<Site> sites;
+    std::vector<sketch::SketchEntityId> seen;
+    for (sketch::SketchEntityId e : sp.points) {
+        if (std::find(seen.begin(), seen.end(), e) != seen.end()) continue; // a point selected twice drills once
+        seen.push_back(e);
+        const std::string pointName = "e" + std::to_string(e.value());
+        const sketch::SketchEntity* ent = sk.findEntity(e);
+        if (!ent) {
+            diags.push_back({Diagnostic::Severity::Warning,
+                             "hole: sketch point " + pointName + " no longer exists in " + sketchName + "; its hole is skipped", std::nullopt});
+            continue;
+        }
+        sketch::Point2 at;
+        if (const auto* pt = std::get_if<sketch::PointGeom>(&ent->geometry)) at = pt->p;
+        else if (const auto* c = std::get_if<sketch::CircleGeom>(&ent->geometry)) at = c->center;
+        else if (const auto* a = std::get_if<sketch::ArcGeom>(&ent->geometry)) at = a->center;
+        else
+            return makeError(ErrorCode::InvalidArgument,
+                             "hole: sketch entity " + pointName + " of " + sketchName + " is a line; select sketch points or circle / arc centres");
+        sites.push_back({e, plane.toWorld(at)});
+    }
+    if (sites.empty()) return makeError(ErrorCode::NotFound, "hole: none of the selected sketch points exists in " + sketchName + " any more");
+
+    // Drill direction (see HoleSketchPlacement): +n only when the whole body lies on the +n side of the sketch plane.
+    const kernel::Shape* body = ctx.body(p.body);
+    const naming::NamingMap* bodyNames = ctx.naming(p.body);
+    if (!body || !bodyNames) return makeError(ErrorCode::NotFound, "hole: body does not exist at this position");
+    const Vec3 n = common::normalized(plane.normal);
+    const Box3 bb = body->boundingBox();
+    double sMin = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < 8; ++i) {
+        const Vec3 corner{(i & 1) ? bb.max.x : bb.min.x, (i & 2) ? bb.max.y : bb.min.y, (i & 4) ? bb.max.z : bb.min.z};
+        sMin = std::min(sMin, dot(corner - plane.origin, n));
+    }
+    const double tol = 1e-6 * (1.0 + length(bb.max - bb.min));
+    Vec3 dir = sMin >= -tol ? n : n * -1.0;
+    if (sp.flip) dir = dir * -1.0;
+
+    // One kernel hole per point, applied in selection order to the evolving body. Each hole is named in its own frame and
+    // with its own tags ("hole.e<id>", "holetool.e<id>"), so the names follow the sketch point, not its position or rank.
+    std::map<BodyId, kernel::Shape> bodies{{p.body, *body}};
+    std::map<BodyId, naming::NamingMap> namings{{p.body, *bodyNames}};
+    FeatureResult last;
+    for (const Site& site : sites) {
+        if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "hole cancelled");
+        const std::string pointName = "e" + std::to_string(site.id.value());
+        const kernel::Axis placement{site.entry, dir};
+        auto detail = kernel::holeWithTool(bodies.at(p.body), placement, spec, ctx.cancel);
+        if (!detail) return makeError(detail.error().code, detail.error().message + " (at sketch point " + pointName + ")");
+        naming::SiblingFrame frame;
+        frame.origin = site.entry;
+        frame.zAxis = dir;
+        frame.xAxis = common::normalized(plane.xDir);
+        frame.yAxis = cross(frame.zAxis, frame.xAxis);
+        auto toolNames = holeToolNaming(id_, *detail, frame, "holetool." + pointName);
+        if (!toolNames) return std::unexpected(toolNames.error());
+        const EvalContext step{bodies, namings, ctx.cancel, ctx.params, ctx.constructions};
+        auto out = common::modifyBody(id_, p.body, step, detail->result, "hole." + pointName, {}, &*toolNames, &frame);
+        if (!out) return std::unexpected(out.error());
+        bodies.insert_or_assign(p.body, out->bodies.at(p.body));
+        namings.insert_or_assign(p.body, out->namings.at(p.body));
+        last = std::move(*out);
+    }
+    last.diagnostics = std::move(diags);
+    last.attributes["holes"] = std::to_string(sites.size());
+    return last;
 }
 
 void registerHoleFeature(recompute::FeatureRegistry& registry) {

@@ -6,8 +6,7 @@
 //    which subShapeKey reports as {0,0,0,0}.
 //  * holeWithTool: kernel::hole that ALSO returns the hole tool (the revolved solid) and the tool's profile with a role label
 //    per profile segment, so the naming layer can keep the tool (operand 1) history and name hole faces by ROLE.
-// FOLLOW-UP for the owner of ops.cpp: kernel::hole() should be reduced to `holeWithTool(...)->result` (the two share the
-// profile construction logic by copy today).
+// kernel::hole() is `holeWithTool(...)->result` (F42 done): the profile construction logic lives only here.
 
 #include <array>
 #include <cstddef>

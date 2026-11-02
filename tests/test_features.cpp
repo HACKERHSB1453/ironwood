@@ -777,6 +777,42 @@ TEST(FeaturesRevolve, SketchLineAxisRevolvesARectangleIntoACylinder) {
     EXPECT_NEAR(volumeOf(res.bodies.at(kB1)), 90.0 * kPi, 1e-6 * 90.0 * kPi);
 }
 
+TEST(FeaturesRevolve, EdgeAxisRevolvesAboutABodyEdgeAndJoins) {
+    // F26: axis = the vertical box edge at (10, 10). A 3 x 10 rectangle in the plane y = 10, x in [10, 13], revolved a full
+    // turn about that edge is a cylinder r = 3, h = 10 centred on the edge; a quarter of it lies inside the box.
+    Timeline tl;
+    tl.append(box10());
+    EvalResult base = evalAllOk(tl);
+    RevolveParams p;
+    PolygonSource src;
+    src.planeOrigin = {10, 10, 0};
+    src.planeNormal = {0, -1, 0}; // y-dir = normal x xDir = +z
+    src.planeXDir = {1, 0, 0};
+    src.points = {{0, 0}, {3, 0}, {3, 10}, {0, 10}};
+    p.source = src;
+    p.axis.kind = RevolveAxis::Kind::Edge;
+    p.axis.edge = cornerEdgeOfBox(base);
+    p.extent = RevolveParams::Extent::Full;
+    p.operation = BodyOp::Join;
+    p.body = kB1;
+    auto rev = std::make_shared<RevolveFeature>(FeatureId{2}, p);
+    ASSERT_EQ(rev->explicitRefs().size(), 1u);
+    ASSERT_EQ(rev->readsBodies().size(), 1u);
+    tl.append(rev);
+    EvalResult r = evalAllOk(tl);
+    EXPECT_NEAR(volumeOf(r.bodies.at(kB1)), 1000.0 + 0.75 * 90.0 * kPi, 1e-6 * 1000.0);
+    // Half turn (OneSide 180 deg) from the profile on the +x side: the sweep sense follows the edge's direction, so the
+    // half cylinder is either y >= 10 (entirely outside the box: +45 pi) or y <= 10 (half of it inside: +22.5 pi).
+    p.extent = RevolveParams::Extent::OneSide;
+    p.angle = "180 deg";
+    Timeline tl2;
+    tl2.append(box10());
+    tl2.append(std::make_shared<RevolveFeature>(FeatureId{2}, p));
+    EvalResult r2 = evalAllOk(tl2);
+    const double v2 = volumeOf(r2.bodies.at(kB1));
+    EXPECT_TRUE(std::abs(v2 - (1000.0 + 45.0 * kPi)) < 1e-3 || std::abs(v2 - (1000.0 + 22.5 * kPi)) < 1e-3) << v2;
+}
+
 TEST(FeaturesRevolve, ExpressionAngleFromParameterTable) {
     ParameterTable params;
     ASSERT_TRUE(params.add("sweep", "180 deg"));

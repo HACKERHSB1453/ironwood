@@ -11,6 +11,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <BOPAlgo_Options.hxx>
@@ -74,6 +75,7 @@
 #include "kernel/internal/progress.hpp"
 #include "kernel/internal/validate.hpp"
 #include "kernel/internal/shape_impl.hpp"
+#include "kernel/naming_support.hpp"
 
 namespace iw::kernel {
 namespace {
@@ -1052,91 +1054,11 @@ Result<ShapeResult> chamferEdgesByAngle(const Shape& shape, std::span<const std:
 }
 
 Result<ShapeResult> hole(const Shape& shape, const Axis& placement, const HoleSpec& spec, CancelToken cancel) {
-    if (shape.isNull()) return makeError(ErrorCode::InvalidArgument, "hole: null shape");
-    if (shape.type() != ShapeType::Solid) return makeError(ErrorCode::InvalidArgument, "hole: target must be a solid");
-    if (!finiteVec(placement.origin) || !finiteVec(placement.direction) || length(placement.direction) < 1e-12)
-        return makeError(ErrorCode::InvalidArgument, "hole: placement needs a finite origin and a non-zero direction");
-    if (!finitePositive(spec.diameter)) return makeError(ErrorCode::InvalidArgument, "hole: diameter must be finite and > 0");
-    if (!spec.through && !finitePositive(spec.depth))
-        return makeError(ErrorCode::InvalidArgument, "hole: depth must be finite and > 0 (or through)");
-    const bool drillOk = spec.drillPointAngle > 0.0 && spec.drillPointAngle <= kPiValue;
-    if (!spec.through && !drillOk) return makeError(ErrorCode::InvalidArgument, "hole: drill point angle must be in (0, pi]");
-    if (cancel.cancelled()) return makeError(ErrorCode::Cancelled, "hole cancelled");
-
-    const Vec3 o = placement.origin;
-    const Vec3 d = normalised(placement.direction);
-    const double r = spec.diameter / 2.0;
-    // The tool starts `margin` outside the entry face so the cut never coincides with the surface.
-    const double margin = std::max(1.0, spec.diameter);
-
-    // Farthest extent of the part along the drill direction (for through holes).
-    const Box3 bb = shape.boundingBox();
-    double tMax = -std::numeric_limits<double>::infinity();
-    for (int i = 0; i < 8; ++i) {
-        const Vec3 corner{(i & 1) ? bb.max.x : bb.min.x, (i & 2) ? bb.max.y : bb.min.y, (i & 4) ? bb.max.z : bb.min.z};
-        tMax = std::max(tMax, dot(corner - o, d));
-    }
-    if (spec.through && tMax <= 0.0)
-        return makeError(ErrorCode::InvalidArgument, "hole: entry point lies beyond the part along the drill direction");
-    const double zEnd = spec.through ? tMax + margin : spec.depth;
-    // Cone of a drill point with full included angle `a`, height r / tan(a/2); a = pi gives a flat bottom.
-    const auto coneHeight = [&] { return spec.through ? 0.0 : r / std::tan(spec.drillPointAngle / 2.0); };
-    const double tip = spec.through ? zEnd : spec.depth + coneHeight();
-
-    std::vector<std::pair<double, double>> rz; // profile in (radial, axial) coordinates, closed polygon
-    switch (spec.kind) {
-    case HoleKind::Simple:
-        rz = spec.through ? std::vector<std::pair<double, double>>{{0, -margin}, {r, -margin}, {r, zEnd}, {0, zEnd}}
-                          : std::vector<std::pair<double, double>>{{0, -margin}, {r, -margin}, {r, spec.depth}, {0, tip}};
-        break;
-    case HoleKind::Counterbore: {
-        if (!(spec.counterboreDiameter > spec.diameter))
-            return makeError(ErrorCode::InvalidArgument, "hole: counterbore diameter must exceed the hole diameter");
-        if (!finitePositive(spec.counterboreDepth))
-            return makeError(ErrorCode::InvalidArgument, "hole: counterbore depth must be finite and > 0");
-        if (!spec.through && !(spec.counterboreDepth < spec.depth))
-            return makeError(ErrorCode::InvalidArgument, "hole: counterbore must be shallower than the hole depth");
-        const double R = spec.counterboreDiameter / 2.0;
-        rz = spec.through
-                 ? std::vector<std::pair<double, double>>{{0, -margin}, {R, -margin}, {R, spec.counterboreDepth}, {r, spec.counterboreDepth}, {r, zEnd}, {0, zEnd}}
-                 : std::vector<std::pair<double, double>>{{0, -margin}, {R, -margin}, {R, spec.counterboreDepth}, {r, spec.counterboreDepth}, {r, spec.depth}, {0, tip}};
-        break;
-    }
-    case HoleKind::Countersink: {
-        if (!(spec.countersinkDiameter > spec.diameter))
-            return makeError(ErrorCode::InvalidArgument, "hole: countersink diameter must exceed the hole diameter");
-        if (!(spec.countersinkAngle > 0.0 && spec.countersinkAngle < kPiValue))
-            return makeError(ErrorCode::InvalidArgument, "hole: countersink angle must be in (0, pi)");
-        const double R = spec.countersinkDiameter / 2.0;
-        const double t = std::tan(spec.countersinkAngle / 2.0);   // dr/dz of the cone wall
-        const double zc = (R - r) / t;                             // depth where the cone meets the hole wall
-        const double limit = spec.through ? zEnd : spec.depth;
-        if (!(zc < limit)) return makeError(ErrorCode::InvalidArgument, "hole: countersink is deeper than the hole");
-        const double rTop = R + margin * t;                        // cone extended above the surface
-        rz = spec.through
-                 ? std::vector<std::pair<double, double>>{{0, -margin}, {rTop, -margin}, {r, zc}, {r, zEnd}, {0, zEnd}}
-                 : std::vector<std::pair<double, double>>{{0, -margin}, {rTop, -margin}, {r, zc}, {r, spec.depth}, {0, tip}};
-        break;
-    }
-    }
-
-    try {
-        // Profile lies in the plane spanned by the axis and a perpendicular direction; revolving it gives the tool.
-        const Vec3 x = perpendicularTo(d);
-        std::vector<Vec3> pts;
-        pts.reserve(rz.size());
-        for (const auto& [radial, axial] : rz) pts.push_back(o + d * axial + x * radial);
-        auto face = makePolygonFace(pts);
-        if (!face) return makeError(ErrorCode::Internal, "hole: could not build tool profile: " + face.error().message);
-        auto tool = revolve(*face, Axis{o, d}, kTwoPiValue, cancel);
-        if (!tool) return std::unexpected(tool.error());
-        auto result = cut(shape, tool->shape, cancel);
-        if (!result && result.error().code == ErrorCode::KernelFailure)
-            return makeError(ErrorCode::KernelFailure, "hole: cut failed (" + result.error().message + ")");
-        return result;
-    } catch (const Standard_Failure& e) {
-        return std::unexpected(occtError(e, "hole"));
-    }
+    // F42: the profile construction, validation and errors live in holeWithTool (naming_support.cpp); hole() is the
+    // same operation without the tool / profile detail.
+    auto detail = holeWithTool(shape, placement, spec, std::move(cancel));
+    if (!detail) return std::unexpected(detail.error());
+    return std::move(detail->result);
 }
 
 Result<ShapeResult> transform(const Shape& shape, const Transform& matrix, CancelToken cancel) {

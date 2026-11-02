@@ -73,11 +73,12 @@ private:
 };
 
 /// Feature id of the sketch an Extrude or Revolve takes its profile from, when `f` is such a feature with a
-/// SketchReferenceSource; nullopt otherwise.
+/// SketchReferenceSource, or that a Hole placed from sketch points uses (HoleSketchPlacement); nullopt otherwise.
 std::optional<FeatureId> sketchReferenceOf(const recompute::Feature& f);
 
 /// Copy of an Extrude / Revolve feature whose sketch reference is replaced by an embedded copy of `solved` (the
-/// solved sketch of the referenced feature). Returns nullptr when `f` does not reference a sketch.
+/// solved sketch of the referenced feature); for a sketch-placed Hole, `solved` is stored in
+/// HoleSketchPlacement::solved. Returns nullptr when `f` does not reference a sketch.
 std::shared_ptr<recompute::Feature> embedSketchReference(const recompute::Feature& f, const sketch::Sketch& solved);
 
 /// Registers kind "sketch" with `registry`.

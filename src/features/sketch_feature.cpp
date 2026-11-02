@@ -9,6 +9,7 @@
 
 #include "features/extrude_feature.hpp"
 #include "features/feature_json.hpp"
+#include "features/hole_feature.hpp"
 #include "features/revolve_feature.hpp"
 #include "features/sketch_json.hpp"
 #include "kernel/ops.hpp"
@@ -241,6 +242,8 @@ std::optional<FeatureId> sketchReferenceOf(const Feature& f) {
         if (const auto* ref = std::get_if<SketchReferenceSource>(&e->params().source)) return ref->sketch;
     } else if (const auto* r = dynamic_cast<const RevolveFeature*>(&f)) {
         if (const auto* ref = std::get_if<SketchReferenceSource>(&r->params().source)) return ref->sketch;
+    } else if (const auto* h = dynamic_cast<const HoleFeature*>(&f)) {
+        if (h->params().sketchPoints) return h->params().sketchPoints->sketch;
     }
     return std::nullopt;
 }
@@ -257,6 +260,12 @@ std::shared_ptr<Feature> embedSketchReference(const Feature& f, const sketch::Sk
             RevolveParams p = r->params();
             p.source = SketchSource{solved, ref->profile};
             return std::make_shared<RevolveFeature>(r->id(), std::move(p));
+        }
+    } else if (const auto* h = dynamic_cast<const HoleFeature*>(&f)) {
+        if (h->params().sketchPoints) {
+            HoleParams p = h->params();
+            p.sketchPoints->solved = solved;
+            return std::make_shared<HoleFeature>(h->id(), std::move(p));
         }
     }
     return nullptr;
