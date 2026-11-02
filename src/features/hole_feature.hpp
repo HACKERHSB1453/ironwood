@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -12,12 +13,38 @@
 #include "kernel/ops.hpp"
 #include "naming/element_name.hpp"
 #include "recompute/feature.hpp"
+#include "sketch/sketch.hpp"
 
 namespace iw::features {
 
+/// Placement "from sketch" (F26, Fusion: Hole -> From Sketch, multiple holes): one hole per referenced sketch point of an
+/// upstream SketchFeature, all cut by the one feature. Points are bound by their stable SketchEntityId, so editing the
+/// sketch (moving a point, changing a dimension) moves the holes.
+///  * Accepted entities: Point entities (construction or not, including the sketch origin kOriginPointId) and the centre
+///    of a Circle or Arc entity. Any other entity kind fails the feature (InvalidArgument).
+///  * A referenced entity that no longer exists in the solved sketch is skipped with a Warning diagnostic naming its id;
+///    when no referenced point is left the feature fails (NotFound).
+///  * Entry point: the point on the sketch plane. Depth (or "through") is measured from the sketch plane. Like every
+///    kernel::hole, the tool also clears max(1 mm, diameter) on the entry side (it assumes the entry lies on a surface),
+///    so a sketch plane INSIDE the body also removes that much material above the entry (follow-up: kernel clearance option).
+///  * Axis: the sketch normal n. The drill direction is decided once per feature from the body's bounding box relative
+///    to the sketch plane: if the body lies entirely on the +n side the holes run along +n, otherwise (body entirely on
+///    the -n side, or the plane cuts through the body) along -n, so a sketch on a top face (outward normal) drills
+///    down into the part, like face placement. `flip` reverses the decided direction.
+///  * The SketchFeature must precede the hole on the timeline. Document::evaluate() embeds the solved sketch into
+///    `solved` before evaluation (the same mechanism as Extrude / Revolve sketch references); evaluated without it the
+///    feature fails with NotFound. `solved` is never serialised.
+struct HoleSketchPlacement {
+    FeatureId sketch;
+    std::vector<sketch::SketchEntityId> points;
+    bool flip = false;
+    std::optional<sketch::Sketch> solved;
+};
+
 /// Hole (B1): simple, counterbore or countersink hole cut into `body`, entering through a planar face.
 ///  * Placement: the entry point is origin + u * X + v * Y of the face's plane (kernel::planeFromFace); the hole runs
-///    into the material along -normal.
+///    into the material along -normal. When `sketchPoints` is set, the holes are placed from sketch points instead
+///    (see HoleSketchPlacement) and `face`, `u`, `v` are ignored.
 ///  * Depth: `depth` from the entry plane, or `through` (depth ignored). Drill point: `drillAngle` (full included angle).
 ///  * `thread` is a cosmetic thread designation such as "M6x1.0" (or empty). It produces NO geometry; it is published
 ///    as the feature result attribute "thread" (FeatureStatus::attributes).
@@ -36,6 +63,7 @@ struct HoleParams {
     std::string countersinkDiameter = "12 mm";
     std::string countersinkAngle = "90 deg";
     std::string thread;
+    std::optional<HoleSketchPlacement> sketchPoints;
 };
 
 class HoleFeature final : public recompute::Feature {
@@ -45,7 +73,10 @@ public:
 
     FeatureId id() const override { return id_; }
     std::string_view kind() const override { return "hole"; }
-    std::vector<naming::ElementRef> explicitRefs() const override { return {params_.face}; }
+    std::vector<naming::ElementRef> explicitRefs() const override {
+        if (params_.sketchPoints) return {};
+        return {params_.face};
+    }
     std::vector<std::string> parameterReferences() const override;
     std::vector<BodyId> readsBodies() const override { return {params_.body}; }
     std::vector<BodyId> writesBodies() const override { return {params_.body}; }
@@ -55,6 +86,8 @@ public:
     const HoleParams& params() const noexcept { return params_; }
 
 private:
+    Result<recompute::FeatureResult> computeFromSketch(const recompute::EvalContext& ctx, const kernel::HoleSpec& spec) const;
+
     FeatureId id_;
     HoleParams params_;
 };
