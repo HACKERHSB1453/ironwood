@@ -459,6 +459,32 @@ namespace {
 /// Parses a 3-sequence (point / vector) argument.
 std::array<double, 3> vec3Arg(const py::handle& h) { return h.cast<std::array<double, 3>>(); }
 
+const std::uint64_t kSketchOriginId = sk::kOriginPointId.value();
+const std::uint64_t kSketchXAxisId = sk::kXAxisId.value();
+const std::uint64_t kSketchYAxisId = sk::kYAxisId.value();
+
+/// Shape / size options shared by Document.hole and Document.hole_from_sketch.
+void setHoleOptions(fe::HoleParams& p, py::object diameter, py::object depth, bool through, const std::string& kind,
+                    py::object drillAngle, py::object cbDiameter, py::object cbDepth, py::object csDiameter,
+                    py::object csAngle, const std::string& thread) {
+    if (kind == "simple") p.kind = kn::HoleKind::Simple;
+    else if (kind == "counterbore") p.kind = kn::HoleKind::Counterbore;
+    else if (kind == "countersink") p.kind = kn::HoleKind::Countersink;
+    else fail(ErrorCode::InvalidArgument, "kind must be simple, counterbore or countersink");
+    p.diameter = lengthExpr(diameter);
+    if (!through) {
+        if (depth.is_none()) fail(ErrorCode::InvalidArgument, "give depth=... or through=True");
+        p.depth = lengthExpr(depth);
+    }
+    p.through = through;
+    p.drillAngle = angleExpr(drillAngle);
+    p.counterboreDiameter = lengthExpr(cbDiameter);
+    p.counterboreDepth = lengthExpr(cbDepth);
+    p.countersinkDiameter = lengthExpr(csDiameter);
+    p.countersinkAngle = angleExpr(csAngle);
+    p.thread = thread;
+}
+
 /// The body that all edges belong to (fillet / chamfer); fails on an empty or mixed selection.
 BodyId commonBodyOf(const std::vector<EdgeH>& edges) {
     if (edges.empty()) fail(ErrorCode::InvalidArgument, "select at least one edge");
@@ -736,22 +762,7 @@ Lengths are mm and angles are degrees; pass numbers or expression strings such a
                  p.face = face.ref;
                  p.u = lengthExpr(at[0]);
                  p.v = lengthExpr(at[1]);
-                 if (kind == "simple") p.kind = kn::HoleKind::Simple;
-                 else if (kind == "counterbore") p.kind = kn::HoleKind::Counterbore;
-                 else if (kind == "countersink") p.kind = kn::HoleKind::Countersink;
-                 else fail(ErrorCode::InvalidArgument, "kind must be simple, counterbore or countersink");
-                 p.diameter = lengthExpr(diameter);
-                 if (!through) {
-                     if (depth.is_none()) fail(ErrorCode::InvalidArgument, "give depth=... or through=True");
-                     p.depth = lengthExpr(depth);
-                 }
-                 p.through = through;
-                 p.drillAngle = angleExpr(drillAngle);
-                 p.counterboreDiameter = lengthExpr(cbDiameter);
-                 p.counterboreDepth = lengthExpr(cbDepth);
-                 p.countersinkDiameter = lengthExpr(csDiameter);
-                 p.countersinkAngle = angleExpr(csAngle);
-                 p.thread = thread;
+                 setHoleOptions(p, diameter, depth, through, kind, drillAngle, cbDiameter, cbDepth, csDiameter, csAngle, thread);
                  return append(mp, std::make_shared<fe::HoleFeature>(mp->doc.allocateFeatureId(), p));
              },
              py::arg("face"), py::arg("diameter") = py::str("6 mm"), py::arg("depth") = py::none(), py::kw_only(),
@@ -760,6 +771,40 @@ Lengths are mm and angles are degrees; pass numbers or expression strings such a
              py::arg("counterbore_depth") = py::str("3 mm"), py::arg("countersink_diameter") = py::str("12 mm"),
              py::arg("countersink_angle") = py::str("90 deg"), py::arg("thread") = "",
              "Hole on a planar face. at=(u, v) is the entry point in the face's plane (see FaceRef.local()).")
+        .def("hole_from_sketch", [](const ModelPtr& mp, const FeatureH& sketchFeature, const std::vector<std::uint64_t>& points,
+                                    py::object diameter, py::object depth, std::optional<BodyH> body, bool through, bool flip,
+                                    const std::string& kind, py::object drillAngle, py::object cbDiameter, py::object cbDepth,
+                                    py::object csDiameter, py::object csAngle, const std::string& thread) {
+                 DocModel& d = *mp;
+                 (void)sketchFeatureOf(d, sketchFeature); // must be a sketch on the timeline
+                 if (points.empty()) fail(ErrorCode::InvalidArgument, "give at least one sketch point id");
+                 fe::HoleParams p;
+                 if (body) {
+                     p.body = body->id;
+                 } else {
+                     const auto& bodies = mp->evaluated().bodies;
+                     if (bodies.size() != 1)
+                         fail(ErrorCode::InvalidArgument,
+                              "the document has " + std::to_string(bodies.size()) + " bodies; pass body=<Body> to cut");
+                     p.body = bodies.begin()->first;
+                 }
+                 fe::HoleSketchPlacement placement;
+                 placement.sketch = sketchFeature.id;
+                 for (auto id : points) placement.points.push_back(sk::SketchEntityId{id});
+                 placement.flip = flip;
+                 p.sketchPoints = std::move(placement);
+                 setHoleOptions(p, diameter, depth, through, kind, drillAngle, cbDiameter, cbDepth, csDiameter, csAngle, thread);
+                 return append(mp, std::make_shared<fe::HoleFeature>(d.doc.allocateFeatureId(), p));
+             },
+             py::arg("sketch"), py::arg("points"), py::arg("diameter") = py::str("6 mm"), py::arg("depth") = py::none(),
+             py::kw_only(), py::arg("body") = py::none(), py::arg("through") = false, py::arg("flip") = false,
+             py::arg("kind") = "simple", py::arg("drill_angle") = py::str("118 deg"),
+             py::arg("counterbore_diameter") = py::str("10 mm"), py::arg("counterbore_depth") = py::str("3 mm"),
+             py::arg("countersink_diameter") = py::str("12 mm"), py::arg("countersink_angle") = py::str("90 deg"),
+             py::arg("thread") = "",
+             "One hole per sketch point of a sketch Feature (point ids, circle/arc ids for their centre, or "
+             "Sketch.ORIGIN), all in one feature. The holes follow the points when the sketch changes. Depth is from the "
+             "sketch plane along its normal, into the body (flip=True reverses). body= defaults to the document's only body.")
         .def("move", [](const ModelPtr& mp, const BodyH& body, py::tuple translate, py::object angle, py::object axisOrigin,
                         py::object axisDirection, bool copy) {
                  fe::MoveParams p;
@@ -810,6 +855,18 @@ Lengths are mm and angles are degrees; pass numbers or expression strings such a
              },
              py::arg("base"), py::arg("axis"), py::arg("angle"),
              "Construction plane through a construction Axis feature, rotated by `angle` from the base plane's orientation.")
+        .def("plane_tangent", [](const ModelPtr& mp, const FaceH& face, py::object angle) {
+                 if (face.kind != "cylinder" && face.kind != "cone")
+                     fail(ErrorCode::InvalidArgument, "plane_tangent needs a cylindrical or conical face (got '" + face.kind + "')");
+                 fe::ConstructionPlaneParams p;
+                 p.kind = fe::ConstructionPlaneParams::Kind::Tangent;
+                 p.base = fe::PlaneRef{true, face.body, face.ref, FeatureId{}};
+                 p.angle = angleExpr(angle);
+                 return append(mp, std::make_shared<fe::ConstructionPlaneFeature>(mp->doc.allocateFeatureId(), p));
+             },
+             py::arg("face"), py::arg("angle") = py::str("0 deg"),
+             "Construction plane tangent to a cylindrical or conical face along the ruling at `angle` around the face's "
+             "axis (for a Z-axis cylinder 0 deg touches the +X side, 90 deg the +Y side). The normal points away from the axis.")
         .def("axis_through_cylinder", [](const ModelPtr& mp, const FaceH& face) {
                  fe::ConstructionAxisParams p;
                  p.kind = fe::ConstructionAxisParams::Kind::Cylinder;
@@ -834,6 +891,16 @@ Lengths are mm and angles are degrees; pass numbers or expression strings such a
                  return append(mp, std::make_shared<fe::ConstructionAxisFeature>(mp->doc.allocateFeatureId(), p));
              },
              py::arg("edge"), "Construction axis along a linear edge.")
+        .def("axis_two_planes", [](const ModelPtr& mp, py::object a, py::object b) {
+                 fe::ConstructionAxisParams p;
+                 p.kind = fe::ConstructionAxisParams::Kind::TwoPlanes;
+                 p.planeA = planeRefOf(a, "axis_two_planes a");
+                 p.planeB = planeRefOf(b, "axis_two_planes b");
+                 return append(mp, std::make_shared<fe::ConstructionAxisFeature>(mp->doc.allocateFeatureId(), p));
+             },
+             py::arg("a"), py::arg("b"),
+             "Construction axis on the intersection line of two planes (planar faces or Plane features); direction "
+             "a.normal x b.normal. Parallel planes fail the feature.")
         .def("point_at_vertex", [](const ModelPtr& mp, const VertexH& vertex) {
                  fe::ConstructionPointParams p;
                  p.kind = fe::ConstructionPointParams::Kind::Vertex;
@@ -849,7 +916,18 @@ Lengths are mm and angles are degrees; pass numbers or expression strings such a
                  p.ref = edge.ref;
                  return append(mp, std::make_shared<fe::ConstructionPointFeature>(mp->doc.allocateFeatureId(), p));
              },
-             py::arg("edge"), "Construction point at the centre of a full circular edge.")
+             py::arg("edge"), "Construction point at the centre of a circular edge (full circle or arc).")
+        .def("point_edge_plane", [](const ModelPtr& mp, const EdgeH& edge, py::object plane) {
+                 fe::ConstructionPointParams p;
+                 p.kind = fe::ConstructionPointParams::Kind::EdgePlane;
+                 p.body = edge.body;
+                 p.ref = edge.ref;
+                 p.plane = planeRefOf(plane, "point_edge_plane plane");
+                 return append(mp, std::make_shared<fe::ConstructionPointFeature>(mp->doc.allocateFeatureId(), p));
+             },
+             py::arg("edge"), py::arg("plane"),
+             "Construction point where an edge crosses a plane (planar face or Plane feature; the plane is infinite). "
+             "With several crossings the one nearest the edge start is used; none fails the feature.")
         // import
         .def("import_step", [](const ModelPtr& mp, const std::string& path) {
                  auto params = unwrap(fe::makeImportParams(path, [&] { return mp->doc.allocateBodyId(); }));
@@ -1224,7 +1302,11 @@ Lengths are mm and angles are degrees; pass numbers or expression strings such a
         .def("__repr__", [](const SketchH& s) {
             return std::format("Sketch(entities={}, constraints={}, dimensions={})", s.sketch.entities().size(),
                                s.sketch.constraints().size(), s.sketch.dimensions().size());
-        });
+        })
+        // Reference geometry every sketch holds (fixed): usable in constraints, dimensions and hole_from_sketch.
+        .def_readonly_static("ORIGIN", &kSketchOriginId, "Entity id of the fixed sketch origin point (0, 0).")
+        .def_readonly_static("X_AXIS", &kSketchXAxisId, "Entity id of the sketch x axis (construction line).")
+        .def_readonly_static("Y_AXIS", &kSketchYAxisId, "Entity id of the sketch y axis (construction line).");
 
     // ---- Standalone solids (imported files; not part of a Document) ----
     py::class_<SolidH> solid(m, "Solid", "A solid read from a file (not part of a Document's timeline).");
