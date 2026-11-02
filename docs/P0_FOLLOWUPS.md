@@ -57,3 +57,4 @@
 | F47 | C1 | **DONE** (addFix ignored sub-point role → pinned both endpoints) — Solver: Fix on a line endpoint + H/V + 4 dims → reported redundant, then conflict after a param edit (fixed construction point works) | Investigate Fix mapping in sketch_solver adapter | P1a wrap-up |
 | F48 | C1 | realistic_100 cold = 4.1 s, edit-early 4.0 s (edit-late 85 ms) | Perf pass: async validation (F43), per-feature input stamps (F24) | P1b perf |
 | F49 | F45 | Profile labels repeat across sketches ("Profile 1" twice) — prefix sketch name ("Sketch 2 › Profile 1"); translucent preview body not visible in offscreen screenshot (data test passes) — verify on a real display in the user hands-on | polish + C5 | P1a wrap-up |
+| F50 | C1 | Hole-from-sketch point moved off the part: feature Ok, removes nothing, silently | **DONE** — per-hole Warning "does not intersect the body" (volume check per hole); C++ + Python C1 tests assert it and its disappearance when the point returns | — |

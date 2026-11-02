@@ -212,6 +212,30 @@ TEST(HoleFromSketch, DeletedPointIsSkippedWithWarningAndAllDeletedFails) {
     EXPECT_NE(st2->error.message.find("none of the selected sketch points"), std::string::npos) << st2->error.message;
 }
 
+TEST(HoleFromSketch, PointOffThePartWarnsThatTheHoleMissesTheBody) {
+    Document d;
+    const BodyId body = d.allocateBodyId();
+    mustVoid(d.addFeature(block(d.allocateFeatureId(), body)));
+    sketch::Sketch sk = sketchAtZ(10);
+    const SketchEntityId on = must(sk.addPoint({10, 10}));
+    const SketchEntityId off = must(sk.addPoint({100, 10})); // outside the 40 x 20 block
+    const FeatureId skId = d.allocateFeatureId();
+    mustVoid(d.addFeature(sketchFeature(skId, sk)));
+    const FeatureId holeId = d.allocateFeatureId();
+    mustVoid(d.addFeature(sketchHole(holeId, body, skId, {on, off}, true)));
+    DocumentEvaluation ev = evalOk(d);
+    EXPECT_NEAR(volumeOf(ev.bodies.at(body)), kBlock - kThroughHole, 1e-6 * kBlock);
+    const FeatureStatus* st = statusOf(ev, holeId);
+    ASSERT_NE(st, nullptr);
+    int missWarnings = 0;
+    for (const Diagnostic& diag : st->diagnostics)
+        if (diag.severity == Diagnostic::Severity::Warning && diag.message.find("does not intersect the body") != std::string::npos) {
+            ++missWarnings;
+            EXPECT_NE(diag.message.find("e" + std::to_string(off.value())), std::string::npos) << diag.message;
+        }
+    EXPECT_EQ(missWarnings, 1);
+}
+
 TEST(HoleFromSketch, DirectionFollowsTheBodySideOfTheSketchPlaneAndFlip) {
     // Sketch on z = 0 (normal +z) under the block: the body is on the +n side, so the hole drills upwards.
     {

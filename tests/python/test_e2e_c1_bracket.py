@@ -121,16 +121,20 @@ class C1Bracket(unittest.TestCase):
 
     def test_points_moved_off_the_plate_cut_nothing_then_recover(self):
         # e = -20 puts both points outside the plate (x = -20 and x = 80). The hole feature stays Ok but removes no
-        # material (current behaviour: no "hole misses the body" warning). Restoring e
-        # brings the holes back on the same feature.
+        # material, and says so: one "does not intersect the body" warning per missed hole. Restoring e
+        # brings the holes back on the same feature, without the warnings.
         d, sketch, extrude, fillet, holes, body = build()
         d.set_parameter("e", "-20 mm")
         ev = d.evaluate()
         self.assertTrue(ev.ok, failed(ev))
+        st = next(s for s in ev.statuses if s.feature_id == holes.id)
+        self.assertEqual(sum("does not intersect the body" in m for m in st.diagnostics), 2, st.diagnostics)
         self.assertAlmostEqual(body.volume, plate_volume(60, 30, 8, 4, 5, holes=0), places=2)
         self.assertEqual(len(body.edges(lambda ed: ed.kind == "circle" and abs(ed.radius - 2.5) < 1e-6)), 0)
         d.set_parameter("e", "12 mm")
         self.assert_state(d, extrude, fillet, holes, body, 60, 30, 8, 4, 5, 12, "restored")
+        st = next(s for s in d.evaluate().statuses if s.feature_id == holes.id)
+        self.assertFalse(any("does not intersect" in m for m in st.diagnostics), st.diagnostics)
 
     def test_save_load_then_edit(self):
         tmp = tempfile.mkdtemp(prefix="iw_py_c1_")

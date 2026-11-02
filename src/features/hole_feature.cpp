@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <cctype>
 #include <limits>
+#include <cmath>
 #include <map>
+#include <optional>
 #include <numbers>
 #include <type_traits>
 #include <utility>
@@ -373,12 +375,26 @@ Result<FeatureResult> HoleFeature::computeFromSketch(const EvalContext& ctx, con
     std::map<BodyId, kernel::Shape> bodies{{p.body, *body}};
     std::map<BodyId, naming::NamingMap> namings{{p.body, *bodyNames}};
     FeatureResult last;
+    // A hole whose point has moved off the part removes no material. That is not an error (restoring the point brings the
+    // hole back), but it must never be silent: warn per missing hole, like Fusion's "does not intersect" feedback [VERIFY].
+    auto volumeOf = [](const kernel::Shape& s) -> std::optional<double> {
+        auto m = kernel::massProperties(s);
+        return m ? std::optional<double>(m->volume) : std::nullopt;
+    };
+    std::optional<double> volBefore = volumeOf(bodies.at(p.body));
     for (const Site& site : sites) {
         if (ctx.cancel.cancelled()) return makeError(ErrorCode::Cancelled, "hole cancelled");
         const std::string pointName = "e" + std::to_string(site.id.value());
         const kernel::Axis placement{site.entry, dir};
         auto detail = kernel::holeWithTool(bodies.at(p.body), placement, spec, ctx.cancel);
         if (!detail) return makeError(detail.error().code, detail.error().message + " (at sketch point " + pointName + ")");
+        const std::optional<double> volAfter = volumeOf(detail->result.shape);
+        if (volBefore && volAfter && *volBefore - *volAfter <= 1e-9 * (1.0 + std::abs(*volBefore))) {
+            diags.push_back({Diagnostic::Severity::Warning,
+                             "hole: the hole at sketch point " + pointName + " does not intersect the body; it removes no material",
+                             std::nullopt});
+        }
+        volBefore = volAfter;
         naming::SiblingFrame frame;
         frame.origin = site.entry;
         frame.zAxis = dir;
