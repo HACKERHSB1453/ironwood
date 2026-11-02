@@ -7,13 +7,22 @@
 #include <gp_Cylinder.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
+#include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
+#include <GeomAbs_CurveType.hxx>
+#include <TopExp.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
+#include <TopoDS_Edge.hxx>
+#include <gp_Circ.hxx>
+#include <gp_Elips.hxx>
+#include <gp_Lin.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
 #include <BRep_Tool.hxx>
 #include <GProp_GProps.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Face.hxx>
+#include <algorithm>
 #include <cmath>
 #include <gp_Dir.hxx>
 #include <Standard_Failure.hxx>
@@ -107,6 +116,61 @@ FaceGeometry Shape::faceGeometry(std::uint32_t index) const {
         return FaceGeometry{};
     }
     return g;
+}
+
+EdgeGeometry Shape::edgeGeometry(std::uint32_t index) const {
+    EdgeGeometry g;
+    if (isNull() || index >= subShapeCount(SubShapeKind::Edge)) return g;
+    const TopoDS_Edge edge = TopoDS::Edge(impl_->index->edges.FindKey(static_cast<int>(index) + 1));
+    if (BRep_Tool::Degenerated(edge)) return g;
+    const auto toVec = [](const gp_Dir& d) { return Vec3{d.X(), d.Y(), d.Z()}; };
+    const auto toPnt = [](const gp_Pnt& p) { return Vec3{p.X(), p.Y(), p.Z()}; };
+    try {
+        // BRepAdaptor_Curve applies the edge Location, so every value below is in world coordinates.
+        BRepAdaptor_Curve curve(edge);
+        const gp_Pnt start = curve.Value(curve.FirstParameter());
+        g.point = toPnt(start);
+        g.closed = start.Distance(curve.Value(curve.LastParameter())) <= std::max(BRep_Tool::Tolerance(edge), 1e-7);
+        switch (curve.GetType()) {
+        case GeomAbs_Line:
+            g.kind = EdgeGeometry::Kind::Line;
+            g.direction = toVec(curve.Line().Direction());
+            break;
+        case GeomAbs_Circle: {
+            const gp_Circ c = curve.Circle();
+            g.kind = EdgeGeometry::Kind::Circle;
+            g.point = toPnt(c.Location());
+            g.direction = toVec(c.Axis().Direction());
+            g.radius = c.Radius();
+            break;
+        }
+        case GeomAbs_Ellipse: {
+            const gp_Elips e = curve.Ellipse();
+            g.kind = EdgeGeometry::Kind::Ellipse;
+            g.point = toPnt(e.Location());
+            g.direction = toVec(e.Axis().Direction());
+            g.radius = e.MajorRadius();
+            g.minorRadius = e.MinorRadius();
+            break;
+        }
+        case GeomAbs_BSplineCurve:
+        case GeomAbs_BezierCurve: g.kind = EdgeGeometry::Kind::BSpline; break;
+        default: break;
+        }
+    } catch (const Standard_Failure&) {
+        return EdgeGeometry{};
+    }
+    return g;
+}
+
+std::vector<Shape> Shape::solids() const {
+    std::vector<Shape> out;
+    if (isNull()) return out;
+    TopTools_IndexedMapOfShape map;
+    TopExp::MapShapes(impl_->shape, TopAbs_SOLID, map);
+    out.reserve(static_cast<std::size_t>(map.Extent()));
+    for (int i = 1; i <= map.Extent(); ++i) out.push_back(wrapShape(map.FindKey(i)));
+    return out;
 }
 
 Box3 Shape::boundingBox() const {

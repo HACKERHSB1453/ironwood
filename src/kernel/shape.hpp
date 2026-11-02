@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "core/math.hpp"
 
@@ -49,6 +50,26 @@ struct FaceGeometry {
     double radius = 0;
 };
 
+/// Curve description of one edge (F31: edge-type filters, construction references). Units mm.
+///  * Line:    `point` = the edge's start point (first parameter of its curve), `direction` = unit direction of the
+///             curve's parametrisation (start -> end of the edge as stored; the sign is NOT meaningful for naming, since
+///             the sub-shape ordering ignores orientation). The edge length is subShapeKey()[3].
+///  * Circle:  `point` = centre, `direction` = unit axis (normal of the circle's plane), `radius` = radius. Full circles
+///             and arcs both report Circle; `closed` tells them apart.
+///  * Ellipse: `point` = centre, `direction` = unit axis, `radius` = major radius, `minorRadius` = minor radius.
+///  * BSpline: B-spline or Bezier curve; only `point` (start point) is filled.
+///  * Other:   any other curve (hyperbola, parabola, offset, ...) or a degenerate edge; only `point` when available.
+/// Vectors not used by a kind are zero. Pure, thread-safe.
+struct EdgeGeometry {
+    enum class Kind : std::uint8_t { Line, Circle, Ellipse, BSpline, Other };
+    Kind kind = Kind::Other;
+    Vec3 point;
+    Vec3 direction;
+    double radius = 0;
+    double minorRadius = 0;
+    bool closed = false; ///< Start and end vertex coincide (full circle / ellipse / closed spline).
+};
+
 /// Immutable value handle to a B-rep shape. Copies are O(1) and share the underlying (never mutated)
 /// geometry, so a Shape may be read concurrently from any number of threads. No OCCT type is exposed.
 ///
@@ -88,6 +109,15 @@ public:
     /// Surface geometry of face `index` (ordering contract). Default-constructed (Kind::Other, zeros) for a null shape or
     /// an out-of-range index.
     FaceGeometry faceGeometry(std::uint32_t index) const;
+
+    /// Curve geometry of edge `index` (ordering contract). Default-constructed (Kind::Other, zeros) for a null shape,
+    /// an out-of-range index or a degenerate edge (no 3D curve).
+    EdgeGeometry edgeGeometry(std::uint32_t index) const;
+
+    /// The solids of this shape, each as its own Shape (unstamped), in first-occurrence order of a depth-first walk
+    /// (one entry per unique TShape + Location). A Solid returns {itself}; a compound of solids returns its members;
+    /// a shape without solids (shell, face, ...) or a null shape returns {}. Locations are kept (world placement).
+    std::vector<Shape> solids() const;
 
     /// Axis-aligned bounding box in mm (may be slightly enlarged by tolerance). Empty for null shape.
     Box3 boundingBox() const;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <filesystem>
@@ -1234,4 +1235,153 @@ TEST(KernelTaper, FaceProfileHistoryMarksStartCapModifiedAndEndCapGenerated) {
         ASSERT_TRUE(it != h.generated.end());
         EXPECT_EQ(it->second.size(), 1u) << "profile edge " << i;
     }
+}
+
+// ---- F31: edge-curve type query and solid extraction ----
+
+TEST(KernelF31, EdgeGeometryOfBoxEdgesIsAxisAlignedLines) {
+    auto box = makeBox({1, 2, 3}, 2, 3, 4);
+    ASSERT_TRUE(box.has_value());
+    const Shape& s = box->shape;
+    ASSERT_EQ(s.subShapeCount(SubShapeKind::Edge), 12u);
+    const Box3 bb = s.boundingBox();
+    int alongX = 0, alongY = 0, alongZ = 0;
+    for (std::uint32_t i = 0; i < 12; ++i) {
+        const EdgeGeometry g = s.edgeGeometry(i);
+        ASSERT_EQ(g.kind, EdgeGeometry::Kind::Line) << i;
+        EXPECT_FALSE(g.closed);
+        EXPECT_NEAR(length(g.direction), 1.0, 1e-12);
+        EXPECT_EQ(g.radius, 0.0);
+        if (std::abs(g.direction.x) > 0.999) ++alongX;
+        if (std::abs(g.direction.y) > 0.999) ++alongY;
+        if (std::abs(g.direction.z) > 0.999) ++alongZ;
+        // The start point is a box corner.
+        EXPECT_TRUE(std::abs(g.point.x - bb.min.x) < 1e-6 || std::abs(g.point.x - bb.max.x) < 1e-6);
+        EXPECT_TRUE(std::abs(g.point.z - bb.min.z) < 1e-6 || std::abs(g.point.z - bb.max.z) < 1e-6);
+    }
+    EXPECT_EQ(alongX, 4);
+    EXPECT_EQ(alongY, 4);
+    EXPECT_EQ(alongZ, 4);
+    EXPECT_EQ(s.edgeGeometry(12).kind, EdgeGeometry::Kind::Other);
+    EXPECT_EQ(Shape{}.edgeGeometry(0).kind, EdgeGeometry::Kind::Other);
+}
+
+TEST(KernelF31, EdgeGeometryOfCylinderGivesCirclesWithCentreAxisRadius) {
+    auto cyl = makeCylinder({5, -1, 2}, {0, 0, 1}, 2.5, 7);
+    ASSERT_TRUE(cyl.has_value());
+    const Shape& s = cyl->shape;
+    int circles = 0, lines = 0;
+    std::set<long> zs;
+    for (std::uint32_t i = 0; i < s.subShapeCount(SubShapeKind::Edge); ++i) {
+        const EdgeGeometry g = s.edgeGeometry(i);
+        if (g.kind == EdgeGeometry::Kind::Circle) {
+            ++circles;
+            EXPECT_TRUE(g.closed);
+            EXPECT_NEAR(g.radius, 2.5, 1e-9);
+            EXPECT_NEAR(std::abs(g.direction.z), 1.0, 1e-12);
+            EXPECT_NEAR(g.point.x, 5, 1e-9);
+            EXPECT_NEAR(g.point.y, -1, 1e-9);
+            zs.insert(std::lround(g.point.z));
+        } else if (g.kind == EdgeGeometry::Kind::Line) {
+            ++lines; // the seam
+            EXPECT_NEAR(std::abs(g.direction.z), 1.0, 1e-12);
+        } else {
+            ADD_FAILURE() << "unexpected edge kind on a cylinder, edge " << i;
+        }
+    }
+    EXPECT_EQ(circles, 2);
+    EXPECT_EQ(lines, 1);
+    EXPECT_EQ(zs, (std::set<long>{2, 9}));
+}
+
+TEST(KernelF31, EdgeGeometryHonoursTheShapeLocation) {
+    auto cyl = makeCylinder({0, 0, 0}, {0, 0, 1}, 1, 1);
+    ASSERT_TRUE(cyl.has_value());
+    Transform t; // translate by (10, 20, 30)
+    t.m[3] = 10;
+    t.m[7] = 20;
+    t.m[11] = 30;
+    auto moved = transform(cyl->shape, t);
+    ASSERT_TRUE(moved.has_value());
+    int found = 0;
+    for (std::uint32_t i = 0; i < moved->shape.subShapeCount(SubShapeKind::Edge); ++i) {
+        const EdgeGeometry g = moved->shape.edgeGeometry(i);
+        if (g.kind != EdgeGeometry::Kind::Circle) continue;
+        ++found;
+        EXPECT_NEAR(g.point.x, 10, 1e-9);
+        EXPECT_NEAR(g.point.y, 20, 1e-9);
+        EXPECT_TRUE(std::abs(g.point.z - 30) < 1e-9 || std::abs(g.point.z - 31) < 1e-9);
+    }
+    EXPECT_EQ(found, 2);
+}
+
+TEST(KernelF31, ObliqueCutOfACylinderGivesEllipseEdges) {
+    auto cyl = makeCylinder({0, 0, 0}, {0, 0, 1}, 2, 20);
+    auto box = makeBox({-10, -10, 10}, 20, 20, 20);
+    ASSERT_TRUE(cyl.has_value() && box.has_value());
+    // Tilt the box 30 deg about the X axis through (0, 0, 10): its bottom face cuts the cylinder obliquely.
+    const double a = 30 * kPi / 180;
+    Transform r;
+    r.m = {1, 0, 0, 0, 0, std::cos(a), -std::sin(a), 0, 0, std::sin(a), std::cos(a), 0, 0, 0, 0, 1};
+    const Vec3 p{0, 0, 10};
+    const Vec3 rp = r.apply(p);
+    r.m[3] = p.x - rp.x;
+    r.m[7] = p.y - rp.y;
+    r.m[11] = p.z - rp.z;
+    auto tilted = transform(box->shape, r);
+    ASSERT_TRUE(tilted.has_value());
+    auto cut1 = cut(cyl->shape, tilted->shape);
+    ASSERT_TRUE(cut1.has_value()) << cut1.error().message;
+    int ellipses = 0;
+    for (std::uint32_t i = 0; i < cut1->shape.subShapeCount(SubShapeKind::Edge); ++i) {
+        const EdgeGeometry g = cut1->shape.edgeGeometry(i);
+        if (g.kind != EdgeGeometry::Kind::Ellipse) continue;
+        ++ellipses;
+        EXPECT_TRUE(g.closed);
+        EXPECT_NEAR(g.minorRadius, 2, 1e-7);
+        EXPECT_NEAR(g.radius, 2 / std::cos(a), 1e-7);
+        EXPECT_NEAR(g.point.z, 10, 1e-7);
+        EXPECT_NEAR(length(g.direction), 1.0, 1e-12);
+    }
+    EXPECT_EQ(ellipses, 1);
+}
+
+TEST(KernelF31, CrossingCylindersGiveSplineIntersectionEdges) {
+    auto a = makeCylinder({0, 0, -10}, {0, 0, 1}, 3, 20);
+    auto b = makeCylinder({-10, 0, 0}, {1, 0, 0}, 2, 20);
+    ASSERT_TRUE(a.has_value() && b.has_value());
+    auto fused = fuse(a->shape, b->shape);
+    ASSERT_TRUE(fused.has_value()) << fused.error().message;
+    int splines = 0;
+    for (std::uint32_t i = 0; i < fused->shape.subShapeCount(SubShapeKind::Edge); ++i)
+        if (fused->shape.edgeGeometry(i).kind == EdgeGeometry::Kind::BSpline) ++splines;
+    EXPECT_GE(splines, 2);
+}
+
+TEST(KernelF31, SolidsSplitsCompoundsAndKeepsPlacement) {
+    auto box = makeBox({0, 0, 0}, 1, 1, 1);
+    ASSERT_TRUE(box.has_value());
+    auto solids = box->shape.solids();
+    ASSERT_EQ(solids.size(), 1u);
+    EXPECT_EQ(solids[0].type(), ShapeType::Solid);
+    EXPECT_TRUE(Shape{}.solids().empty());
+
+    // Two disjoint boxes fused: one result shape holding two solids, each keeping its world placement.
+    auto far = makeBox({10, 0, 0}, 2, 1, 1);
+    ASSERT_TRUE(far.has_value());
+    auto both = fuse(box->shape, far->shape);
+    ASSERT_TRUE(both.has_value());
+    auto parts = both->shape.solids();
+    ASSERT_EQ(parts.size(), 2u);
+    double total = 0, maxX = 0;
+    for (const auto& p : parts) {
+        EXPECT_EQ(p.type(), ShapeType::Solid);
+        EXPECT_EQ(p.subShapeCount(SubShapeKind::Face), 6u);
+        auto mp = massProperties(p);
+        ASSERT_TRUE(mp.has_value());
+        total += mp->volume;
+        maxX = std::max(maxX, p.boundingBox().max.x);
+    }
+    EXPECT_NEAR(total, 3.0, 1e-9);
+    EXPECT_NEAR(maxX, 12.0, 1e-6);
 }
