@@ -41,6 +41,14 @@ struct ConstructionGeometry {
     Vec3 direction{0, 0, 1};
 };
 
+/// Opaque, immutable sketch output a feature publishes to later features (F30 sketch channel). recompute does not know
+/// the sketch module: the producer (features::SketchFeature) derives from this and consumers (Extrude / Revolve / Hole
+/// sketch references) downcast it. Shared, never copied: the evaluator keeps it in its cached prefix states, so a
+/// consumer recomputed later reads the solve its predecessor already did.
+struct SketchOutput {
+    virtual ~SketchOutput() = default;
+};
+
 /// State visible to a feature at its timeline position: the bodies produced by all earlier, unsuppressed
 /// features (order-dependent semantics, ARCHITECTURE section 4). Immutable for the duration of compute().
 struct EvalContext {
@@ -52,6 +60,17 @@ struct EvalContext {
     const ParameterTable* params = nullptr;
     /// Construction geometry produced by earlier features (B1). nullptr when the evaluation has none.
     const std::map<FeatureId, ConstructionGeometry>* constructions = nullptr;
+
+    /// Sketch outputs published by earlier, successfully computed features (F30). nullptr when the evaluation has none.
+    const std::map<FeatureId, std::shared_ptr<const SketchOutput>>* sketches = nullptr;
+
+    /// nullptr if `id` published no sketch output before this timeline position (not a sketch, suppressed, failed,
+    /// skipped, or later on the timeline).
+    const SketchOutput* sketch(FeatureId id) const {
+        if (!sketches) return nullptr;
+        auto it = sketches->find(id);
+        return it == sketches->end() ? nullptr : it->second.get();
+    }
 
     /// nullptr if `id` is not a construction feature at this timeline position.
     const ConstructionGeometry* construction(FeatureId id) const {
@@ -83,6 +102,9 @@ struct FeatureResult {
     /// Non-geometric attributes of the feature (e.g. the cosmetic thread of a Hole: "thread" -> "M6x1.0"). Published on
     /// FeatureStatus::attributes; they never affect geometry or naming.
     std::map<std::string, std::string> attributes;
+    /// Set by sketch features (F30); the evaluator publishes it to later features (EvalContext::sketch) and to
+    /// FeatureStatus::sketch.
+    std::shared_ptr<const SketchOutput> sketch;
 };
 
 /// A timeline entry. Implementations are immutable after construction (an edit creates a new instance, so

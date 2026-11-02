@@ -16,6 +16,7 @@ struct State {
     std::map<BodyId, kernel::Shape> bodies;
     std::map<BodyId, naming::NamingMap> namings;
     std::map<FeatureId, ConstructionGeometry> constructions; ///< Published by Ok construction features.
+    std::map<FeatureId, std::shared_ptr<const SketchOutput>> sketches; ///< Published by Ok sketch features (F30).
     std::set<BodyId> poisoned;          ///< Bodies a failed/skipped feature should have written.
     std::set<FeatureId> broken;         ///< Failed or Skipped features (explicit refs into them are dead).
 };
@@ -77,7 +78,7 @@ Entry computeEntry(const Feature& f, bool suppressed, std::uint64_t chain, const
 
     Result<FeatureResult> res = makeError(ErrorCode::Internal, "not computed");
     try {
-        EvalContext ctx{prev.bodies, prev.namings, cancel, params, &prev.constructions};
+        EvalContext ctx{prev.bodies, prev.namings, cancel, params, &prev.constructions, &prev.sketches};
         res = f.compute(ctx);
     } catch (const std::exception& ex) {
         res = makeError(ErrorCode::Internal, std::string("feature threw: ") + ex.what());
@@ -118,6 +119,11 @@ Entry computeEntry(const Feature& f, bool suppressed, std::uint64_t chain, const
     if (res->constructionGeometry) {
         st->constructions.insert_or_assign(f.id(), *res->constructionGeometry);
         e.status.construction = *res->constructionGeometry;
+    }
+    st->sketches.erase(f.id());
+    if (res->sketch) {
+        st->sketches.insert_or_assign(f.id(), res->sketch);
+        e.status.sketch = std::move(res->sketch);
     }
     e.status.state = FeatureStatus::State::Ok;
     e.status.attributes = std::move(res->attributes);
